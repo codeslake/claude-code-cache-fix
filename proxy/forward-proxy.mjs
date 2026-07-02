@@ -109,20 +109,29 @@ export function attachForwardProxy(server) {
   const host = upstreamHost();
 
   server.on("connect", (req, clientSocket, head) => {
-    const target = req.url; // "host:port"
-    const reqHost = target.split(":")[0];
-    if (reqHost !== host) return blindTunnel(target, clientSocket, head);
-
-    // MITM the upstream host: terminate TLS with our leaf, then hand the
-    // decrypted socket to the server's HTTP handler as if it were a plaintext
-    // connection. The pipeline + upstream forwarding run exactly as in
-    // reverse-proxy mode; upstream egress uses config.upstream (+ config
-    // .httpsProxy) via forwardRequest().
+    // Wrap the whole handler: a throw in a 'connect' listener escapes to
+    // uncaughtException and takes the process down. Self-heal means a single
+    // bad CONNECT tears down that one socket, never the proxy. Always attach
+    // the client-socket error handler first so a mid-handshake reset can't
+    // crash us either.
     clientSocket.on("error", () => {});
-    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-    const tlsSocket = new tls.TLSSocket(clientSocket, { isServer: true, secureContext });
-    tlsSocket.on("error", () => tlsSocket.destroy());
-    server.emit("connection", tlsSocket);
+    try {
+      const target = req.url; // "host:port"
+      const reqHost = target.split(":")[0];
+      if (reqHost !== host) return blindTunnel(target, clientSocket, head);
+
+      // MITM the upstream host: terminate TLS with our leaf, then hand the
+      // decrypted socket to the server's HTTP handler as if it were a plaintext
+      // connection. The pipeline + upstream forwarding run exactly as in
+      // reverse-proxy mode; upstream egress uses config.upstream (+ config
+      // .httpsProxy) via forwardRequest().
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      const tlsSocket = new tls.TLSSocket(clientSocket, { isServer: true, secureContext });
+      tlsSocket.on("error", () => tlsSocket.destroy());
+      server.emit("connection", tlsSocket);
+    } catch {
+      try { clientSocket.destroy(); } catch {}
+    }
   });
 
   return caPath;

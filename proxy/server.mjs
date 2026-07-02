@@ -472,6 +472,24 @@ export async function startProxy(options = {}) {
   if (config.forwardProxy) {
     try { forwardProxyCA = attachForwardProxy(server); }
     catch (err) { process.stderr.write(`[cache-fix] forward-proxy FAILED (reverse-proxy only): ${err && err.message}\n`); }
+
+    // Self-heal: in forward-proxy mode the proxy MITMs the whole upstream host,
+    // so a stray socket/TLS error or a bug in one request must never take the
+    // process down — an in-flight CC session is wired to THIS port and cannot
+    // fail over. Log and keep serving instead of crashing. Scoped to
+    // forward-proxy mode so reverse-proxy deployments keep Node's default
+    // crash-on-uncaught semantics (their supervisor restarts them). Registered
+    // once; guarded so repeated startProxy() calls in a test process don't
+    // stack listeners.
+    if (!process.env.__CACHE_FIX_SELF_HEAL_ON) {
+      process.env.__CACHE_FIX_SELF_HEAL_ON = "1";
+      process.on("uncaughtException", (err) => {
+        process.stderr.write(`[cache-fix] self-heal: uncaughtException swallowed (proxy stays up): ${err && err.stack || err}\n`);
+      });
+      process.on("unhandledRejection", (reason) => {
+        process.stderr.write(`[cache-fix] self-heal: unhandledRejection swallowed (proxy stays up): ${reason && reason.stack || reason}\n`);
+      });
+    }
   }
 
   await new Promise((resolve, reject) => {
