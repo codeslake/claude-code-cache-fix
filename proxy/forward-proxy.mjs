@@ -103,7 +103,7 @@ function parseProxy(url) {
 }
 
 // Blind-tunnel a CONNECT to `target` (host:port) untouched. Routes through the
-// outbound proxy (config.httpsProxy, e.g. corporate/privoxy) when set, else
+// outbound proxy (config.httpsProxy, e.g. a corporate proxy) when set, else
 // dials the target directly. No TLS termination; bytes pass through opaque.
 function blindTunnel(target, clientSocket, head) {
   const [host, portStr] = target.split(":");
