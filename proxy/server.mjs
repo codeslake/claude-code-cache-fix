@@ -6,6 +6,7 @@ import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
 import { startOAuthRefresher, stopOAuthRefresher } from "./oauth/refresher.mjs";
+import { attachForwardProxy } from "./forward-proxy.mjs";
 
 // Debug logging — writes to ~/.claude/cache-fix-debug.log (override path with
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
@@ -424,6 +425,18 @@ export async function startProxy(options = {}) {
   } catch {}
 
   const server = createProxyServer();
+
+  // Forward-proxy mode (CACHE_FIX_FORWARD_PROXY=on): also handle CONNECT and
+  // MITM only the upstream host, so the client wires HTTPS_PROXY (not
+  // ANTHROPIC_BASE_URL) and keeps Remote Control. Attached before listen so the
+  // handler is present for the first CONNECT. Failure falls back to
+  // reverse-proxy only rather than preventing the proxy from serving.
+  let forwardProxyCA = null;
+  if (config.forwardProxy) {
+    try { forwardProxyCA = attachForwardProxy(server); }
+    catch (err) { process.stderr.write(`[cache-fix] forward-proxy FAILED (reverse-proxy only): ${err && err.message}\n`); }
+  }
+
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, bind, () => {
@@ -445,6 +458,13 @@ export async function startProxy(options = {}) {
   }
 
   const addr = server.address();
+  if (forwardProxyCA) {
+    process.stderr.write(
+      "[cache-fix] forward-proxy: on — wire the client (leave ANTHROPIC_BASE_URL UNSET so Remote Control stays enabled):\n" +
+      `  export HTTPS_PROXY=http://${addr.address}:${addr.port}\n` +
+      `  export NODE_EXTRA_CA_CERTS=${forwardProxyCA}\n`,
+    );
+  }
   return {
     server,
     port: addr.port,
