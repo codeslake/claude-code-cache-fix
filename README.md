@@ -531,7 +531,7 @@ Both modes write quota state on every API call. Proxy mode (v3.5.0+) splits into
 
 - **Q5h** quota bar `[███░┃░░░░░]` + percent + `(exhaust X, reset Y)`. Filled cells are consumed quota; the heavy-vertical tick is wall-clock elapsed position in the window. Tick to the right of the fill = under pace; tick inside the fill = burning faster than time (over pace). `exhaust` is the projected time-to-100% at the current burn rate; `reset` is the wall-clock time until the window rolls over. When `exhaust < reset`, you will hit 100% before the window resets — back off.
 - **Q7d** same shape with day-scale durations (e.g. `(exhaust 3d13h, reset 3d0h)`). Below a day, the suffix auto-switches to `h/m` format (e.g. `(exhaust 1h41m, reset 0h30m)`).
-- **TTL tier** — `TTL:1h` when healthy, **`TTL:5m` in red when the server has downgraded you** (typically at Q5h ≥ 100%)
+- **TTL tier** derived from the response's measured `usage.cache_creation.ephemeral_1h_input_tokens` vs `ephemeral_5m_input_tokens`: `TTL:1h` when the 1h tier dominates, **`TTL:5m` in red when the server has downgraded you to the 5m tier** (typically at Q5h ≥ 100%). Reading the measured split (rather than guessing from whether the response had a cache read) keeps the tier stable across a workflow's subagent fan-out, where a fresh-prefix request legitimately has no cache read yet.
 - **PEAK** in yellow during weekday peak hours (13:00–19:00 UTC)
 - **Cache hit rate %**
 - **OVERAGE** flag when active
@@ -695,6 +695,12 @@ The shipped [`tools/quota-statusline.sh`](tools/quota-statusline.sh) is the refe
 ### Why per-session
 
 On multi-agent hosts (multiple Claude Code sessions sharing one proxy), the pre-v3.5.0 single global file caused every session to overwrite the others' cache stats with each response. A statusline reading from session A would show session B's TTL tier whenever B sent a request more recently. Per-session files plus an account-global quota file resolve this without losing the easy account-wide view. See [#104](https://github.com/cnighswonger/claude-code-cache-fix/issues/104) for the original report.
+
+### Multiple accounts (`CLAUDE_CONFIG_DIR`)
+
+Claude Code sets `CLAUDE_CONFIG_DIR` to isolate alternate accounts (e.g. `--act 2` -> `~/.claude-2`, `--console` -> `~/.claude-console`). The proxy honors it for **all** of its on-disk state: `quota-status/`, `usage.jsonl`, `cache-fix-state/`, session mirrors, snapshots, and OAuth events all land under `$CLAUDE_CONFIG_DIR` instead of a hardcoded `~/.claude`. When it's unset the proxy uses `~/.claude` exactly as before (no change for single-account users).
+
+This matters when you run **one proxy per account**: without it, two accounts' proxies both write to `~/.claude/quota-status/account.json` and clobber each other's quota state. Give each account's proxy its own `CLAUDE_CONFIG_DIR` (matching the value Claude Code itself uses for that account) and their state stays cleanly separated.
 
 ## Image stripping (preload mode)
 
