@@ -25,7 +25,7 @@ import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import config from "./config.mjs";
 
-// The CA is global (one cert CC trusts), not per-account, so it lives outside
+// The CA is global (one cert CC trusts), not per-config-dir, so it lives outside
 // CLAUDE_CONFIG_DIR. Overridable for tests / non-default homes.
 const CA_DIR = process.env.CACHE_FIX_CA_DIR || join(homedir(), ".claude", "cache-fix-ca");
 
@@ -50,8 +50,8 @@ export function ensureCA() {
   }
   mkdirSync(CA_DIR, { recursive: true, mode: 0o700 });
 
-  // Serialize generation across concurrent proxies (two accounts starting at
-  // once share this global CA dir). An atomic mkdir lock elects one generator;
+  // Serialize generation across concurrent proxies (two proxies started against
+  // separate config dirs share this global CA dir). An atomic mkdir lock elects one generator;
   // the others wait for it to finish rather than racing openssl and clobbering
   // each other's ca.pem/leaf.pem (which produced a leaf that didn't chain to
   // the on-disk CA -> client UNKNOWN_ISSUER). All artifacts are written to
