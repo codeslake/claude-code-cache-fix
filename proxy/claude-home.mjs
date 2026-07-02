@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-// The Claude Code config root. Honors CLAUDE_CONFIG_DIR — Claude Code sets it
+// The Claude Code config root. Honors CLAUDE_CONFIG_DIR, which Claude Code sets
 // for alternate accounts (e.g. `--act 2` -> ~/.claude-2, `--console` ->
 // ~/.claude-console). Without this, every account's proxy state (quota-status,
 // usage.jsonl, session-mirrors, snapshots, oauth) is hardcoded to ~/.claude and

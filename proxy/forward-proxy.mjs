@@ -7,8 +7,8 @@
 // api.anthropic.com, so RC keeps working, while we still see and transform
 // /v1/messages.
 //
-// It only MITMs the upstream host (api.anthropic.com) — where the cacheable
-// /v1/messages traffic lives — and blind-tunnels every other CONNECT
+// It only MITMs the upstream host (api.anthropic.com), where the cacheable
+// /v1/messages traffic lives, and blind-tunnels every other CONNECT
 // (mcp-proxy.anthropic.com, telegram, npm, ...) untouched, so RC/MCP and
 // unrelated traffic are unaffected. The decrypted upstream request is fed into
 // the SAME http request handler used by reverse-proxy mode (server.emit
@@ -70,7 +70,7 @@ function parseProxy(url) {
 
 // Blind-tunnel a CONNECT to `target` (host:port) untouched. Routes through the
 // outbound proxy (config.httpsProxy, e.g. corporate/privoxy) when set, else
-// dials the target directly. No TLS termination — bytes pass through opaque.
+// dials the target directly. No TLS termination; bytes pass through opaque.
 function blindTunnel(target, clientSocket, head) {
   const [host, portStr] = target.split(":");
   const port = Number(portStr) || 443;
