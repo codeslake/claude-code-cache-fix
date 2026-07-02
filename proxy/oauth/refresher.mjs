@@ -26,6 +26,7 @@ import properLockfile from "proper-lockfile";
 
 import { emitOAuthEvent } from "./events.mjs";
 import config from "../config.mjs";
+import { claudeHome } from "../claude-home.mjs";
 
 const TOKEN_URL_DEFAULT = "https://platform.claude.com/v1/oauth/token";
 // The client_id is the public OAuth client id baked into the Claude Code
@@ -75,7 +76,7 @@ function nowMs() { return Date.now(); }
 
 function credPath() {
   return process.env.CACHE_FIX_OAUTH_CRED_PATH ||
-    join(homedir(), ".claude", ".credentials.json");
+    join(claudeHome(), ".credentials.json");
 }
 
 function tokenUrl() {
