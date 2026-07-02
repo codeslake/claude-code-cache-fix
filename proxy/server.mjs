@@ -320,10 +320,10 @@ function handleNotFound(_req, res) {
 
 // Transparent pass-through for forward-proxy mode. When the proxy MITMs the
 // whole upstream host (CACHE_FIX_FORWARD_PROXY=on), it sees EVERY request to
-// api.anthropic.com — not just /v1/messages. Non-transformed paths (Remote
+// api.anthropic.com, not just /v1/messages. Non-transformed paths (Remote
 // Control credential fetch, OAuth, /api/*, ...) must be relayed to upstream
 // untouched; otherwise they'd 404 and break RC ("Remote credentials fetch
-// failed"). No pipeline, no parsing — collect the body (if any), forward it via
+// failed"). No pipeline, no parsing: collect the body (if any), forward it via
 // the same upstream transport (incl. corp-proxy egress), and stream the
 // response straight back. Reverse-proxy mode never reaches this (only
 // /v1/messages arrives there), so its 404 contract is unchanged.
@@ -475,7 +475,7 @@ export async function startProxy(options = {}) {
 
     // Self-heal: in forward-proxy mode the proxy MITMs the whole upstream host,
     // so a stray socket/TLS error or a bug in one request must never take the
-    // process down — an in-flight CC session is wired to THIS port and cannot
+    // process down: an in-flight CC session is wired to THIS port and cannot
     // fail over. Log and keep serving instead of crashing. Scoped to
     // forward-proxy mode so reverse-proxy deployments keep Node's default
     // crash-on-uncaught semantics (their supervisor restarts them). Registered
@@ -515,7 +515,7 @@ export async function startProxy(options = {}) {
   const addr = server.address();
   if (forwardProxyCA) {
     process.stderr.write(
-      "[cache-fix] forward-proxy: on — wire the client (leave ANTHROPIC_BASE_URL UNSET so Remote Control stays enabled):\n" +
+      "[cache-fix] forward-proxy: on. Wire the client (leave ANTHROPIC_BASE_URL UNSET so Remote Control stays enabled):\n" +
       `  export HTTPS_PROXY=http://${addr.address}:${addr.port}\n` +
       `  export NODE_EXTRA_CA_CERTS=${forwardProxyCA}\n`,
     );
