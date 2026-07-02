@@ -19,7 +19,7 @@
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -44,20 +44,54 @@ export function ensureCA() {
   const leafPem = join(CA_DIR, "leaf.pem");
   const leafKey = join(CA_DIR, "leaf.key");
   const host = upstreamHost();
-  if (existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey)) {
+  const ready = () => existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey);
+  if (ready()) {
     return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
   }
   mkdirSync(CA_DIR, { recursive: true, mode: 0o700 });
-  const run = (args) => execFileSync("openssl", args, { stdio: ["ignore", "ignore", "pipe"] });
-  run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", caKey, "-out", caPem,
-       "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA"]);
-  run(["genrsa", "-out", leafKey, "2048"]);
-  const csr = join(CA_DIR, "leaf.csr");
-  run(["req", "-new", "-key", leafKey, "-out", csr, "-subj", `/CN=${host}`]);
-  const ext = join(CA_DIR, "leaf.ext");
-  writeFileSync(ext, `subjectAltName=DNS:${host}\nextendedKeyUsage=serverAuth\n`);
-  run(["x509", "-req", "-in", csr, "-CA", caPem, "-CAkey", caKey, "-CAcreateserial",
-       "-out", leafPem, "-days", "3650", "-extfile", ext]);
+
+  // Serialize generation across concurrent proxies (two accounts starting at
+  // once share this global CA dir). An atomic mkdir lock elects one generator;
+  // the others wait for it to finish rather than racing openssl and clobbering
+  // each other's ca.pem/leaf.pem (which produced a leaf that didn't chain to
+  // the on-disk CA -> client UNKNOWN_ISSUER). All artifacts are written to
+  // temp paths and atomically renamed into place so a reader never sees a
+  // half-written file.
+  const lock = join(CA_DIR, ".gen.lock");
+  let haveLock = false;
+  try { mkdirSync(lock); haveLock = true; } catch {}
+  if (!haveLock) {
+    // Someone else is generating. Wait (bounded) for the artifacts to appear.
+    // Synchronous sleep via Atomics.wait (no busy-spin, no external `sleep`).
+    const sleep100 = () => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); } catch {} };
+    const deadline = Date.now() + 30000;
+    while (!ready() && Date.now() < deadline) sleep100();
+    if (ready()) return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
+    // Timed out (stale lock / dead generator): fall through and generate anyway.
+    try { mkdirSync(lock); } catch {}
+  }
+  try {
+    if (ready()) return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
+    const run = (args) => execFileSync("openssl", args, { stdio: ["ignore", "ignore", "pipe"] });
+    const tmp = (n) => join(CA_DIR, `.tmp.${n}`);
+    run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", tmp("ca.key"), "-out", tmp("ca.pem"),
+         "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA"]);
+    run(["genrsa", "-out", tmp("leaf.key"), "2048"]);
+    const csr = tmp("leaf.csr");
+    run(["req", "-new", "-key", tmp("leaf.key"), "-out", csr, "-subj", `/CN=${host}`]);
+    const ext = tmp("leaf.ext");
+    writeFileSync(ext, `subjectAltName=DNS:${host}\nextendedKeyUsage=serverAuth\n`);
+    run(["x509", "-req", "-in", csr, "-CA", tmp("ca.pem"), "-CAkey", tmp("ca.key"), "-CAcreateserial",
+         "-out", tmp("leaf.pem"), "-days", "3650", "-extfile", ext]);
+    // Atomic publish: rename the CA key first, then ca.pem, then leaf files.
+    // The existence guard keys on ca.pem+leaf.pem+leaf.key, so publish those last.
+    renameSync(tmp("ca.key"), caKey);
+    renameSync(tmp("ca.pem"), caPem);
+    renameSync(tmp("leaf.key"), leafKey);
+    renameSync(tmp("leaf.pem"), leafPem);
+  } finally {
+    try { rmSync(lock, { recursive: true, force: true }); } catch {}
+  }
   return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
 }
 
@@ -88,13 +122,73 @@ function blindTunnel(target, clientSocket, head) {
     // CONNECT target through the outbound proxy.
     const r = http.request({ host: via.host, port: via.port, method: "CONNECT", path: target,
                              headers: { host: target } });
-    r.on("connect", (_res, socket) => onUpstream(socket));
+    r.on("connect", (res, socket) => {
+      // Node fires 'connect' even when the outbound proxy DENIES the tunnel
+      // (403/407/502). Relaying our own "200 Connection Established" then would
+      // hand the client a dead pipe. Propagate the real failure status and tear
+      // down instead, so a corp-proxy denial surfaces as a clean error.
+      if (res.statusCode !== 200) {
+        try {
+          clientSocket.write(`HTTP/1.1 ${res.statusCode} ${res.statusMessage || "Proxy Error"}\r\n\r\n`);
+        } catch {}
+        socket.destroy();
+        clientSocket.destroy();
+        return;
+      }
+      onUpstream(socket);
+    });
     r.on("error", () => clientSocket.destroy());
     r.end();
   } else {
     const socket = net.connect(port, host, () => onUpstream(socket));
     socket.on("error", () => clientSocket.destroy());
   }
+}
+
+// Open a TLS connection to the upstream host, directly or through the corp
+// CONNECT proxy (config.httpsProxy), and invoke cb(tlsSocket). Used to relay a
+// MITM'd WebSocket upgrade to the real upstream.
+function connectUpstreamTLS(cb, onErr) {
+  let upHost = "api.anthropic.com", upPort = 443;
+  try { const u = new URL(config.upstream); upHost = u.hostname; upPort = Number(u.port) || 443; } catch {}
+  const finish = (rawSocket) => {
+    const tlsUp = tls.connect({ socket: rawSocket, servername: upHost }, () => cb(tlsUp));
+    tlsUp.on("error", onErr);
+  };
+  const via = parseProxy(config.httpsProxy);
+  if (via) {
+    const r = http.request({ host: via.host, port: via.port, method: "CONNECT",
+                             path: `${upHost}:${upPort}`, headers: { host: `${upHost}:${upPort}` } });
+    r.on("connect", (res, rawSocket) => {
+      if (res.statusCode !== 200) { rawSocket.destroy(); onErr(new Error(`upstream CONNECT ${res.statusCode}`)); return; }
+      finish(rawSocket);
+    });
+    r.on("error", onErr);
+    r.end();
+  } else {
+    const rawSocket = net.connect(upPort, upHost, () => finish(rawSocket));
+    rawSocket.on("error", onErr);
+  }
+}
+
+// Relay a decrypted client WebSocket/Upgrade to the upstream host verbatim.
+function relayUpstreamUpgrade(req, clientSocket, head) {
+  const bail = (up) => { try { up && up.destroy(); } catch {} try { clientSocket.destroy(); } catch {} };
+  connectUpstreamTLS((up) => {
+    // Re-serialize the original request line + headers onto the upstream TLS
+    // socket, then splice the two streams. Headers are relayed as-received
+    // (Upgrade/Connection/Sec-WebSocket-* preserved) so the handshake completes
+    // end-to-end and only the bytes flow through us.
+    let head_ = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
+    for (let i = 0; i < req.rawHeaders.length; i += 2) head_ += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
+    head_ += "\r\n";
+    up.write(head_);
+    if (head && head.length) up.write(head);
+    up.pipe(clientSocket);
+    clientSocket.pipe(up);
+    up.on("error", () => bail(up));
+    clientSocket.on("error", () => bail(up));
+  }, () => bail(null));
 }
 
 /**
@@ -107,6 +201,22 @@ export function attachForwardProxy(server) {
   const { caPath, key, cert } = ensureCA();
   const secureContext = tls.createSecureContext({ key, cert });
   const host = upstreamHost();
+
+  // WebSocket / HTTP Upgrade on the MITM'd host. Our http.Server has no default
+  // upgrade handling, so without this Node would DESTROY the socket, breaking
+  // any WS to the upstream host (e.g. /voice's wss://api.anthropic.com/api/ws/
+  // speech_to_text/voice_stream). Relay the upgrade to upstream over a fresh TLS
+  // connection (through the corp proxy if configured) and pipe raw bytes both
+  // ways. `req` is the decrypted request on the MITM'd tlsSocket; `socket` is
+  // that tlsSocket; `head` is any buffered bytes after the headers.
+  server.on("upgrade", (req, socket, head) => {
+    socket.on("error", () => {});
+    try {
+      relayUpstreamUpgrade(req, socket, head);
+    } catch {
+      try { socket.destroy(); } catch {}
+    }
+  });
 
   server.on("connect", (req, clientSocket, head) => {
     // Wrap the whole handler: a throw in a 'connect' listener escapes to
