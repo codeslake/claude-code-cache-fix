@@ -15,12 +15,12 @@ import { createHash, randomBytes } from "node:crypto";
 // $HOME between cases. The homedir() call is essentially free.
 function paths() {
   const home = homedir();
-  const quotaDir = join(home, ".claude", "quota-status");
+  const quotaDir = join(claudeHome(), "quota-status");
   return {
     quotaDir,
     accountPath: join(quotaDir, "account.json"),
     sessionsDir: join(quotaDir, "sessions"),
-    legacyPath: join(home, ".claude", "quota-status.json"),
+    legacyPath: join(claudeHome(), "quota-status.json"),
   };
 }
 
@@ -52,6 +52,7 @@ const SAME_FAMILY_STICKY_THRESHOLD = 3;
 // reader that imports it from this module; new call sites should import
 // directly from `../model-families.mjs`.
 import { modelFamily } from "../model-families.mjs";
+import { claudeHome } from "../claude-home.mjs";
 export { modelFamily } from "../model-families.mjs";
 
 // Read the persisted per-session JSON's divergence fields, guarded on
