@@ -317,6 +317,40 @@ function handleNotFound(_req, res) {
   res.end(JSON.stringify({ error: "not_found" }));
 }
 
+// Transparent pass-through for forward-proxy mode. When the proxy MITMs the
+// whole upstream host (CACHE_FIX_FORWARD_PROXY=on), it sees EVERY request to
+// api.anthropic.com — not just /v1/messages. Non-transformed paths (Remote
+// Control credential fetch, OAuth, /api/*, ...) must be relayed to upstream
+// untouched; otherwise they'd 404 and break RC ("Remote credentials fetch
+// failed"). No pipeline, no parsing — collect the body (if any), forward it via
+// the same upstream transport (incl. corp-proxy egress), and stream the
+// response straight back. Reverse-proxy mode never reaches this (only
+// /v1/messages arrives there), so its 404 contract is unchanged.
+async function handlePassthrough(clientReq, clientRes) {
+  const abortController = new AbortController();
+  clientReq.on("close", () => { if (!clientRes.writableEnded) abortController.abort(); });
+
+  const method = (clientReq.method || "GET").toUpperCase();
+  const body = (method === "GET" || method === "HEAD") ? null : await collectBody(clientReq);
+
+  let upstreamRes, responseHeaders, statusCode;
+  try {
+    ({ upstreamRes, responseHeaders, statusCode } = await forwardRequest(
+      clientReq, body, abortController.signal));
+  } catch (err) {
+    debugLog("[PROXY] passthrough forwardRequest error:", err.message, "url:", clientReq.url);
+    if (abortController.signal.aborted) return;
+    if (!clientRes.headersSent) {
+      clientRes.writeHead(502, { "content-type": "application/json" });
+      clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
+    }
+    return;
+  }
+  clientRes.writeHead(statusCode, responseHeaders);
+  upstreamRes.on("error", () => { if (!clientRes.writableEnded) clientRes.end(); });
+  upstreamRes.pipe(clientRes);
+}
+
 /**
  * Builds an http.Server with the proxy's request handler wired in. The
  * returned server is **not** listening and the extension pipeline has not
@@ -355,6 +389,9 @@ export function createProxyServer() {
         if (req.method === "GET" && req.url === "/health") return handleHealth(req, res);
         if (req.method === "POST" && req.url?.startsWith("/v1/messages")) return await handleMessages(req, res);
         if (req.url?.startsWith("/api/claude_cli/bootstrap")) return await handleBootstrap(req, res);
+        // Forward-proxy mode MITMs the whole host, so any other path (RC creds,
+        // OAuth, ...) must be relayed to upstream untouched rather than 404'd.
+        if (config.forwardProxy) return await handlePassthrough(req, res);
         debugLog("ERROR: handler not found for req.url=", req.url, "method=", req.method);
         handleNotFound(req, res);
       } catch (error) {
