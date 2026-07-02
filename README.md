@@ -151,6 +151,19 @@ docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
   ghcr.io/cnighswonger/claude-code-cache-fix:latest
 ```
 
+**Forward-proxy mode in Docker** (keeps Remote Control; see [Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working)). Add `-e CACHE_FIX_FORWARD_PROXY=on` and persist the CA dir so the generated CA survives container restarts and can be read by the host client:
+
+```bash
+docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
+  -e CACHE_FIX_FORWARD_PROXY=on \
+  -e CACHE_FIX_CA_DIR=/ca -v cache-fix-ca:/ca \
+  ghcr.io/cnighswonger/claude-code-cache-fix:latest
+
+# Export the CA once, then point the client at the proxy (ANTHROPIC_BASE_URL stays unset):
+docker cp cache-fix-proxy:/ca/ca.pem ./cache-fix-ca.pem
+HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=$PWD/cache-fix-ca.pem claude
+```
+
 ### Health check
 
 ```bash

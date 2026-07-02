@@ -3,11 +3,21 @@
 # Runs the proxy server on port 9801 (override with -e CACHE_FIX_PROXY_PORT=...).
 # Forwards to api.anthropic.com by default (override with -e CACHE_FIX_PROXY_UPSTREAM=...).
 #
-# Usage:
+# Usage (reverse-proxy mode):
 #   docker run -d -p 9801:9801 --name cache-fix-proxy \
 #     ghcr.io/cnighswonger/claude-code-cache-fix:latest
+#   # then set ANTHROPIC_BASE_URL=http://127.0.0.1:9801 in the shell that runs claude.
 #
-# Then set ANTHROPIC_BASE_URL=http://127.0.0.1:9801 in the shell that runs claude.
+# Forward-proxy mode (keeps Remote Control; client uses HTTPS_PROXY, not
+# ANTHROPIC_BASE_URL). Add -e CACHE_FIX_FORWARD_PROXY=on and persist the CA dir
+# so the generated CA survives restarts and can be read by the host client:
+#   docker run -d -p 9801:9801 --name cache-fix-proxy \
+#     -e CACHE_FIX_FORWARD_PROXY=on \
+#     -e CACHE_FIX_CA_DIR=/ca -v cache-fix-ca:/ca \
+#     ghcr.io/cnighswonger/claude-code-cache-fix:latest
+#   # then, on the host:
+#   #   docker cp cache-fix-proxy:/ca/ca.pem ./cache-fix-ca.pem
+#   #   HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=./cache-fix-ca.pem claude
 
 FROM node:22-alpine
 
