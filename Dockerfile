@@ -9,15 +9,17 @@
 #   # then set ANTHROPIC_BASE_URL=http://127.0.0.1:9801 in the shell that runs claude.
 #
 # Forward-proxy mode (keeps Remote Control; client uses HTTPS_PROXY, not
-# ANTHROPIC_BASE_URL). Add -e CACHE_FIX_FORWARD_PROXY=on and persist the CA dir
-# so the generated CA survives restarts and can be read by the host client:
+# ANTHROPIC_BASE_URL). Add -e CACHE_FIX_FORWARD_PROXY=on and a WRITABLE CA dir.
+# The image runs as uid 1000 (node); a fresh named volume mounts root-owned, so
+# use a chown'd bind mount (persists the CA + lets the host read it):
+#   mkdir -p ./cache-fix-ca && sudo chown 1000:1000 ./cache-fix-ca
 #   docker run -d -p 9801:9801 --name cache-fix-proxy \
 #     -e CACHE_FIX_FORWARD_PROXY=on \
-#     -e CACHE_FIX_CA_DIR=/ca -v cache-fix-ca:/ca \
+#     -e CACHE_FIX_CA_DIR=/ca -v "$PWD/cache-fix-ca:/ca" \
 #     ghcr.io/cnighswonger/claude-code-cache-fix:latest
-#   # then, on the host:
-#   #   docker cp cache-fix-proxy:/ca/ca.pem ./cache-fix-ca.pem
-#   #   HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=./cache-fix-ca.pem claude
+#   # then, on the host (CA is at ./cache-fix-ca/ca.pem):
+#   #   HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=$PWD/cache-fix-ca/ca.pem claude
+#   # verify: curl -s localhost:9801/health must show "forward_proxy":true
 
 FROM node:22-alpine
 

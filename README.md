@@ -151,18 +151,21 @@ docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
   ghcr.io/cnighswonger/claude-code-cache-fix:latest
 ```
 
-**Forward-proxy mode in Docker** (keeps Remote Control; see [Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working)). Add `-e CACHE_FIX_FORWARD_PROXY=on` and persist the CA dir so the generated CA survives container restarts and can be read by the host client:
+**Forward-proxy mode in Docker** (keeps Remote Control; see [Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working)). Add `-e CACHE_FIX_FORWARD_PROXY=on` and point `CACHE_FIX_CA_DIR` at a writable path. The image runs as the unprivileged `node` user (uid 1000), and a fresh Docker named volume mounts **root-owned**, so use a bind mount you `chown` to uid 1000 (this also persists the CA across restarts and lets the host read it):
 
 ```bash
+mkdir -p ./cache-fix-ca && sudo chown 1000:1000 ./cache-fix-ca
 docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
   -e CACHE_FIX_FORWARD_PROXY=on \
-  -e CACHE_FIX_CA_DIR=/ca -v cache-fix-ca:/ca \
+  -e CACHE_FIX_CA_DIR=/ca -v "$PWD/cache-fix-ca:/ca" \
   ghcr.io/cnighswonger/claude-code-cache-fix:latest
 
-# Export the CA once, then point the client at the proxy (ANTHROPIC_BASE_URL stays unset):
-docker cp cache-fix-proxy:/ca/ca.pem ./cache-fix-ca.pem
-HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=$PWD/cache-fix-ca.pem claude
+# The CA is now at ./cache-fix-ca/ca.pem on the host. Point the client at the
+# proxy (leave ANTHROPIC_BASE_URL unset so Remote Control stays enabled):
+HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=$PWD/cache-fix-ca/ca.pem claude
 ```
+
+If you don't need the CA to persist on the host, drop the volume and let it live in the container's writable layer: `-e CACHE_FIX_CA_DIR=/tmp/cache-fix-ca` (then `docker cp cache-fix-proxy:/tmp/cache-fix-ca/ca.pem ./ca.pem` to fetch it). Check it worked: `curl -s localhost:9801/health` must report `"forward_proxy":true`; a `false` there means the proxy fell back to reverse-proxy (e.g. an unwritable CA dir).
 
 ### Health check
 
