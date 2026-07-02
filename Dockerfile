@@ -22,7 +22,10 @@
 FROM node:22-alpine
 
 # curl is needed for the HEALTHCHECK directive below (Alpine doesn't ship it).
-RUN apk add --no-cache curl
+# openssl is needed by forward-proxy mode (CACHE_FIX_FORWARD_PROXY=on) to
+# generate the MITM CA; without it forward-proxy silently falls back to
+# reverse-proxy. Harmless for reverse-proxy-only users (a few hundred KB).
+RUN apk add --no-cache curl openssl
 
 WORKDIR /app
 

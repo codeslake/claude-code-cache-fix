@@ -293,6 +293,14 @@ async function handleBootstrap(clientReq, clientRes) {
   clientRes.end(rawResponse);
 }
 
+// Set true only after attachForwardProxy() actually succeeds. `config
+// .forwardProxy` reflects the REQUESTED mode; this reflects the EFFECTIVE mode.
+// They diverge when forward-proxy was requested but attach failed (e.g. openssl
+// missing so CA generation threw) and we fell back to reverse-proxy. /health
+// reports the effective value so clients/monitoring aren't told forward-proxy
+// is on when it silently isn't.
+let _forwardProxyActive = false;
+
 function handleHealth(_req, res) {
   // Surface extension-load failures so callers (operators, monitoring) see
   // a degraded proxy state instead of a misleading "ok". See #196: a Node
@@ -310,7 +318,7 @@ function handleHealth(_req, res) {
     return;
   }
   res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ status: "ok", version: config.version, forward_proxy: config.forwardProxy }));
+  res.end(JSON.stringify({ status: "ok", version: config.version, forward_proxy: _forwardProxyActive }));
 }
 
 function handleNotFound(_req, res) {
@@ -470,7 +478,7 @@ export async function startProxy(options = {}) {
   // reverse-proxy only rather than preventing the proxy from serving.
   let forwardProxyCA = null;
   if (config.forwardProxy) {
-    try { forwardProxyCA = attachForwardProxy(server); }
+    try { forwardProxyCA = attachForwardProxy(server); _forwardProxyActive = true; }
     catch (err) { process.stderr.write(`[cache-fix] forward-proxy FAILED (reverse-proxy only): ${err && err.message}\n`); }
 
     // Self-heal: in forward-proxy mode the proxy MITMs the whole upstream host,
