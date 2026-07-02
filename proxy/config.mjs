@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
 
 function envInt(name, fallback) {
   const raw = process.env[name];
@@ -10,12 +11,18 @@ function envInt(name, fallback) {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// Package version, read once at init. Surfaced on /health so clients (e.g. a
+// status line) can show which cache-fix build is actually serving them.
+let _version = "unknown";
+try { _version = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf8")).version || "unknown"; } catch {}
+
 // Most fields are read once at module init (preserving prior behavior).
 // Corp-proxy/CA fields and `upstream` are getters so they reflect live env —
 // important for test isolation (see test/proxy-upstream-corp-proxy.test.mjs
 // and test/proxy-server-bootstrap.test.mjs) and for callers that legitimately
 // want to flip env at runtime.
 const config = {
+  version: _version,
   port: envInt("CACHE_FIX_PROXY_PORT", 9801),
   bind: process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1",
   get upstream() { return process.env.CACHE_FIX_PROXY_UPSTREAM || "https://api.anthropic.com"; },

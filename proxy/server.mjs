@@ -310,7 +310,7 @@ function handleHealth(_req, res) {
     return;
   }
   res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ status: "ok" }));
+  res.end(JSON.stringify({ status: "ok", version: config.version, forward_proxy: config.forwardProxy }));
 }
 
 function handleNotFound(_req, res) {
