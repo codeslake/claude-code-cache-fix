@@ -9,7 +9,7 @@
 //
 // It only MITMs the upstream host (api.anthropic.com), where the cacheable
 // /v1/messages traffic lives, and blind-tunnels every other CONNECT
-// (mcp-proxy.anthropic.com, telegram, npm, ...) untouched, so RC/MCP and
+// (mcp-proxy.anthropic.com, telemetry, npm, ...) untouched, so RC/MCP and
 // unrelated traffic are unaffected. The decrypted upstream request is fed into
 // the SAME http request handler used by reverse-proxy mode (server.emit
 // ('connection', tlsSocket)), so the entire extension pipeline is reused as-is.
