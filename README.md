@@ -29,7 +29,7 @@ That's it. The proxy applies its default extension pipeline automatically. No wr
 
 ### Forward-proxy mode (keeps Remote Control working)
 
-The quick-start above is **reverse-proxy mode**: you point `ANTHROPIC_BASE_URL` at the proxy. That is simple, but on Claude Code **>= 2.1.196** a non-Anthropic `ANTHROPIC_BASE_URL` **disables Remote Control** (`/remote-control`), `/schedule`, and claude.ai MCP connectors — CC treats any custom base URL like a Bedrock/Vertex gateway. If you rely on those features, use forward-proxy mode instead.
+The quick-start above is **reverse-proxy mode**: you point `ANTHROPIC_BASE_URL` at the proxy. That is simple, but on Claude Code **>= 2.1.196** a non-Anthropic `ANTHROPIC_BASE_URL` **disables Remote Control** (`/remote-control`), `/schedule`, and claude.ai MCP connectors (CC treats any custom base URL like a Bedrock/Vertex gateway). If you rely on those features, use forward-proxy mode instead.
 
 In **forward-proxy mode** the proxy sits in front of the *real* `api.anthropic.com` as an `HTTPS_PROXY`. Claude Code's base URL stays `api.anthropic.com`, so Remote Control keeps working, while the proxy still sees and transforms `/v1/messages`.
 
@@ -40,15 +40,50 @@ CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/serv
 #   export HTTPS_PROXY=http://127.0.0.1:9801
 #   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
 
-# Launch Claude Code through it — leave ANTHROPIC_BASE_URL UNSET
+# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
 HTTPS_PROXY=http://127.0.0.1:9801 \
 NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
   claude
 ```
 
-How it works: the proxy also handles HTTP `CONNECT`. It MITMs **only** the upstream host (`api.anthropic.com`) — terminating TLS with a locally-generated CA so it can run the same extension pipeline — and **blind-tunnels every other CONNECT** (mcp-proxy, telemetry, npm, ...) untouched. On first start it generates a CA under `~/.claude/cache-fix-ca/` (override with `CACHE_FIX_CA_DIR`); the client must trust it via `NODE_EXTRA_CA_CERTS`. A WebSocket/Upgrade to the upstream host (e.g. `/voice`) is relayed to upstream as-is. Because base URL stays `api.anthropic.com`, all of `/api/oauth/*`, `/v1/agents`, Remote Control credential fetches, etc. pass through untouched and RC stays enabled.
+How it works: the proxy also handles HTTP `CONNECT`. It MITMs **only** the upstream host (`api.anthropic.com`), terminating TLS with a locally-generated CA so it can run the same extension pipeline, and **blind-tunnels every other CONNECT** (mcp-proxy, telemetry, npm, ...) untouched. On first start it generates a CA under `~/.claude/cache-fix-ca/` (override with `CACHE_FIX_CA_DIR`); the client must trust it via `NODE_EXTRA_CA_CERTS`. A WebSocket/Upgrade to the upstream host (e.g. `/voice`) is relayed to upstream as-is. Because base URL stays `api.anthropic.com`, all of `/api/oauth/*`, `/v1/agents`, Remote Control credential fetches, etc. pass through untouched and RC stays enabled.
 
 Corporate proxy chaining works the same as reverse mode: set `HTTPS_PROXY`/`HTTP_PROXY` for the proxy's **own** upstream egress (the proxy dials `api.anthropic.com` through it). The client's `HTTPS_PROXY` points at the cache-fix proxy; the cache-fix proxy's `HTTPS_PROXY` (in its own env) points at the corporate proxy.
+
+**Running it persistently.** The `... node .../proxy/server.mjs &` above is fine for a quick try, but a backgrounded process is not supervised: it does not restart if it crashes or if the machine reboots. To run forward-proxy mode as a managed service (auto-restart, start-on-login), use the same `install-service` path described under [Running as a service](#running-as-a-service) — just set the flag at install time so it is baked into the unit:
+
+```bash
+CACHE_FIX_FORWARD_PROXY=on cache-fix-proxy install-service
+```
+
+The generated systemd unit / launchd agent carries `CACHE_FIX_FORWARD_PROXY=on`, so the service starts the proxy in forward-proxy mode and keeps it up (systemd `Restart=on-failure` plus the healthcheck timer; launchd `KeepAlive`).
+
+**The service only manages the proxy end.** It does **not** — and cannot — set anything on your `claude` client, which is a separate process. You still wire the client yourself in whatever shell launches `claude`, using the two values from the forward-proxy quick-start above:
+
+- `HTTPS_PROXY` — where the proxy listens: `http://127.0.0.1:<port>` (default port `9801`, or your `CACHE_FIX_PROXY_PORT`).
+- `NODE_EXTRA_CA_CERTS` — the CA the proxy generated on first start: `~/.claude/cache-fix-ca/ca.pem` (or `$CACHE_FIX_CA_DIR/ca.pem`).
+
+Three ways to wire it, depending on how broadly you want the vars to apply:
+
+```bash
+# a) per-invocation — scoped to just this claude run
+HTTPS_PROXY=http://127.0.0.1:9801 \
+NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
+  claude
+
+# b) whole shell — add to ~/.zshrc / ~/.bashrc (every HTTPS in that shell goes
+#    through the proxy; harmless since non-anthropic hosts are blind-tunneled,
+#    but that shell's HTTPS breaks if the proxy is ever down)
+export HTTPS_PROXY=http://127.0.0.1:9801
+export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
+
+# c) scoped to claude only — a shell function (recommended; avoids b's blast radius)
+claude() {
+  HTTPS_PROXY=http://127.0.0.1:9801 \
+  NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
+    command claude "$@"
+}
+```
 
 ### What the proxy does
 
@@ -531,7 +566,7 @@ Both modes write quota state on every API call. Proxy mode (v3.5.0+) splits into
 
 - **Q5h** quota bar `[███░┃░░░░░]` + percent + `(exhaust X, reset Y)`. Filled cells are consumed quota; the heavy-vertical tick is wall-clock elapsed position in the window. Tick to the right of the fill = under pace; tick inside the fill = burning faster than time (over pace). `exhaust` is the projected time-to-100% at the current burn rate; `reset` is the wall-clock time until the window rolls over. When `exhaust < reset`, you will hit 100% before the window resets — back off.
 - **Q7d** same shape with day-scale durations (e.g. `(exhaust 3d13h, reset 3d0h)`). Below a day, the suffix auto-switches to `h/m` format (e.g. `(exhaust 1h41m, reset 0h30m)`).
-- **TTL tier** derived from the response's measured `usage.cache_creation.ephemeral_1h_input_tokens` vs `ephemeral_5m_input_tokens`: `TTL:1h` when the 1h tier dominates, **`TTL:5m` in red when the server has downgraded you to the 5m tier** (typically at Q5h >= 100%). Reading the measured split (rather than guessing from whether the response had a cache read) keeps the tier stable across a workflow's subagent fan-out, where a fresh-prefix request legitimately has no cache read yet.
+- **TTL tier** — `TTL:1h` when healthy, **`TTL:5m` in red when the server has downgraded you** (typically at Q5h ≥ 100%)
 - **PEAK** in yellow during weekday peak hours (13:00–19:00 UTC)
 - **Cache hit rate %**
 - **OVERAGE** flag when active
@@ -695,12 +730,6 @@ The shipped [`tools/quota-statusline.sh`](tools/quota-statusline.sh) is the refe
 ### Why per-session
 
 On multi-agent hosts (multiple Claude Code sessions sharing one proxy), the pre-v3.5.0 single global file caused every session to overwrite the others' cache stats with each response. A statusline reading from session A would show session B's TTL tier whenever B sent a request more recently. Per-session files plus an account-global quota file resolve this without losing the easy account-wide view. See [#104](https://github.com/cnighswonger/claude-code-cache-fix/issues/104) for the original report.
-
-### `CLAUDE_CONFIG_DIR`
-
-Claude Code reads `CLAUDE_CONFIG_DIR` to relocate its config root away from the default `~/.claude` (used to keep multiple independent config roots in separate directories). The proxy now honors the same variable for **all** of its on-disk state: `quota-status/`, `usage.jsonl`, `cache-fix-state/`, session mirrors, snapshots, and OAuth events all land under `$CLAUDE_CONFIG_DIR` instead of a hardcoded `~/.claude`. When it's unset the proxy uses `~/.claude` exactly as before (no change for the common single-config case).
-
-This matters when you run **one proxy per config dir**: without it, every proxy writes to `~/.claude/quota-status/account.json` and they clobber each other's quota state. Give each proxy the same `CLAUDE_CONFIG_DIR` its Claude Code client uses, and their state stays cleanly separated.
 
 ## Image stripping (preload mode)
 
