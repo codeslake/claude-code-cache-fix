@@ -15,7 +15,7 @@ fail=0
 #
 # `discovery` is deliberately absent from this list: it is emitted only on a host
 # with no run dir, so requiring it would fail every host that has one.
-REQUIRED="launcher ca-trust proxy-live deploy-live"
+REQUIRED="launcher ca-trust proxy-live deploy-live ca-trust-live"
 seen=""
 say() {
   printf '%s\t%s\t%s\n' "$1" "$2" "$3"
@@ -222,6 +222,43 @@ for port in ${ports:-}; do
     say deploy-live FAIL "port $port: holder is running $lh, disk is $dh — deployed, not running"
   else
     say deploy-live OK "port $port: proxy $lp and holder $lh both match disk"
+  fi
+
+  # 5. ASK THE PROCESS THAT ACTUALLY TERMINATES TLS.
+  #
+  #    Check 2 runs bin/ca-trust.mjs in THIS shell and asks whether a fresh node
+  #    process can load our CA from the bundle. That is not the question. The
+  #    proxy read its CA at startup and holds it in memory: regenerate the CA
+  #    under a running proxy and check 2 still says OK while every handshake
+  #    fails. /health publishes no CA fingerprint, so nothing else covers it.
+  #
+  #    The shape came from cswap's pin: their check ran `cswap pin` in their own
+  #    shell, which reads the keychain, while the DAEMON could not — and a Mac
+  #    served unpinned for 27 hours behind 8/8 green. A CLI that works is not
+  #    evidence about the daemon.
+  #
+  #    So: a real CONNECT through this port, and verify the leaf it presents
+  #    against the CA on this box's disk. Measured 2026-08-08 on all three —
+  #    `Verify return code: 0 (ok)`, issuer CN=cache-fix forward-proxy CA;
+  #    negative control against the system store gives 19, so a pass here is not
+  #    something every store would produce.
+  #
+  #    Only inside the `ours` branch, so another install's proxy on 9902/9903 is
+  #    never asked to present OUR CA. No `timeout` wrapper: macOS ships no
+  #    coreutils, and wrapping it made this probe return EMPTY on both Macs —
+  #    which reads as failure and is not.
+  ca="$CFG/cache-fix-ca/ca.pem"
+  if [ ! -r "$ca" ]; then
+    say ca-trust-live FAIL "port $port: no CA at $ca to verify the live leaf against"
+  else
+    v=$(openssl s_client -proxy "127.0.0.1:$port" -connect api.anthropic.com:443 \
+          -servername api.anthropic.com -CAfile "$ca" </dev/null 2>/dev/null \
+        | sed -n 's/^Verify return code: //p' | head -1)
+    case "$v" in
+      "0 (ok)") say ca-trust-live OK "port $port: the live leaf chains to $ca" ;;
+      "")       say ca-trust-live FAIL "port $port: no handshake to read — the check could not look" ;;
+      *)        say ca-trust-live FAIL "port $port: the LIVE leaf does not chain to our CA ($v) — the running proxy is not using $ca" ;;
+    esac
   fi
 done
 
