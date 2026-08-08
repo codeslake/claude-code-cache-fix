@@ -5,7 +5,24 @@ set -u
 D="$HOME/.local/share/cache-fix-fork"
 CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 fail=0
-say() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; [ "$2" = FAIL ] && fail=1; return 0; }
+# EVERY REQUIRED CHECK MUST SPEAK, and silence is the failure this records.
+# `say` raises `fail` only when it is CALLED, so a check whose block was deleted
+# or renamed, or whose branches all missed, emits nothing and this script still
+# exits 0. Measured on lambda-docker: dropping the whole `deploy-live` block —
+# the one check that answers "did the deploy actually take" — left EXIT=0 with
+# three checks instead of four. "The deploy check is gone" and "the deploy check
+# passed" produced the identical result, and EXIT=0 is what gets quoted.
+#
+# `discovery` is deliberately absent from this list: it is emitted only on a host
+# with no run dir, so requiring it would fail every host that has one.
+REQUIRED="launcher ca-trust proxy-live deploy-live"
+seen=""
+say() {
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3"
+  case " $seen " in *" $1 "*) ;; *) seen="$seen $1" ;; esac
+  [ "$2" = FAIL ] && fail=1
+  return 0
+}
 
 # 1. The launcher parses at all. A tree that cannot even be loaded is the one
 #    failure that makes every other probe meaningless.
@@ -154,9 +171,17 @@ for port in ${ports:-}; do
     # -sf` throws away, so this read is empty for both "no proxy at all" and
     # "the address is up with no proxy behind it" — and the second is a deploy
     # that did not take. A check that cannot run must fail, not skip.
+    # AND THE ELSE-BRANCH USED TO SKIP, three lines under a comment forbidding
+    # exactly that. Nothing answered and it is not a carrying relay, so this
+    # check COULD NOT LOOK — which is a FAIL, not a pass. `proxy-live` happens
+    # to fail on the same port today, so this never produced a false green on
+    # its own; that is shadowing, not coverage, and it disappears the moment
+    # either check's port list changes.
     if curl -s --max-time 3 --noproxy '*' "http://127.0.0.1:$port/health" 2>/dev/null \
          | grep -q '"carrying":"gap-relay"'; then
       say deploy-live FAIL "port $port: no proxy is running — a standby relay is carrying the address"
+    else
+      say deploy-live FAIL "port $port: nothing answered /health, so this check could not look"
     fi
     continue
   fi
@@ -198,6 +223,14 @@ for port in ${ports:-}; do
   else
     say deploy-live OK "port $port: proxy $lp and holder $lh both match disk"
   fi
+done
+
+# The absence sweep. Runs last so every check has had its chance to speak.
+for c in $REQUIRED; do
+  case " $seen " in
+    *" $c "*) ;;
+    *) say "$c" FAIL "check never ran — its block is missing, renamed, or every branch missed" ;;
+  esac
 done
 
 exit $fail
