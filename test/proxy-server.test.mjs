@@ -1,12 +1,42 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
+import { execFileSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { mkdir, writeFile, rm } from "node:fs/promises";
+import { readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { startProxy } from "../proxy/server.mjs";
+import { join, dirname } from "node:path";
+import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
+
+const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
+const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
+
+function listeners(port) {
+  try {
+    return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+      .trim().split("\n").filter(Boolean);
+  } catch { return []; }
+}
+
+const cmdOf = (pid) => {
+  try { return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }); }
+  catch { return ""; }
+};
+
+const usedPorts = [];
+async function freePort() {
+  const s = net.createServer();
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  const p = s.address().port;
+  await new Promise((r) => s.close(r));
+  usedPorts.push(p);
+  return p;
+}
 
 let handle;
 let proxyPort;
@@ -340,5 +370,661 @@ describe("proxy server /health degraded (#196)", () => {
     // Guard against regression to a Linux-specific hint that would mislead
     // macOS operators (the round-1 Codex finding on this PR).
     assert.ok(!/cache-fix-proxy\.service/.test(parsed.hint), "hint must not be systemd-specific");
+  });
+});
+
+describe("zero-downtime reload", () => {
+  // A reload must not cut a response that is already streaming. Kill-then-respawn
+  // does: the port is unbound between the two, and every in-flight body dies.
+  //
+  // Driven with two REAL server processes over a socket THIS test binds and
+  // never closes, because the question is whether a successor can serve a
+  // listener it did not bind — which an in-process test cannot ask.
+  it("a successor serves the inherited socket while the old process is still streaming", async () => {
+    // A deliberately slow upstream, so the response is still open at the reload.
+    //
+    // Ended on DEMAND, not on a chunk count: a fixed 12 x 250ms budget has to
+    // outlast a whole second proxy boot, and on CI's 2-core runner it did not —
+    // the stream finished first and the test's own premise check fired
+    // ("it had already finished after 1 chunks"). Now it streams until this
+    // test says stop, so the boot can take as long as the box needs.
+    // EVERY open response, not "the last one to arrive". A single `stopStream`
+    // variable was overwritten by the next request this upstream served — the
+    // proxy's own boot probe reaches it too — so the 1.5s stop closed a
+    // different response and the streaming one was cut by nothing the test
+    // could see. It surfaced as the premise check firing with `ended` true,
+    // which reads as "the upstream finished" and is the opposite of what
+    // happened.
+    const openStreams = new Set();
+    const stopStream = () => { for (const s of openStreams) s(); openStreams.clear(); };
+    const upstream = http.createServer((q, r) => {
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let n = 0;
+      const t = setInterval(() => r.write(`data: ${++n}\n\n`), 250);
+      const stop = () => { clearInterval(t); try { r.end(); } catch {} };
+      openStreams.add(stop);
+      r.on("close", () => { clearInterval(t); openStreams.delete(stop); });
+      q.resume();
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const upPort = upstream.address().port;
+
+    // The supervisor's socket. Bound once here and never closed — that is the
+    // whole mechanism, so nothing in this test may close it early.
+    //
+    // The real supervisor is a shell: it holds the fd and NEVER accepts. A node
+    // server accepts unconditionally, and the kernel shares accepts with the
+    // proxy that inherited the same socket — so one this fixture took was
+    // answered with a 15-byte /health body, and the streaming client saw its
+    // response END after one chunk. Measured under load: steals tracked the
+    // failure 1:1, one steal per failing run and none in a passing one.
+    //
+    // `pause()` is the fix, not a bigger backlog: it stops this process pulling
+    // from the accept queue while the socket stays bound, which is exactly what
+    // a shell holding an fd does.
+    const stolenSockets = new Set();
+    const listener = net.createServer();
+    // A steal is UNAVOIDABLE: a node server accepts, and there is no knob that
+    // holds the fd without accepting (measured — net.Server has no pause(), and
+    // maxConnections=0 accepts then RSTs 19 of 20). The kernel shares the accept
+    // queue with the proxies that inherited this socket, so some connections
+    // land here.
+    //
+    // So RESET a steal and let the caller retry. The two alternatives both
+    // corrupt the measurement: ANSWERING it (the old `content-length: 15`
+    // /health body) ended the streaming client after one chunk — steals tracked
+    // the failure 1:1 under load — and holding it open with no reply hangs the
+    // caller until its own deadline. A reset is the one answer a client can
+    // tell apart from a served response, so the retry below is sound.
+    let stolen = 0;
+    listener.on("connection", (c) => {
+      stolen++;
+      c.on("error", () => {});
+      c.resetAndDestroy?.() ?? c.destroy();
+    });
+    await new Promise((r) => listener.listen({ port: 0, host: "127.0.0.1" }, r));
+    const PORT = listener.address().port;
+    const fd = listener._handle.fd;
+    assert.ok(fd >= 0, `no numeric fd for the listening socket on ${process.platform}`);
+
+    const env = { ...process.env,
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upPort}`,
+      LISTEN_FDS: "1" };
+    // Ambient proxy vars would send this test's own requests through a real
+    // proxy on the developer's box, which hangs forever.
+    // ALL_PROXY too, not just the http/https pair: node consults it as a fallback,
+    // so a developer whose shell exports one (an account-pinning MITM, say) sends
+    // this test's own upstream traffic through it. Measured on such a box under
+    // load — the relayed stream was ended after one chunk and the premise check
+    // fired, describing a defect that only existed in the harness.
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"]) delete env[k];
+
+    // Through the LAUNCHER, which is what a supervisor actually runs. `stdio:
+    // "inherit"` there passes fds 0-2 only, so this is where a handed-down
+    // socket is silently lost and the server binds its own port instead.
+    const boot = () => spawn(process.execPath, [launcherPath, "server"], {
+      env, stdio: ["ignore", "pipe", "pipe", fd] });
+    const started = (p) => new Promise((res, rej) => {
+      const to = setTimeout(() => rej(new Error("proxy did not report listening")), 15_000);
+      p.stdout.on("data", (d) => { if (/listening/.test(String(d))) { clearTimeout(to); res(); } });
+      p.on("error", rej);
+    });
+
+    const older = boot();
+    const kids = [older];
+    try {
+      await started(older);
+
+      // Start streaming, and wait until bytes are actually flowing — a request
+      // that has not been answered yet would prove nothing about in-flight.
+      let chunks = 0, ended = false, failure = null;
+      // Retried on a reset, because a steal RSTs (above). Only BEFORE any byte
+      // arrives: once the proxy is streaming, a reset is the defect this test
+      // exists to catch and must never be retried away.
+      const openStream = () => {
+        const r = http.request(
+          { host: "127.0.0.1", port: PORT, path: "/v1/messages", method: "POST",
+            headers: { "content-type": "application/json" } },
+          (res) => {
+            res.on("data", () => chunks++);
+            res.on("end", () => { ended = true; });
+            res.on("error", (e) => { failure = e.code || e.message; });
+          });
+        r.on("error", (e) => {
+          if (chunks === 0 && Date.now() < flowing) return void openStream();
+          failure = e.code || e.message;
+        });
+        r.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+        return r;
+      };
+      const flowing = Date.now() + 10_000;
+      openStream();
+      while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 100));
+      assert.ok(chunks > 0, `premise: the response must be streaming before the reload. failure=${failure}`);
+
+      const newer = boot();
+      kids.push(newer);
+      await started(newer);
+
+      // PRECONDITION, asserted rather than assumed: the stream must still be
+      // OPEN at the reload, or "it completed" is satisfied by a response that
+      // had already finished and the test measures nothing. An accidental
+      // control is invisible until a slower box or a faster upstream turns this
+      // green without exercising anything.
+      assert.ok(!ended, `premise: the stream must still be open at the reload; it had already ` +
+        `finished after ${chunks} chunks, so this run measured a completed response`);
+      const midflight = chunks;
+
+      older.kill("SIGTERM");
+      // Let a few more chunks cross the handover, THEN end it. The assertions
+      // below are "nothing was cut" and "chunks arrived after the reload";
+      // both need the stream to outlive the signal, not the clock.
+      setTimeout(() => stopStream(), 1_500);
+      const done = Date.now() + 20_000;
+      while (!ended && !failure && Date.now() < done) await new Promise((r) => setTimeout(r, 100));
+
+      assert.equal(failure, null, `the reload cut a response that was already streaming (${failure})`);
+      assert.ok(ended, "the streaming response never completed across the reload");
+      // ...and it kept going AFTER the reload rather than having been complete
+      // at the moment of it.
+      assert.ok(chunks > midflight,
+        `no chunk arrived after the reload (${midflight} before, ${chunks} total), ` +
+        `so the handover was never exercised`);
+
+      // The successor is serving, and it is the one still alive.
+      //
+      // RETRIED ON A RESET, the same rule the streaming request above follows
+      // and for the same reason: this fixture's listener shares the accept
+      // queue and RSTs whatever it takes (`resetAndDestroy`, ~40 lines up), so
+      // a single probe that happens to be stolen fails on the harness rather
+      // than on the proxy. The odds scale with how little CPU there is —
+      // measured, this passed 2 of 2 full-file runs on 48 cores and failed 3 of
+      // 3 pinned to 2 with `taskset -c 0,1`, which is CI's shape. The error was
+      // always ERR:ECONNRESET, never a bad body.
+      //
+      // A reset is the ONE answer a client can tell apart from a served
+      // response, which is what makes retrying sound here; a wrong body or a
+      // refusal still fails, because those are the proxy's answers, not the
+      // fixture's.
+      const probe = () => new Promise((res) => {
+        http.get({ host: "127.0.0.1", port: PORT, path: "/health" }, (r) => {
+          let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+        }).on("error", (e) => res(`ERR:${e.code}`));
+      });
+      let health = await probe();
+      const settled = Date.now() + 10_000;
+      while (health === "ERR:ECONNRESET" && Date.now() < settled) health = await probe();
+      assert.ok(!health.startsWith("ERR:"),
+        `the port answered nothing after the predecessor exited: ${health}`);
+      assert.equal(JSON.parse(health).status, "ok",
+        `nothing served the port after the predecessor exited (got ${JSON.stringify(health.slice(0, 120))})`);
+    } finally {
+      // SIGTERM, not SIGKILL: the launcher forwards it to the server it spawned.
+      // SIGKILL cannot be forwarded, so the server would outlive its parent and
+      // keep this test's event loop alive on its pipes.
+      for (const k of kids) { try { k.kill("SIGTERM"); } catch {} }
+      await Promise.all(kids.map((k) => new Promise((r) => {
+        if (k.exitCode !== null || k.signalCode) return r();
+        const t = setTimeout(() => { try { k.kill("SIGKILL"); } catch {} r(); }, 8_000);
+        k.on("exit", () => { clearTimeout(t); r(); });
+      })));
+      // Before close(): it waits on every open response, and an assertion that
+      // threw before the deliberate stop above leaves this one streaming
+      // forever — the cleanup would hang rather than report the failure.
+      stopStream();
+      await new Promise((r) => upstream.close(r));
+      for (const c of stolenSockets) c.destroy();
+      await new Promise((r) => listener.close(r));
+      // REAP THE SUCCESSOR. SIGTERM above is the signal that means "hand the
+      // socket on", so each stop above BREEDS a detached proxy that ignores
+      // exit-with-parent by design — that guard is what makes a redeploy free.
+      // Nothing here was reaping them: measured, 3 left per run, all
+      // FROM_HANDOVER=1 at ppid 1, one of them on 9801. They hold this runner's
+      // stdio, so the file finished its cases and then never exited, and with
+      // it the whole `npm test` — 1,108 cases in and no exit code.
+      //
+      // SIGHUP, never SIGTERM: SIGTERM would breed the next one and this loop
+      // would never drain.
+      // BOTH PORTS. Some cases here make the handed-down fd deliberately
+      // unusable, and the server then falls back to binding the DEFAULT — so a
+      // successor bred from one of those sits on 9801, not on this fixture's
+      // port. Reaping only the fixture's port left exactly one behind, measured,
+      // and one is enough to hold the runner open.
+      const defaultPort = Number(
+        /envInt\("CACHE_FIX_PROXY_PORT",\s*(\d+)\)/.exec(
+          readFileSync(new URL("../proxy/config.mjs", import.meta.url), "utf8"))?.[1]) || 0;
+      for (let i = 0; i < 5; i++) {
+        let owners = [];
+        for (const port of [PORT, defaultPort].filter(Boolean)) {
+          try {
+            owners = owners.concat(
+              execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                           { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+                .trim().split("\n").filter(Boolean));
+          } catch { /* nobody on that one */ }
+        }
+        if (!owners.length) break;
+        let signalled = 0;
+        for (const o of owners) {
+          const pid = Number(o);
+          if (!Number.isInteger(pid) || pid <= 1) continue;
+          let ppid = 0;
+          try { ppid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
+          catch { continue; }
+          if (ppid !== 1) continue;          // only an orphan; never a neighbour's live fixture
+          try { process.kill(pid, "SIGHUP"); signalled++; } catch {}
+        }
+        if (!signalled) break;
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  });
+
+
+  // `LISTEN_FDS` reaches every descendant, so a proxy can be handed a claim for
+  // a socket it does not have. Both doors: named for another pid, and named for
+  // us but pointing at something unservable (fd 3 in an IPC-forked child is the
+  // IPC channel — `listen({fd:3})` fails EEXIST there). Either way it must end
+  // up serving a port of its own, never nothing.
+  for (const [name, env] of [
+    ["addressed to another process", { LISTEN_FDS: "1", LISTEN_PID: String(process.pid + 1) }],
+    ["pointing at an unservable fd", { LISTEN_FDS: "1" }],
+  ]) {
+    it(`binds its own port when LISTEN_FDS is ${name}`, async () => {
+      const saved = { fds: process.env.LISTEN_FDS, pid: process.env.LISTEN_PID };
+      Object.assign(process.env, env);
+      if (!("LISTEN_PID" in env)) delete process.env.LISTEN_PID;
+      let handle = null;
+      try {
+        handle = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
+        assert.ok(handle.port > 0, "bound nothing of its own, so the port is unserved");
+        const body = await new Promise((res) => {
+          http.get({ host: "127.0.0.1", port: handle.port, path: "/health" }, (r) => {
+            let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+          }).on("error", (e) => res(`ERR:${e.code}`));
+        });
+        assert.equal(JSON.parse(body).status, "ok", "the port it bound does not serve");
+      } finally {
+        for (const [k, v] of [["LISTEN_FDS", saved.fds], ["LISTEN_PID", saved.pid]]) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+        if (handle) await handle.close();
+      }
+    });
+  }
+
+  // The upstream comes from HTTPS_PROXY, so it is chosen by whichever shell
+  // launched us. Started from a shell that already exports the chain, this proxy
+  // adopts a hop pointing back at itself and every request loops instead of
+  // reaching the internet.
+  //
+  // Happened twice on one box in one day. Both times /health was fully green —
+  // status ok, forward_proxy true, port bound — because those fields report what
+  // is CONFIGURED. Only the VALUE of https_proxy showed it, which is why this
+  // asserts a refusal to START rather than a health field.
+  describe("upstream self-reference", () => {
+    const self = (u, port = 9901, bind = "127.0.0.1") => upstreamPointsAtSelf(u, port, bind);
+
+    it("refuses an upstream that is this proxy's own address", () => {
+      // The incident verbatim: pin credentials, our own port.
+      assert.ok(self("http://cswap:tok@127.0.0.1:9901"), "the measured loop was allowed");
+      assert.ok(self("http://127.0.0.1:9901"), "bare self-reference was allowed");
+      assert.ok(self("http://localhost:9901"), "a local alias of ourselves was allowed");
+    });
+
+    it("allows the hop below, and any remote host", () => {
+      assert.equal(self("http://127.0.0.1:8118"), "",
+        "refused the CORRECT next hop — this would break every healthy start");
+      assert.equal(self("http://proxy.corp:9901"), "",
+        "refused a remote upstream that merely shares our port number");
+      assert.equal(self(""), "", "refused when there is no upstream at all");
+    });
+
+    it("does not echo credentials into the error", () => {
+      assert.ok(!self("http://cswap:SECRET@127.0.0.1:9901").includes("SECRET"),
+        "the refusal message would leak a token into every log that captures it");
+    });
+
+    // THE PORT THE HOLDER ADVERTISES, not the one we were asked to bind. This
+    // is the ONLY shape the guard was written for and the one it could never
+    // see: a holder hands its child the socket on fd 3 and spawns it with
+    // CACHE_FIX_PROXY_PORT=0, so `port` is 0 here and every real upstream
+    // compares unequal. The measured incident the guard cites (9901 -> 36301 ->
+    // 9901) is exactly this. /health made it worse by reading the BOUND port,
+    // so a looped child booted fine and then published upstream_is_self: true,
+    // contradicting the comment claiming that can never happen.
+    it("refuses a loop through the ADVERTISED port, not just the requested one", async () => {
+      const saved = { p: process.env.HTTPS_PROXY, h: process.env.CACHE_FIX_HELD_PORT };
+      process.env.HTTPS_PROXY = "http://127.0.0.1:19894";
+      process.env.CACHE_FIX_HELD_PORT = "19894";
+      // CLOSED IF IT STARTS. When this assertion fails, startProxy has RESOLVED
+      // — it bound a real port — and leaving that behind hung the whole file for
+      // its 200s ceiling on the first run. A fixture that hangs on failure hides
+      // the defect it just found.
+      let started = null;
+      try {
+        await assert.rejects(
+          // port 0 == "bind anything", which is what the holder passes.
+          async () => { started = await startProxy({ port: 0, bind: "127.0.0.1", watch: false }); },
+          /refusing to start/,
+          "a child handed an inherited socket booted with its upstream pointing at " +
+          "the address it serves — every request loops back into itself");
+      } finally {
+        try { await started?.close?.(); } catch {}
+        if (saved.p === undefined) delete process.env.HTTPS_PROXY; else process.env.HTTPS_PROXY = saved.p;
+        if (saved.h === undefined) delete process.env.CACHE_FIX_HELD_PORT; else process.env.CACHE_FIX_HELD_PORT = saved.h;
+      }
+    });
+
+    it("startProxy actually refuses, not just the predicate", async () => {
+      const saved = process.env.HTTPS_PROXY;
+      process.env.HTTPS_PROXY = "http://127.0.0.1:19893";
+      try {
+        await assert.rejects(
+          () => startProxy({ port: 19893, bind: "127.0.0.1", watch: false }),
+          /refusing to start/,
+          "the predicate is right but nothing calls it — a looping proxy still boots");
+      } finally {
+        if (saved === undefined) delete process.env.HTTPS_PROXY;
+        else process.env.HTTPS_PROXY = saved;
+      }
+    });
+
+    // The self-loop guard only catches an upstream that is US. The process
+    // measured during the outage pointed at the hop IN FRONT of us (the pin),
+    // which is not our address and passes that guard — so the upstream must
+    // stop being whatever the launching shell exported.
+    it("a dedicated upstream variable outranks the session's wiring", async () => {
+      const saved = { u: process.env.CACHE_FIX_UPSTREAM_PROXY, s: process.env.HTTPS_PROXY };
+      process.env.CACHE_FIX_UPSTREAM_PROXY = "http://127.0.0.1:8118";
+      process.env.HTTPS_PROXY = "http://127.0.0.1:36301";
+      try {
+        const { default: fresh } = await import(`../proxy/config.mjs?u=${Date.now()}`);
+        assert.equal(fresh.httpsProxy, "http://127.0.0.1:8118",
+          "an inherited HTTPS_PROXY beat the dedicated variable — this is the outage");
+        assert.equal(fresh.httpProxy, "http://127.0.0.1:8118",
+          "httpProxy ignored the dedicated variable, so the fallthrough still loops");
+      } finally {
+        for (const [k, v] of [["CACHE_FIX_UPSTREAM_PROXY", saved.u], ["HTTPS_PROXY", saved.s]]) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+
+    it("run-service drops inherited wiring, and says so in the source", () => {
+      const src = readFileSync(new URL("../bin/claude-via-proxy.mjs", import.meta.url), "utf8");
+      const branch = /SUBCOMMAND === "run-service"[\s\S]*?return holdPort/.exec(src)?.[0];
+      assert.ok(branch, "the run-service branch moved — this no longer tests it");
+      for (const k of ["HTTPS_PROXY", "ALL_PROXY", "HTTP_PROXY"]) {
+        assert.match(branch, new RegExp(`"${k}"`),
+          `run-service does not clear ${k}, so a wired shell still decides our upstream`);
+      }
+      assert.match(branch, /CACHE_FIX_UPSTREAM_PROXY/,
+        "clearing without an escape hatch leaves an operator no way to set the upstream");
+    });
+
+    // Both outages had every health field green, because they all reported what
+    // was CONFIGURED. These two report what IS: the port we took, and whether
+    // our own upstream loops back to us.
+    it("health reports the port it actually bound", async () => {
+      const handle = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
+      try {
+        const body = await new Promise((res) => {
+          http.get({ host: "127.0.0.1", port: handle.port, path: "/health" }, (r) => {
+            let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+          }).on("error", (e) => res(`ERR:${e.code}`));
+        });
+        const h = JSON.parse(body);
+        assert.equal(h.listen_port, handle.port,
+          "health did not name the bound port — a proxy on the wrong port reads as healthy");
+        assert.notEqual(h.listen_port, 0,
+          "port 0 was echoed back rather than the ephemeral port actually taken");
+        assert.equal(h.upstream_is_self, false,
+          "a proxy with no self-referencing upstream reported one");
+      } finally {
+        await handle.close();
+      }
+    });
+
+    // A service binds an address sessions were ALREADY told to use, so the
+    // built-in default is a wrong answer rather than a missing one: it binds a
+    // port nobody dials while every health field reports a healthy proxy.
+    // Measured — a run-service started without it took 9801 while the fleet was
+    // on 9901, and that process was still sitting there 9 hours later.
+    it("run-service refuses to guess its port", () => {
+      const port = process.env.CACHE_FIX_PROXY_PORT;
+      delete process.env.CACHE_FIX_PROXY_PORT;
+      try {
+        // Bounded: without a refusal this command HOLDS THE PORT FOREVER, and
+        // `node --test` has no default timeout, so the whole run would hang
+        // with nothing reported rather than failing.
+        const r = execFileSync(process.execPath,
+          [fileURLToPath(new URL("../bin/claude-via-proxy.mjs", import.meta.url)), "run-service"],
+          { encoding: "utf8", env: { ...process.env, CACHE_FIX_FORWARD_PROXY: "on" },
+            stdio: ["ignore", "pipe", "pipe"], timeout: 20_000, killSignal: "SIGKILL" });
+        assert.fail(`run-service started without a port and printed: ${r.slice(0, 120)}`);
+      } catch (e) {
+        // A timeout also lands here, and reading it as a refusal would let the
+        // exact failure this guards against pass as a success.
+        assert.notEqual(e.code, "ETIMEDOUT",
+          "run-service neither refused nor exited — it is holding a port it was never given");
+        assert.match(String(e.stderr ?? e.message), /needs CACHE_FIX_PROXY_PORT/,
+          "it did not refuse — a service bound a port nobody was told about");
+      } finally {
+        if (port === undefined) delete process.env.CACHE_FIX_PROXY_PORT;
+        else process.env.CACHE_FIX_PROXY_PORT = port;
+      }
+    });
+
+    // The polluted process had HTTPS_PROXY on the pin and HTTP_PROXY on itself.
+    // selectProxyUrl falls through to httpProxy when httpsProxy is empty, so
+    // that half alone still builds the loop.
+    it("refuses when only HTTP_PROXY names us", async () => {
+      const saved = { s: process.env.HTTPS_PROXY, p: process.env.HTTP_PROXY };
+      delete process.env.HTTPS_PROXY;
+      process.env.HTTP_PROXY = "http://127.0.0.1:19894";
+      try {
+        await assert.rejects(
+          () => startProxy({ port: 19894, bind: "127.0.0.1", watch: false }),
+          /refusing to start/,
+          "HTTP_PROXY pointing at us was allowed — the loop forms through the fallthrough");
+      } finally {
+        for (const [k, v] of [["HTTPS_PROXY", saved.s], ["HTTP_PROXY", saved.p]]) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+  });
+
+});
+
+// ONE SWEEP FOR THE FILE, over the ports it handed out and nobody else's. A
+// standby relay outlives a holder that was killed rather than released — that
+// is the point of it — and while it has not armed yet it holds a socket nobody
+// listened on, so a case's own cleanup cannot see it. Reaping by process name
+// instead would reach into a neighbouring file's live fixture, since node runs
+// test files concurrently in their own processes.
+after(async () => {
+  for (let i = 0; i < 6; i++) {
+    let any = false;
+    for (const port of usedPorts) {
+      for (const q of listeners(port)) {
+        // OURS ONLY. freePort() releases the port before handing it over, so by
+        // sweep time the OS may have given it to something unrelated — and
+        // signalling a stranger is exactly what holderPidOn's own comment
+        // refuses to do.
+        if (!/claude-via-proxy|gap-relay|server\.mjs|scratch-launcher-|scratch-fake-server-/.test(cmdOf(q))) continue;
+        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
+      }
+    }
+    if (!any && i) break;
+    await new Promise((r) => setTimeout(r, 700));
+  }
+});
+
+// close() MUST RESOLVE AFTER shutdown() HAS ALREADY UNBOUND.
+//
+// shutdown() closes the server first — announcing the release while we still
+// hold the socket makes the supervisor race a bind it must lose — and then
+// drains through handle.close(). That second server.close() reports
+// ERR_SERVER_NOT_RUNNING, so on the ONE path that calls it this promise always
+// rejected. Nothing handles that rejection; only the process.exit() inside the
+// .finally() beat the unhandled-rejection report to it, which means the shape
+// was one edit away from turning every clean shutdown into a crash.
+//
+// Both callbacks fire on the same 'close' event, after the drain, so resolving
+// is not a papered-over failure — it is the true answer.
+describe("close() after an external server.close()", () => {
+  it("resolves rather than rejecting with ERR_SERVER_NOT_RUNNING", async () => {
+    const handle = await startProxy({ port: 0, watch: false });
+    // Exactly what shutdown() does one line before it calls close().
+    handle.server.close();
+    await handle.close();   // rejecting here fails the case
+  });
+
+  it("still rejects a close that fails for a REAL reason", async () => {
+    const handle = await startProxy({ port: 0, watch: false });
+    const boom = new Error("disk on fire");
+    boom.code = "EIO";
+    const real = handle.server.close.bind(handle.server);
+    handle.server.close = (cb) => cb(boom);
+    try {
+      await assert.rejects(() => handle.close(), /disk on fire/,
+        "the ERR_SERVER_NOT_RUNNING exemption swallowed a genuine close failure");
+    } finally {
+      // The stub never closed anything, so the listener is still up.
+      handle.server.close = real;
+      await new Promise((r) => real(r));
+    }
+  });
+});
+
+// ONE FIELD MUST NOT CARRY TWO MEANINGS.
+//
+// /health.https_proxy publishes a URL in two different situations: the hop a
+// resolve actually used, and the first configured candidate on a proxy that has
+// dialled nothing yet. From the string alone a reader cannot tell them apart,
+// so any consumer's confirm logic would have to guess — and a guess is what the
+// fix was removing. That is why https_proxy_measured exists.
+//
+// The objection was raised by cswap's pin during review; the comment then went
+// further and said pin READS this field, which is measured false — their check
+// dials pin's own :36301. A good review point does not make the reviewer a
+// consumer, and this comment turned one into the other.
+describe("/health hop reporting", () => {
+  const ENV = ["CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_FALLBACK_PROXIES",
+               "CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy",
+               "HTTP_PROXY", "http_proxy", "CACHE_FIX_CHAIN_GRACE_MS"];
+
+  const health = (port) => new Promise((resolve, reject) => {
+    const r = http.request({ host: "127.0.0.1", port, method: "GET", path: "/health" }, (res) => {
+      let b = ""; res.on("data", (c) => { b += c; }); res.on("end", () => resolve(JSON.parse(b)));
+    });
+    r.on("error", reject); r.end();
+  });
+
+  it("says whether the published hop was MEASURED or merely configured", async () => {
+    const saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
+    const caDir = join(tmpdir(), `ccf-health-hop-${process.pid}`);
+    // A hop address with nothing behind it, so the chain is guaranteed to fail.
+    const probe = net.createServer();
+    await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+    const deadPort = probe.address().port;
+    await new Promise((r) => probe.close(r));
+
+    let handle;
+    try {
+      for (const k of ENV) delete process.env[k];
+      process.env.CACHE_FIX_FORWARD_PROXY = "on";
+      process.env.CACHE_FIX_CA_DIR = caDir;
+      process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${deadPort}`;
+      // THE GRACE IS PAID, and the comment that used to sit here said it was not.
+      // CHAIN_GRACE_MS is a module-level const captured at import, so setting the
+      // env after upstream.mjs is already loaded changes nothing — measured, this
+      // case runs 2,616 ms, which is one full 2,500 ms default window. Setting it
+      // anyway and calling the retry loop "not under test" was a lie in a comment,
+      // which is worse than the 2.5 s: it tells the next reader the wait is gone.
+      // Not worth a production getter — an operator sets this before the proxy
+      // starts, which is the only moment it is read, and that path works.
+
+      handle = await startProxy({ port: 0, watch: false });
+
+      // Nothing dialled yet: the candidate is all that is known, and it must be
+      // flagged as such rather than read as a confirmed hop.
+      const fresh = await health(handle.port);
+      assert.equal(fresh.https_proxy, `http://127.0.0.1:${deadPort}`,
+        "a fresh proxy published no candidate at all — the pin loses its hop entirely");
+      assert.equal(fresh.https_proxy_measured, false,
+        "a candidate nothing has dialled was published as a measured hop");
+      assert.equal(fresh.direct_last, null, "premise: nothing has fallen direct yet");
+
+      // Now force a resolve. The chain is dead, so it falls through to direct:
+      // https_proxy becomes null ("checked, nothing reachable") and the sticky
+      // mark appears.
+      const { resolveHop } = await import("../proxy/upstream.mjs");
+      assert.equal(await resolveHop(true), "", "premise: the dead chain must fall through");
+
+      const after = await health(handle.port);
+      assert.equal(after.https_proxy, null,
+        "a chain that was checked and found dead still named a hop — a confidently " +
+        "wrong answer is worse here than no answer");
+      assert.equal(after.https_proxy_measured, false, "null needs no measured flag");
+      assert.match(String(after.direct_last), /^\d{4}-\d{2}-\d{2}T.*Z$/,
+        `the direct fall-through left no timestamp: ${after.direct_last}`);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+      if (handle) await handle.close();
+      try { await rm(caDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
+// THE CLIENT-ABANDON ABORT, IN BOTH DIRECTIONS.
+//
+// handleMessages installs an abort so a client that gives up mid-SSE frees the
+// upstream. It was keyed on clientReq's "close" — which Node emits when the
+// request BODY is consumed, i.e. on every request, immediately — so it aborted
+// while the client was still waiting, and the forwardRequest catch opens with
+// `if (aborted) return`. Nothing was written back.
+//
+// Measured before the fix, reverse mode, upstream refusing instantly (what a
+// dead local hop does): POST /v1/messages hung for the client's full timeout
+// instead of answering 502, for both an at-once and a delayed body.
+//
+// BOTH CASES OR NEITHER. Asserting only the 502 would pass against a build that
+// deleted the listener outright, which leaks an upstream connection for every
+// abandoned stream — a worse bug, and invisible until the box runs out of
+// sockets.
+describe("client-abandon abort", () => {
+  const ENV = ["CACHE_FIX_PROXY_UPSTREAM", "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR",
+               "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_UPSTREAM_PROXY",
+               "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+  const save = () => Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
+  const restore = (s) => { for (const [k, v] of Object.entries(s)) {
+    if (v === undefined) delete process.env[k]; else process.env[k] = v; } };
+
+  it("answers 502 when the upstream refuses, instead of hanging the client", async () => {
+    const saved = save();
+    const dead = await freePort();               // nothing listening: instant ECONNREFUSED
+    let h;
+    try {
+      for (const k of ENV) delete process.env[k];
+      process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${dead}`;
+      h = await startProxy({ port: 0, watch: false });
+      const got = await new Promise((resolve) => {
+        const r = http.request({ host: "127.0.0.1", port: h.port, method: "POST",
+                                 path: "/v1/messages", headers: { "content-type": "application/json" } },
+          (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
+        r.on("error", (e) => resolve(`ERR:${e.code}`));
+        r.setTimeout(6_000, () => { r.destroy(); resolve("HANG"); });
+        r.end(JSON.stringify({ model: "x", messages: [] }));
+      });
+      assert.equal(got, 502,
+        `a refusing upstream produced ${got} — the client was never answered, ` +
+        `which is a live session stalling on the most ordinary upstream failure`);
+    } finally { restore(saved); if (h) await h.close(); }
   });
 });
