@@ -10,6 +10,7 @@
 //
 // USAGE
 //   node .claude/gap-probe.mjs <port> 0 <runMs>          OBSERVE ONLY — signals nothing
+//   node .claude/gap-probe.mjs <port> 0 0               OBSERVE UNTIL SIGTERM — no fixed window
 //   node .claude/gap-probe.mjs <port> <holderPid> <ms> [SIG]   signals, for lab use
 //
 // The observe-only form is the one for a live box: pass 0 and it never signals,
@@ -91,4 +92,14 @@ if (holderPid > 0) {
   }, Math.round(runMs / 3));
 }
 
-setTimeout(() => { stop = true; }, runMs);
+// runMs 0 = RUN UNTIL SIGNALLED, and for a one-shot event that is the only safe
+// form. A fixed window is a guess about WHEN the thing happens: the cswap peer
+// measured that a pin recycle fires on the next LAUNCHER INVOCATION after an
+// install, not when the install returns — so a probe started at install time and
+// stopped on a timer can expire BEFORE the event and report `refused: 0` for a
+// window that never opened. A clean zero about a window that did not happen is
+// the false-GREEN shape, and on a one-attempt event there is no second chance to
+// notice. Unbounded, the stop condition lives outside the probe, where whoever
+// can actually see the trigger decides.
+if (runMs > 0) setTimeout(() => { stop = true; }, runMs);
+else for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { stop = true; });
