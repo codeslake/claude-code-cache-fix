@@ -58,6 +58,37 @@ function dial() {
   req.on("timeout", () => req.destroy(new Error("timeout")));
 }
 
+// WHO HOLDS THE PORT, sampled alongside the dials — because `refused: 0` is not
+// a result on its own. A probe stopped before the event it was armed for prints
+// exactly the same clean line as a handover that dropped nothing, and on a
+// one-shot window there is no second chance to notice which one you got. The
+// unbounded mode moved that hazard from a timer to whoever sends SIGTERM; it did
+// not remove it.
+//
+// Identity is (pid, starttime), never pid alone: pid reuse is live on this fleet
+// (wraparound measured, pid_max 4194304), and a content hash cannot see a
+// restart either — a fresh process on identical bytes publishes the same tree.
+const holders = new Set();
+let firstHolders = null, lastHolders = null;
+const sampleHolders = () => {
+  let out = "";
+  try {
+    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch { out = ""; }
+  const ids = out.trim().split("\n").filter(Boolean).map((pid) => {
+    let st = "";
+    try {
+      st = execFileSync("ps", ["-o", "lstart=", "-p", pid],
+                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch { }
+    return `${pid}@${st}`;
+  }).sort().join(",");
+  if (firstHolders === null) firstHolders = ids;
+  lastHolders = ids;
+  holders.add(ids);
+};
+
 function done() {
   const total = ok + refused + reset + other;
   console.log(JSON.stringify({
@@ -68,6 +99,12 @@ function done() {
     // case this probe exists to report was the case it could not report.
     // Counts are the finding; the array is only for offsets and answered-state.
     failuresRecorded: events.length,
+    // THE VERDICT, so a clean count cannot be quoted as a clean handover.
+    listenerFirst: firstHolders, listenerLast: lastHolders,
+    listenerChanged: holders.size > 1,
+    verdict: refused > 0 ? "GAP MEASURED"
+           : holders.size > 1 ? "CLEAN HANDOVER MEASURED"
+           : "NOTHING HAPPENED — the listener never changed, so this run measures nothing",
     failures: events.slice(0, 20),
   }));
   process.exit(refused === 0 ? 0 : 1);
@@ -75,6 +112,9 @@ function done() {
 
 // Four concurrent dialers, so the window is covered densely rather than at
 // whatever rate one sequential chain happens to reach.
+sampleHolders();
+const holderTimer = setInterval(sampleHolders, 500);
+holderTimer.unref?.();
 inflight = 4;
 for (let i = 0; i < 4; i++) dial();
 
