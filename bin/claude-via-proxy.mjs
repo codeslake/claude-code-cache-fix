@@ -753,8 +753,14 @@ function codeFingerprint(root) {
   } catch { return ""; }
 }
 
+// The writer and the reaper below must name the same thing, so they read one
+// constant. Deriving the reaper's prefix from this path instead is not
+// portable: the separator is not "/" everywhere, and readdirSync yields
+// basenames.
+const RECORD_PREFIX = "cache-fix-proxy-";
+
 function fingerprintPath(port) {
-  return join(tmpdir(), `cache-fix-proxy-${port}.sha256`);
+  return join(tmpdir(), `${RECORD_PREFIX}${port}.sha256`);
 }
 
 // Temp + rename: a reader that opens this mid-write would compare against a
@@ -769,10 +775,75 @@ function publishFingerprint(port) {
   } catch { /* best effort: an unwritable tmpdir must not stop a proxy starting */ }
 }
 
+// Nothing else removes these. The port is ephemeral wherever the OS picks one,
+// so without this a record accumulates per proxy start without bound, and every
+// later scan of tmpdir pays for the ones already there.
+//
+// A PORT THAT STILL ANSWERS OUTRANKS THE CLOCK, because nothing republishes a
+// record: one call site, the spawn path, so the mtime is the last child spawn.
+// Age alone would therefore make the gate a deadline rather than a margin — a
+// holder that neither respawns nor is redeployed for a week is fully live with
+// an over-age record, and deleting it makes runningOurCode() answer null, which
+// ends in takeOver() exiting 0 while announcing a deploy that has not taken
+// effect.
+//
+// Seven days on top, matching the scratch-CA reaper, to bound what a crashed
+// holder leaves behind on a port nobody rebinds.
+async function reapFingerprintRecords() {
+  const recordAgeMs = 7 * 86_400_000;
+  try {
+    for (const f of readdirSync(tmpdir())) {
+      if (!f.startsWith(RECORD_PREFIX) || !f.endsWith(".sha256")) continue;
+      const p = join(tmpdir(), f);
+      try {
+        if (Date.now() - statSync(p).mtimeMs <= recordAgeMs) continue;
+        if (!(await portFree(f.slice(RECORD_PREFIX.length, -".sha256".length)))) continue;
+        rmSync(p);
+      } catch { /* raced, gone, or refused; a survivor is disk, not correctness */ }
+    }
+  } catch { /* unreadable tmpdir: publishing already degraded, say nothing more */ }
+}
+
+// ASKED BY BINDING, NOT BY lsof. holderPidOn needs a PID and so has to shell
+// out; this needs one bit and the kernel answers it directly, which keeps the
+// reap working on a host with no lsof — otherwise the leak fix is a silent
+// no-op exactly where nobody would look for it. A name whose port is not a
+// number is not ours to judge, so it is kept.
+//
+// It answers "is anything LISTENING", which is not the same as "is anyone using
+// this port". Two consequences, both narrow and neither silent:
+//
+// A holder in the bound-but-not-listening state this file creates on purpose
+// reads as free, so a record could be reaped during the window before its relay
+// takes over. The window has not been measured for the relay specifically; the
+// ~80 ms nearby belongs to the proxy child's boot, which is a larger spawn.
+// Losing a record there ends in the announced exit 0 above.
+//
+// And this probe IS a listener while it asks. A launcher starting concurrently
+// runs otherHolderOn(), which selects on a LISTEN socket plus a run-service
+// command line plus greater uptime — a peer mid-probe can satisfy those and be
+// read as an incumbent. Bounded by the bind lifetime, under 59 µs per record.
+//
+// Serialized, and it does not yield: measured at 3,000 over-age records the loop
+// held the event loop for 176 ms. listen and close resolve on nextTick, so the
+// await never reaches the poll phase. It runs after the bind, so it delays no
+// listener — but budget roughly 60 ms per 1,000 eligible records before calling
+// it free.
+function portFree(port) {
+  const n = Number(port);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return Promise.resolve(false);
+  return new Promise((res) => {
+    const s = net.createServer();
+    s.once("error", () => res(false));
+    s.listen(n, bindAddr(), () => s.close(() => res(true)));
+  });
+}
+
 // TRUE, FALSE, or NULL for "cannot tell" — a third state because the callers
 // must be able to TELL unknown apart, not because they answer it differently.
 // Both end at exit 0; only one of them says why (see otherHolderOn). Unknown is
-// ordinary: the record lives in /tmp, which systemd-tmpfiles sweeps.
+// ordinary: the record is age-reaped (see reapFingerprintRecords) and a host
+// with a /tmp sweeper clears it too.
 function runningOurCode(port) {
   let theirs = "";
   try { theirs = readFileSync(fingerprintPath(port), "utf8").trim(); } catch { return null; }
@@ -816,6 +887,16 @@ function holdPort(rest) {
   for (const s of [process.stdout, process.stderr]) {
     s.on("error", () => { /* the reader left; putting the proxy back is the job */ });
   }
+  // Here, not in publishFingerprint: that returns early when the fingerprint is
+  // unreadable, which would stop reaping exactly when publishing is broken, and
+  // it runs on every respawn. Deferred because the scan walks the whole tmpdir
+  // and would delay the bind; nothing waits on its result. unref so it cannot
+  // hold the process open.
+  //
+  // The idempotent exits below settle before the timers phase and so never reap,
+  // but they publish nothing either: a launcher that leaves a record is one that
+  // reaps.
+  setTimeout(reapFingerprintRecords, 0).unref();
   // The proxy's own default: holding a different port than the proxy would have
   // served leaves nothing at the documented address.
   // `|| 9801` REWROTE PORT 0 to 9801. "0" is a truthy string so the run-service
