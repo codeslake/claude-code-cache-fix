@@ -1,0 +1,35 @@
+# CCF standing orders — appended by watch.sh to every event it emits.
+#
+# One per line: <selector>|<order>. Selectors: pr:<n> | any | tui.
+# Lines starting with # are not selectors and never match, so they stay comments.
+#
+# WHY THIS FILE EXISTS: an order given at invocation lives only in the session
+# that heard it, and this session has compacted twice since receiving the two
+# below. The order has to travel with the event or it does not survive.
+#
+# NOT in integrated.conf — the conf is sourced as shell, and an order is prose
+# with pipes and quotes in it. Excluded from git by upstream's own .gitignore
+# line 8 (`.claude/*`), verified with check-ignore --no-index.
+
+any|RESPONSE PROCEDURE (user, verbatim intent): on a comment — review it, fix what is real, run /superpowers:requesting-code-review and fix, run /ponytail-review and apply. Then merge to integrated and deploy every machine. In that order: fix -> review -> push the PR branch -> rebuild integrated -> deploy.
+
+any|HOW EACH FIX LANDS (user's order, 2026-08-01): apply it TDD-first — the test fails BEFORE the fix, every time, no exceptions for "obvious" ones. /ponytail-review over the production diff APPLIES the cuts, it does not just list them. Then $TEST_CMD whole-suite, and mutation-check every new guard (remove it, watch a test die, restore). Reproduce each review finding here before agreeing with it; state plainly which ones did not reproduce.
+
+any|A LIVE PROXY KEEPS THE CODE IT BOOTED WITH. deploy.sh prints "NOTE: <host> has a live proxy holding pre-deploy code" and still exits 0. That note is the CCF equivalent of cswap's TUI-restart trap: the files are new, the running proxy is not, and reporting "deployed" while every session still serves pre-deploy code is the failure it warns about. Say per host whether a relaunch is still owed. Never restart a proxy to clear it — that drops in-flight requests for every session on the port and is a separate, confirmed step.
+
+any|CODEX REVIEW NEEDS --base <merge-base>, ALWAYS. Its detectDefaultBranch() picks `main`, and in this fork `main` is origin/main, which stopped tracking upstream on 2026-07-18 (3911f6b) while upstream/main is 23346ac — 13 commits ahead. Measured 2026-08-01: a review run without --base reported 6 findings, 4 of them against session-budget-breaker.mjs and tier-advisor.mjs, files this PR does not touch at all. They looked like ours only because those files did not exist at 3911f6b, so the whole file read as added. Blame put them on upstream's own #244 and #262. Coverage was never lost (an older base is a superset) — the cost is review budget spent on someone else's code and a session that has to classify every finding by hand. Resolve it: git merge-base upstream/main HEAD, and pass that.
+
+any|DRAFT -> READY IS THE USER'S CALL, in that turn. Never flip a PR to ready because the work looks finished. mergeStateStatus BLOCKED on a ready PR means review is required, not that something broke.
+
+# RETIRED 2026-08-11 — #296 MERGED (measured: state=MERGED, head 5e6a2e04). Two
+# `pr:296` orders removed: its out-of-scope-findings list, and the codex-landing
+# procedure. The procedure was general, so it moved up to the `any|HOW EACH FIX
+# LANDS` line rather than being dropped. The out-of-scope list was specific to
+# that diff and dies with it.
+#
+# WHY THIS MATTERS BEYOND TIDINESS: the draft order above used to read "Never
+# flip #296". That PR merged, and the dead number rode into every event forever
+# because its selector is `any`, not `pr:296`. It made a session (this one) talk
+# about draft state on #304, which was never a draft. A PR number in an `any`
+# order is a landmine — scope it `pr:<n>` so it dies with the PR, or write the
+# rule without the number.

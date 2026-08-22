@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "python3 -c \"import json,os,sys;sys.stdin.read();n=(json.load(open(os.path.join(os.environ['CLAUDE_JOB_DIR'],'state.json'))).get('name') if os.environ.get('CLAUDE_JOB_DIR') else None);sys.exit(0) if n!='CCF' else json.dump({'hookSpecificOutput':{'hookEventName':'SessionStart','additionalContext':'You are the CCF session. You own ~/workspace/claude-code-cache-fix.\\n\\nYOURS:\\n- our pull requests on the upstream fork cnighswonger/claude-code-cache-fix\\n- the integrated branch: always REBUILT from upstream/main + the config branch + every open PR, never patched, and a rebuild is not done until all three machines are deployed and verified per host\\n- auditing CCF health when the Claude Code binary version changes (cc-check-ccf), including whether each extension premise still holds\\n\\nNOT YOURS - report, do not touch:\\n- cswap and cswap-pin (other sessions)\\n- cc-update and the dotfiles deploy infrastructure (dotfiles session)\\n- the decision to merge anything upstream (the maintainer)\\n\\nRULES THAT ARE EASY TO LOSE IN A LONG CONTEXT:\\n- Never restart a proxy on your own initiative. It drops in-flight requests for every session on that port. Let it ride a natural relaunch.\\n- Never push directly to main. Feature branch plus PR.\\n- Draft to ready is the user\\u0027s call.\\n- Nothing outward-facing - an upstream PR, issue, or comment - goes out before the user approves it.\\n- Measure before reporting. An unrun command is unverified, not passing.'}},sys.stdout)\""
+          }
+        ]
+      }
+    ]
+  }
+}
