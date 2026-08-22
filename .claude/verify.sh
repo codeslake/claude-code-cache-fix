@@ -324,12 +324,22 @@ if [ -z "$mt_runner" ]; then
 else
   mt_out=$( cd "$mt_runner" && bash utils/tests/run-owned.sh ccf 2>&1 ); mt_rc=$?
   case "$mt_out" in
+    *"NOTHING WAS VERIFIED"*)
+      # The set RAN and produced no verdict, which is neither of the other two.
+      # Not unrunnable-because-absent: the gate is here and working. Not a code
+      # failure: nothing was tested. Both names fire so the remedy is readable —
+      # the instrument line says no answer, the verdict line says why.
+      say module-tests-unrunnable FAIL "$(printf '%s' "$mt_out" | grep -m1 'NOTHING WAS VERIFIED')"
+      say module-tests FAIL "the set produced no verdict — every harness declined by policy, so N/N would have been a pass over an empty result" ;;
     *REFUSE:*)
       say module-tests-unrunnable FAIL "$(printf '%s' "$mt_out" | grep -m1 'REFUSE:')"
       say module-tests FAIL "the gate could not run — see module-tests-unrunnable" ;;
     *"FAILED:"*)
       say module-tests FAIL "$(printf '%s' "$mt_out" | grep -m1 'FAILED:')" ;;
-    *": "*"/"*" OK"*)
+    *": "*"/"*" OK" | *": "*"/"*" OK ("*)
+      # Two shapes, both a pass: "N/N OK" and "N/N OK (M refused by policy: ...)".
+      # Written out rather than left to one loose glob — the trailing-refusals
+      # form only matched by accident of " OK" following the slash.
       say module-tests OK "$(printf '%s' "$mt_out" | grep -m1 ' OK')" ;;
     *)
       # Unparseable is UNANSWERED, never benign. A runner whose output shape
