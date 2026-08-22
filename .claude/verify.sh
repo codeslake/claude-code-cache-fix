@@ -15,7 +15,7 @@ fail=0
 #
 # `discovery` is deliberately absent from this list: it is emitted only on a host
 # with no run dir, so requiring it would fail every host that has one.
-REQUIRED="launcher ca-trust proxy-live deploy-live ca-trust-live"
+REQUIRED="launcher ca-trust proxy-live deploy-live ca-trust-live module-tests"
 seen=""
 say() {
   printf '%s\t%s\t%s\n' "$1" "$2" "$3"
@@ -300,6 +300,45 @@ for port in ${ports:-}; do
     esac
   fi
 done
+# ---------------------------------------------------------------------------
+# The dotfiles WIRING GATE, run against this module's own claimed files.
+#
+# TWO CHECK NAMES on purpose. "could not run" and "ran and found a break" carry
+# the same verdict and OPPOSITE remedies — install/repair dotfiles, versus fix
+# the thing under test. The runner reports both through a flat 0/1 exit, so the
+# discrimination has to come from its OUTPUT; inferring it from the code would
+# turn a refusal into a shrug.
+#
+# ABSENT IS A FAILURE HERE, not a skip. A host in DEPLOY_HOSTS is managed by
+# definition, so a missing gate means this machine is not actually managed —
+# which is a reportable break, not an unavailable check. The commit hook takes
+# the opposite branch for the opposite reason: a machine someone commits from
+# never agreed to be managed.
+mt_out=""; mt_rc=0; mt_runner=""
+for _d in "${DOTFILES_PATH:-}" "$HOME/dotfiles" "$HOME/Documents/dotfiles"; do
+  [ -n "$_d" ] && [ -f "$_d/utils/tests/run-owned.sh" ] && { mt_runner="$_d"; break; }
+done
+if [ -z "$mt_runner" ]; then
+  say module-tests-unrunnable FAIL "no utils/tests/run-owned.sh under DOTFILES_PATH, ~/dotfiles or ~/Documents/dotfiles — this host is in DEPLOY_HOSTS but carries no wiring gate"
+  say module-tests FAIL "the gate could not run — see module-tests-unrunnable"
+else
+  mt_out=$( cd "$mt_runner" && bash utils/tests/run-owned.sh ccf 2>&1 ); mt_rc=$?
+  case "$mt_out" in
+    *REFUSE:*)
+      say module-tests-unrunnable FAIL "$(printf '%s' "$mt_out" | grep -m1 'REFUSE:')"
+      say module-tests FAIL "the gate could not run — see module-tests-unrunnable" ;;
+    *"FAILED:"*)
+      say module-tests FAIL "$(printf '%s' "$mt_out" | grep -m1 'FAILED:')" ;;
+    *": "*"/"*" OK"*)
+      say module-tests OK "$(printf '%s' "$mt_out" | grep -m1 ' OK')" ;;
+    *)
+      # Unparseable is UNANSWERED, never benign. A runner whose output shape
+      # changed must not read as a pass because no branch matched it.
+      say module-tests-unrunnable FAIL "run-owned.sh rc=$mt_rc, output matched no known shape: $(printf '%s' "$mt_out" | head -1)"
+      say module-tests FAIL "the gate could not run — see module-tests-unrunnable" ;;
+  esac
+fi
+
 
 # The absence sweep. Runs last so every check has had its chance to speak.
 for c in $REQUIRED; do
