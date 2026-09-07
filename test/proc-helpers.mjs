@@ -96,6 +96,37 @@ export function ours(port) {
   return out;
 }
 
+// EVERY PROCESS DESCENDED FROM ONE TEST FILE'S RUN, by env marker rather than
+// by the port it ends up on. onPort()/ours() need a registered port; a
+// self-heal successor or a standby relay a case never asked freePort() for
+// (born on a kernel-picked port nobody recorded) is still ours to find here,
+// because every spawn in this tree forwards `{...process.env, ...}` and so
+// inherits whatever the top of the file stamped. Same two platforms as ours();
+// unverified on macOS (no live box to measure this leg on) — a case there
+// still has the port sweep above as its floor, so nothing regresses.
+export function stamped(marker) {
+  const want = new RegExp(`CACHE_FIX_TEST_LINEAGE=${marker}(?:\\s|$)`);
+  const out = [];
+  try {
+    for (const pid of readdirSync("/proc")) {
+      if (!/^\d+$/.test(pid)) continue;
+      let env = "";
+      try { env = readFileSync(`/proc/${pid}/environ`, "utf8").replace(/\0/g, " "); } catch { continue; }
+      if (want.test(env) && OURS.test(cmdOf(pid))) out.push(pid);
+    }
+    return out;
+  } catch { /* no /proc: ask ps below */ }
+  try {
+    const rows = execFileSync("ps", ["-wwEo", "pid=,command="],
+                              { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    for (const line of rows.split("\n")) {
+      const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+      if (m && want.test(m[2]) && OURS.test(m[2])) out.push(m[1]);
+    }
+  } catch { /* no ps either */ }
+  return out;
+}
+
 // A port nobody is listening on RIGHT NOW. It is released before the caller
 // uses it — see the OURS note above for what that costs and how it is bounded.
 export async function freePort() {
