@@ -1067,7 +1067,10 @@ describe("a holder stop with a reply in flight", () => {
     try {
       const up = Date.now() + 25_000;
       let body = await probe(port);
-      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      while (body.startsWith("ERR:") && Date.now() < up) {
+        await new Promise((r) => setTimeout(r, 100));
+        body = await probe(port);
+      }
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
       let chunks = 0;
