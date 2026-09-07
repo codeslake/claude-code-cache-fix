@@ -22,7 +22,7 @@
 // mode, and the holder through BOTH of its dispatch doors — `server` with
 // CACHE_FIX_HOLD_PORT=on was the one an earlier fix missed while the other
 // passed, so a single holder row would have called that fixed.
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { spawn } from "node:child_process";
@@ -31,7 +31,18 @@ import { withDeadline } from "./child-deadline.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { armLineage, reapStamped } from "./proc-helpers.mjs";
+
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+// EVENT #348. `reap()` below kills the holder's own process GROUP, but
+// openStandby() (bin/claude-via-proxy.mjs) spawns its standby `detached:
+// true` too — Node's detach starts a NEW session, so the standby is never IN
+// that group, and a SIGKILLed holder never runs closeStandby() either. The
+// two `run-service`/`server` cases just past this point are exactly the door
+// that leaves one behind (measured: two `bin/gap-relay.mjs`, ppid 1,
+// STANDBY_PARENT already dead, after a whole-suite run). Same class as
+// proxy-held-port.test.mjs's R3 fix, different file.
+const lineage = armLineage("stdio-epipe-survival");
 const reap = (p) => { try { process.kill(-p.pid, "SIGKILL"); } catch {} try { p.kill("SIGKILL"); } catch {} };
 const cleanEnv = () => {
   const env = { ...process.env };
@@ -192,3 +203,10 @@ describe("a dead stdio reader does not kill the port's process", () => {
 // does this holder have", which is a number on the machine, not a shape in the
 // source. `openStandby` states the same identity rule twenty lines below and had
 // always followed it; this is the sibling that was missed in the same sweep.
+
+// ONE SWEEP FOR THE FILE, by lineage: this file had none before, so a standby
+// `reap()`'s process-group kill cannot reach (detached: true starts a new
+// session) rode past every case's own cleanup. See proc-helpers.mjs's
+// armLineage()/reapStamped() and proxy-held-port.test.mjs's R3 fix, same
+// shape.
+after(async () => { await reapStamped(lineage); });

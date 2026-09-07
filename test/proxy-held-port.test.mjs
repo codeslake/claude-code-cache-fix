@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, reapStamped, stamped } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, listeners, onPort, reapStamped, stamped } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -70,19 +70,10 @@ async function freePort() {
 // `{...process.env, ...}`, so setting this once, here, before any case spawns
 // anything, marks the whole lineage any case in this file can cause —
 // self-heal successor, standby, or a kernel-picked port nobody registered —
-// regardless of which port it ends up on. See stamped() in proc-helpers.mjs.
-process.env.CACHE_FIX_TEST_LINEAGE = `proxy-held-port-${process.pid}`;
-
-// A SYNCHRONOUS BACKSTOP. `after()` is async and can be skipped entirely by a
-// crash before the runner reaches teardown -- the file-level sweep below is
-// the normal path, this is what still runs if that path is never taken.
-// `exit` cannot await, so this is SIGKILL directly rather than the
-// SIGHUP-then-wait the async sweep gets to do.
-process.on("exit", () => {
-  for (const p of stamped(process.env.CACHE_FIX_TEST_LINEAGE)) {
-    try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
-  }
-});
+// regardless of which port it ends up on. armLineage() (proc-helpers.mjs)
+// also installs the synchronous exit-time backstop: `after()` below is async
+// and can be skipped entirely by a crash before the runner reaches teardown.
+armLineage("proxy-held-port");
 
 // Its own file: every case here drives a REAL launcher holding a REAL port, so
 // a mis-signalled pid or a stuck child aborts the whole runner process. Node

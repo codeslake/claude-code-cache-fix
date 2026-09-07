@@ -133,6 +133,25 @@ export async function reapStamped(marker) {
   for (const p of stamped(marker)) { try { process.kill(Number(p), "SIGKILL"); } catch { /* gone already */ } }
 }
 
+// ARM A FILE'S LINEAGE, ONE CALL. `||=` rather than `=`: a caller that already
+// has a marker (a harness passing one in through the child's env) is honoured
+// instead of overwritten, so an outer probe and the file it drives can agree
+// on the same marker without the file having to know it is being probed.
+// Installs the synchronous exit-time SIGKILL backstop over it (see the note
+// this replaces in proxy-held-port.test.mjs: `after()` is async and can be
+// skipped by a crash before teardown) and returns the marker so the caller
+// can also `await reapStamped(marker)` from its own async teardown.
+export function armLineage(name) {
+  process.env.CACHE_FIX_TEST_LINEAGE ||= `${name}-${process.pid}`;
+  const marker = process.env.CACHE_FIX_TEST_LINEAGE;
+  process.on("exit", () => {
+    for (const p of stamped(marker)) {
+      try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
+    }
+  });
+  return marker;
+}
+
 // A port nobody is listening on RIGHT NOW. It is released before the caller
 // uses it — see the OURS note above for what that costs and how it is bounded.
 export async function freePort() {
