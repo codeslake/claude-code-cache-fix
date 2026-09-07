@@ -397,11 +397,25 @@ export function hopAlive(proxyUrl, timeoutMs = 700) {
   });
 }
 
+// A keep-alive socket idle longer than this is destroyed rather than handed
+// back out of the pool. Well under privoxy's keep-alive-timeout 300 (2026-09-06
+// burst: 44 singleton ECONNRESETs were the hop closing an idle socket this
+// pool kept offering for reuse). Mutable only for tests — production always
+// gets the real default; see __setUpstreamIdleTimeoutMsForTests below.
+let _upstreamIdleTimeoutMs = 60_000;
+export function __setUpstreamIdleTimeoutMsForTests(ms) {
+  _upstreamIdleTimeoutMs = ms === undefined ? 60_000 : ms;
+  // _agents is cached by proxy/CA/rejectUnauthorized, not by this timeout, so
+  // an already-built Agent would otherwise keep the timeout it was built with.
+  _agents.clear();
+}
+
 function buildAgent(isHTTPS, proxyUrl) {
   const ca = loadCa();
   if (proxyUrl) {
     const opts = {
       keepAlive: true,
+      timeout: _upstreamIdleTimeoutMs,
       proxy: proxyUrl,
       rejectUnauthorized: config.rejectUnauthorized,
       ...(ca ? { ca } : {}),
@@ -415,11 +429,12 @@ function buildAgent(isHTTPS, proxyUrl) {
     if (isHTTPS) {
       return new https.Agent({
         keepAlive: true,
+        timeout: _upstreamIdleTimeoutMs,
         rejectUnauthorized: config.rejectUnauthorized,
         ...(ca ? { ca } : {}),
       });
     }
-    return new http.Agent({ keepAlive: true });
+    return new http.Agent({ keepAlive: true, timeout: _upstreamIdleTimeoutMs });
   }
   return null;
 }
@@ -525,37 +540,65 @@ export async function forwardRequest(clientReq, body, signal) {
         `${upstreamUrl0.hostname} directly`);
     }
   }
-  return new Promise((resolve, reject) => {
-    const upstreamUrl = upstreamUrl0;
+  const upstreamUrl = upstreamUrl0;
 
-    const headers = buildUpstreamHeaders(clientReq.headers, upstreamUrl.hostname);
-    if (body) {
-      headers["content-length"] = Buffer.byteLength(body).toString();
-    }
+  const headers = buildUpstreamHeaders(clientReq.headers, upstreamUrl.hostname);
+  if (body) {
+    headers["content-length"] = Buffer.byteLength(body).toString();
+  }
 
-    const isHTTPS = upstreamUrl.protocol === "https:";
-    const transport = isHTTPS ? https : http;
+  const isHTTPS = upstreamUrl.protocol === "https:";
+  const transport = isHTTPS ? https : http;
 
-    const options = {
-      hostname: upstreamUrl.hostname,
-      port: defaultPort(upstreamUrl),
-      path: upstreamUrl.pathname + upstreamUrl.search,
-      method: clientReq.method,
-      headers,
-      timeout: config.timeout,
-      agent: getAgent(isHTTPS, upstreamUrl.hostname, hop),
-    };
+  const options = {
+    hostname: upstreamUrl.hostname,
+    port: defaultPort(upstreamUrl),
+    path: upstreamUrl.pathname + upstreamUrl.search,
+    method: clientReq.method,
+    headers,
+    timeout: config.timeout,
+    agent: getAgent(isHTTPS, upstreamUrl.hostname, hop),
+  };
 
+  // ONE retry, on a FRESH dial, only when the failure is provably pre-send —
+  // nothing this attempt wrote could have reached upstream, so re-sending the
+  // same bytes is safe. Two shapes, both measured in the 2026-09-06 burst:
+  //
+  //  - a brand-new socket that errors before it ever finished connecting (its
+  //    'connect' event for plain HTTP, 'secureConnect' for TLS) — a hop that
+  //    resets the CONNECT before replying, or a TLS handshake failure. No
+  //    request byte can have gone out; the request stream buffers until that
+  //    event, and if the event never fires there was no socket to write to.
+  //  - a REUSED keep-alive socket that fails with ECONNRESET — Node's own
+  //    documented idiom (`req.reusedSocket`) for "the peer had already closed
+  //    this idle socket; the write landed on a dead connection". Node's Agent
+  //    prunes a socket it has *seen* close from its free list, so this only
+  //    fires on the reset-in-flight race the idle timeout above narrows but
+  //    cannot fully close.
+  //
+  // Never past this point: after a response byte (this function has already
+  // resolved by then — see `settled`), after a completed handshake on a fresh
+  // socket (a post-connect failure is a real, current error), when the
+  // caller's signal is already aborted, or more than once.
+  const attempt = (isRetry) => new Promise((resolve, reject) => {
     let upstreamConnectionId = null;
+    let established = false;   // saw 'connect' (http) / 'secureConnect' (https)
+    let settled = false;
+
     // The 'socket' event fires when a socket is assigned to this request,
     // synchronously after transport.request() returns for both new and
     // pooled-keep-alive sockets. By the time the response callback runs we
     // already know which connection carried the request.
     const captureSocket = (sock) => {
       upstreamConnectionId = getOrAssignConnectionId(sock);
+      // A REUSED socket already passed this event, long before this attempt
+      // attached a listener for it — upstreamReq.reusedSocket is how that case
+      // is told apart, below.
+      sock.once(isHTTPS ? "secureConnect" : "connect", () => { established = true; });
     };
 
     const upstreamReq = transport.request(options, (upstreamRes) => {
+      settled = true;
       const responseHeaders = filterResponseHeaders(upstreamRes.headers);
       resolve({
         upstreamRes,
@@ -566,7 +609,19 @@ export async function forwardRequest(clientReq, body, signal) {
     });
     upstreamReq.on("socket", captureSocket);
 
-    upstreamReq.on("error", reject);
+    upstreamReq.on("error", (err) => {
+      if (settled) return;
+      const retryable = !isRetry && !(signal && signal.aborted) && (
+        (!upstreamReq.reusedSocket && !established) ||
+        (upstreamReq.reusedSocket && err.code === "ECONNRESET")
+      );
+      if (retryable) {
+        settled = true;
+        resolve(attempt(true));
+        return;
+      }
+      reject(err);
+    });
     upstreamReq.on("timeout", () => {
       upstreamReq.destroy(new Error("Upstream timeout"));
     });
@@ -583,4 +638,6 @@ export async function forwardRequest(clientReq, body, signal) {
       upstreamReq.end();
     }
   });
+
+  return attempt(false);
 }
