@@ -397,6 +397,32 @@ export function hopAlive(proxyUrl, timeoutMs = 700) {
   });
 }
 
+// hpagent's CONNECT sub-request reads `options.timeout` off the SAME object
+// Node's own Agent.createSocket hands to createConnection(). On Node <22,
+// createSocket has no "per-request timeout wins" correction (added between
+// v20 and v24; see forwardRequest's connect-budget comment) — it always
+// merges the AGENT's own construction `timeout` (idleTimeoutMs, minutes)
+// last, so it always wins, and the per-request connect budget we pass to
+// transport.request() never reaches hpagent's own request at all. Measured:
+// CI on Node 18/20 (cnighswonger/claude-code-cache-fix#371) showed a stalled
+// CONNECT taking ~idleTimeoutMs instead of the connect budget, and a budget
+// of 0 (off) STILL cut at idleTimeoutMs instead of running unbounded.
+//
+// keepSocketAlive() -- which re-arms a socket's timeout to
+// `this.options.timeout` every time it returns to the free list -- is
+// UNCHANGED on every version, so the Agent's own construction timeout must
+// stay idleTimeoutMs for that to keep working; the fix instead overrides the
+// ARGUMENT this hands to hpagent's createConnection, for new connections
+// only (a reused socket never calls createConnection at all).
+function withConnectBudget(agent) {
+  const original = agent.createConnection.bind(agent);
+  agent.createConnection = (options, callback) => {
+    const budget = config.upstreamConnectTimeoutMs;
+    return original({ ...options, timeout: budget > 0 ? budget : config.timeout }, callback);
+  };
+  return agent;
+}
+
 function buildAgent(isHTTPS, proxyUrl) {
   const ca = loadCa();
   if (proxyUrl) {
@@ -407,7 +433,7 @@ function buildAgent(isHTTPS, proxyUrl) {
       rejectUnauthorized: config.rejectUnauthorized,
       ...(ca ? { ca } : {}),
     };
-    return isHTTPS ? new HttpsProxyAgent(opts) : new HttpProxyAgent(opts);
+    return withConnectBudget(isHTTPS ? new HttpsProxyAgent(opts) : new HttpProxyAgent(opts));
   }
   // No proxy. Only build a custom agent when CA or insecure mode warrants it;
   // otherwise return null so Node uses its global default agent (preserves the
@@ -645,11 +671,20 @@ export async function forwardRequest(clientReq, body, signal) {
           // pooled connection together -- so leaving siblings in the pool
           // lets the retry land on another dead one instead of a fresh dial.
           const agent = options.agent || transport.globalAgent;
-          // getName() reads `.host`, and `options` here only ever carries
-          // `.hostname` (the field transport.request() itself accepts) — so
-          // the un-corrected call built "localhost:port:" and found nothing.
-          const name = agent.getName({ ...options, host: options.hostname });
-          for (const s of agent.freeSockets?.[name] ?? []) s.destroy();
+          // NOT agent.getName(): https.Agent.prototype.getName appends
+          // ca/cert/rejectUnauthorized/... on top of http's own
+          // host:port:..., and buildAgent always sets rejectUnauthorized —
+          // reconstructing the exact name from `options` (which carries none
+          // of those TLS fields; only the agent's OWN construction options
+          // do) can never match what Node actually stored the free sockets
+          // under, so an exact-name lookup silently sweeps nothing. Every
+          // name (http or https) starts with `hostname:port:`, so match on
+          // that prefix instead — both share it by construction.
+          const prefix = `${options.hostname}:${options.port}:`;
+          for (const [n, list] of Object.entries(agent.freeSockets ?? {})) {
+            if (!n.startsWith(prefix)) continue;
+            for (const s of list) s.destroy();
+          }
         }
         resolve(attempt(true));
         return;

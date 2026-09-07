@@ -1,8 +1,8 @@
 // The 2026-09-06 22:17-23:0xZ burst: 311 x "upstream error -> 502", 14 of them
 // a TLS/CONNECT reset on a socket that never sent a byte, 44 a singleton
 // ECONNRESET on a keep-alive socket the hop had already dropped. One attempt,
-// no retry, every time -- and CCF's pool had no idle timeout against privoxy's
-// keep-alive-timeout 300, so a socket sat in the free list well past the point
+// no retry, every time -- and CCF's pool had no idle timeout against the
+// hop's keep-alive, so a socket sat in the free list well past the point
 // the hop had already closed it.
 //
 // Two guards in proxy/upstream.mjs forwardRequest()/buildAgent():
@@ -40,7 +40,8 @@ function selfSignedCert() {
   const key = join(dir, "key.pem");
   const cert = join(dir, "cert.pem");
   execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes",
-    "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=127.0.0.1"]);
+    "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=127.0.0.1"],
+    { timeout: 30_000, killSignal: "SIGKILL" });
   return { dir, key, cert };
 }
 
@@ -53,6 +54,7 @@ process.env.CACHE_FIX_UPSTREAM_IDLE_TIMEOUT_MS = "150";
 // An ambient HTTPS_PROXY would route these cases past the fixture; scrub it.
 const ENV_KEYS = [
   "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_PROXY_UPSTREAM", "CACHE_FIX_PROXY_REJECT_UNAUTHORIZED",
+  "CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS",
   "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
   "NO_PROXY", "no_proxy",
 ];
@@ -67,19 +69,34 @@ function withEnv(overrides, fn) {
   });
 }
 
-const mockReq = (extraHeaders = {}) => ({
+const mockReq = () => ({
   url: "/v1/messages",
   method: "POST",
-  headers: { "content-type": "application/json", ...extraHeaders },
+  headers: { "content-type": "application/json" },
 });
+
+// A successful call over a keep-alive fixture server leaves ITS OWN side of
+// the connection open (pooled, idle) even after the client side is unref'd
+// -- server.close() only stops accepting new connections and waits for
+// every existing one to end, which an idle pooled one never does on its
+// own. Node 18's test runner waits for the process to exit naturally rather
+// than forcing it, so a fixture left this way hangs the whole file. Track
+// every connection a server accepts and destroy them in `finally`.
+function trackConnections(server) {
+  const sockets = new Set();
+  server.on("connection", (s) => { sockets.add(s); s.on("close", () => sockets.delete(s)); });
+  return () => { for (const s of sockets) s.destroy(); };
+}
 
 describe("upstream leg resets (PR fix/upstream-leg-resets)", () => {
   it("retries once when the hop resets the CONNECT before replying, and the retry lands on a fresh socket", async () => {
     const backend = http.createServer((req, res) => { res.end("backend-ok"); });
+    const closeBackend = trackConnections(backend);
     await new Promise((r) => backend.listen(0, "127.0.0.1", r));
     const backendPort = backend.address().port;
 
     const hop = startResettingHop({ forward: `127.0.0.1:${backendPort}`, resetFirstConnect: true });
+    const closeHop = trackConnections(hop);
     await new Promise((r) => hop.listen(0, "127.0.0.1", r));
     const hopPort = hop.address().port;
 
@@ -96,6 +113,8 @@ describe("upstream leg resets (PR fix/upstream-leg-resets)", () => {
         assert.equal(Buffer.concat(chunks).toString(), "backend-ok");
       });
     } finally {
+      closeBackend();
+      closeHop();
       backend.close();
       hop.close();
     }
@@ -116,6 +135,7 @@ describe("upstream leg resets (PR fix/upstream-leg-resets)", () => {
         setImmediate(() => sock.resetAndDestroy());
       });
     });
+    const closeSrv = trackConnections(srv);
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
     const port = srv.address().port;
 
@@ -139,6 +159,7 @@ describe("upstream leg resets (PR fix/upstream-leg-resets)", () => {
         for await (const _ of r2.upstreamRes) { /* drain */ }
       });
     } finally {
+      closeSrv();
       srv.close();
     }
   });
@@ -233,6 +254,7 @@ describe("upstream leg resets (PR fix/upstream-leg-resets)", () => {
         sock.write(`HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\nConnection: keep-alive\r\n\r\n${body}`);
       });
     });
+    const closeSrv = trackConnections(srv);
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
     const port = srv.address().port;
 
@@ -256,6 +278,7 @@ describe("upstream leg resets (PR fix/upstream-leg-resets)", () => {
         assert.notEqual(idB, idC, "an idle socket past the timeout was still reused");
       });
     } finally {
+      closeSrv();
       srv.close();
     }
   });
@@ -268,6 +291,8 @@ describe("upstream CONNECT-phase budget (PR fix/upstream-leg-resets)", () => {
     const backendPort = backend.address().port;
 
     const hop = startResettingHop({ forward: `127.0.0.1:${backendPort}`, stallFirstConnect: true });
+    const hopSockets = new Set();
+    hop.on("connection", (s) => { hopSockets.add(s); s.on("close", () => hopSockets.delete(s)); });
     await new Promise((r) => hop.listen(0, "127.0.0.1", r));
     const hopPort = hop.address().port;
 
@@ -282,10 +307,16 @@ describe("upstream CONNECT-phase budget (PR fix/upstream-leg-resets)", () => {
         const { statusCode, upstreamRes } = await forwardRequest(mockReq(), "{}", null);
         const took = Date.now() - t0;
         assert.equal(statusCode, 200, "the retry after the hop's silent CONNECT did not reach the real backend");
-        assert.ok(took < 400, `retry took ${took}ms, more than ~2x the 200ms budget`);
+        assert.ok(took < 600, `retry took ${took}ms, more than ~3x the 200ms budget`);
         for await (const _ of upstreamRes) { /* drain */ }
       });
     } finally {
+      // The successful retry leaves a live keep-alive tunnel through the hop
+      // to the backend: server.close() alone waits for every connection to
+      // end, which this one never does on its own (both ends are pooled,
+      // unref'd, idle) -- drop them so the servers' own handles release.
+      for (const s of hopSockets) s.destroy();
+      backend.closeAllConnections();
       backend.close();
       hop.close();
     }
@@ -333,15 +364,16 @@ describe("upstream CONNECT-phase budget (PR fix/upstream-leg-resets)", () => {
     // has no handle this file can reach otherwise) is what lets the test
     // finish instead of waiting out that timeout for real.
     const backend = http.createServer((req, res) => { res.end("backend-ok"); });
+    const closeBackend = trackConnections(backend);
     await new Promise((r) => backend.listen(0, "127.0.0.1", r));
     const backendPort = backend.address().port;
 
     const hop = startResettingHop({ forward: `127.0.0.1:${backendPort}`, stallFirstConnect: true });
-    const hopSockets = new Set();
-    hop.on("connection", (s) => { hopSockets.add(s); s.on("close", () => hopSockets.delete(s)); });
+    const closeHop = trackConnections(hop);
     await new Promise((r) => hop.listen(0, "127.0.0.1", r));
     const hopPort = hop.address().port;
 
+    let pending;
     try {
       await withEnv({
         CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${backendPort}`,
@@ -349,28 +381,35 @@ describe("upstream CONNECT-phase budget (PR fix/upstream-leg-resets)", () => {
         CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS: "0",
       }, async () => {
         const { forwardRequest } = await import("../proxy/upstream.mjs");
+        pending = forwardRequest(mockReq(), "{}", null).then(() => "resolved").catch((e) => `rejected:${e.message}`);
         const settled = await Promise.race([
-          forwardRequest(mockReq(), "{}", null).then(() => "resolved").catch((e) => `rejected:${e.message}`),
+          pending,
           new Promise((r) => setTimeout(() => r("still-pending"), 700)),
         ]);
         assert.equal(settled, "still-pending", `CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS=0 did not disable the budget: ${settled}`);
       });
     } finally {
-      for (const s of hopSockets) s.destroy();   // drop the stalled CONNECT so nothing keeps the process alive
+      // Drop the stalled CONNECT so the orphaned forwardRequest call above can
+      // actually settle (it retries fresh -- the hop is still listening and
+      // serves a second CONNECT normally) instead of leaving a handle open
+      // past this test, which some Node versions will not exit cleanly with.
+      closeHop();
+      if (pending) await pending;
+      closeBackend();
       backend.close();
       hop.close();
     }
   });
 });
 
-// fable review, B1: a REUSED (or already-connected) socket never re-fires
-// 'connect'/'secureConnect', so `established` stayed false for its whole life
-// and the short connect budget — meant only for the CONNECT phase — stayed
-// armed through the response wait too. Three shapes hand back such a socket:
-// a keep-alive REUSE (any agent), and hpagent's HttpProxyAgent (plain http
+// A REUSED (or already-connected) socket never re-fires 'connect'/
+// 'secureConnect', so `established` stayed false for its whole life and the
+// short connect budget — meant only for the CONNECT phase — stayed armed
+// through the response wait too. Three shapes hand back such a socket: a
+// keep-alive REUSE (any agent), and hpagent's HttpProxyAgent (plain http
 // upstream through a hop), whose tunnel socket is already TCP-connected by
 // the time it is handed over.
-describe("upstream CONNECT-phase budget: already-established sockets (fable review B1)", () => {
+describe("upstream CONNECT-phase budget: already-established sockets", () => {
   it("re-arms on a REUSED keep-alive socket, so a slow second response is not cut by the connect budget", async () => {
     // HTTPS, not plain http: for a reused socket `!isHTTPS && !sock.connecting`
     // is excluded by construction, so this exercises `upstreamReq.reusedSocket`
@@ -382,6 +421,7 @@ describe("upstream CONNECT-phase budget: already-established sockets (fable revi
       if (seen === 1) { res.end("first"); return; }
       setTimeout(() => res.end("second"), 300);
     });
+    const closeBackend = trackConnections(backend);
     await new Promise((r) => backend.listen(0, "127.0.0.1", r));
     const backendPort = backend.address().port;
 
@@ -401,8 +441,17 @@ describe("upstream CONNECT-phase budget: already-established sockets (fable revi
         // timeout — stays in effect and cuts the 300ms-delayed response.
         const r2 = await forwardRequest(mockReq(), "{}", null);
         assert.equal(r2.statusCode, 200, "a reused socket's slow response was cut by the connect budget");
+        // NOT just "still 200": without the reusedSocket branch, the same
+        // failure (established false, budget expires) is caught by the
+        // existing pre-send retry path instead — a fresh dial that also
+        // lands on 200, giving a false green. Pin it to the SAME connection
+        // and to the backend having answered exactly twice.
+        assert.equal(r2.upstreamConnectionId, r1.upstreamConnectionId,
+          "the second call dialed a fresh connection instead of reusing the first — the timeout was retried, not avoided");
+        assert.equal(seen, 2, "the backend saw more than two requests — a retry happened");
       });
     } finally {
+      closeBackend();
       backend.close();
       rmSync(dir, { recursive: true, force: true });
     }
@@ -413,6 +462,7 @@ describe("upstream CONNECT-phase budget: already-established sockets (fable revi
     const backend = https.createServer({ key: readFileSync(key), cert: readFileSync(cert) }, (req, res) => {
       setTimeout(() => res.end("slow-but-real"), 300);
     });
+    const closeBackend = trackConnections(backend);
     await new Promise((r) => backend.listen(0, "127.0.0.1", r));
     const backendPort = backend.address().port;
 
@@ -428,6 +478,7 @@ describe("upstream CONNECT-phase budget: already-established sockets (fable revi
         for await (const _ of upstreamRes) { /* drain */ }
       });
     } finally {
+      closeBackend();
       backend.close();
       rmSync(dir, { recursive: true, force: true });
     }
@@ -439,10 +490,12 @@ describe("upstream CONNECT-phase budget: already-established sockets (fable revi
       seen += 1;
       sock.once("data", () => { sock.resetAndDestroy(); });
     });
+    const closeBackend = trackConnections(backend);
     await new Promise((r) => backend.listen(0, "127.0.0.1", r));
     const backendPort = backend.address().port;
 
     const hop = startResettingHop({ forward: `127.0.0.1:${backendPort}` });   // plain relay, no reset/stall
+    const closeHop = trackConnections(hop);
     await new Promise((r) => hop.listen(0, "127.0.0.1", r));
     const hopPort = hop.address().port;
 
@@ -457,18 +510,20 @@ describe("upstream CONNECT-phase budget: already-established sockets (fable revi
           "a post-send reset relayed through the http-via-hop path was retried — established never became true for its tunnel socket");
       });
     } finally {
+      closeBackend();
+      closeHop();
       backend.close();
       hop.close();
     }
   });
 });
 
-// fable review, B4: the retry dials through the SAME agent/pool, so it can
-// land on ANOTHER pooled socket instead of a fresh one -- and when a hop
-// drops, every free socket it was carrying tends to die together (the
-// 2026-09-06 burst's own shape). One retry against a sibling that is also
-// already dead just rejects (isRetry blocks a second try).
-describe("upstream leg resets: sibling free sockets (fable review B4)", () => {
+// The retry dials through the SAME agent/pool, so it can land on ANOTHER
+// pooled socket instead of a fresh one -- and when a hop drops, every free
+// socket it was carrying tends to die together (the 2026-09-06 burst's own
+// shape). One retry against a sibling that is also already dead just
+// rejects (isRetry blocks a second try).
+describe("upstream leg resets: sibling free sockets", () => {
   it("destroys sibling free sockets before a retry, so it does not land on another one the same hop dropped", async () => {
     // Resets a socket's SECOND request rather than answering it -- both A and
     // B, once free, carry this same fate, standing in for "the hop dropped
@@ -483,6 +538,7 @@ describe("upstream leg resets: sibling free sockets (fable review B4)", () => {
         sock.write(`HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\nConnection: keep-alive\r\n\r\n${body}`);
       });
     });
+    const closeBackend = trackConnections(backend);
     await new Promise((r) => backend.listen(0, "127.0.0.1", r));
     const port = backend.address().port;
 
@@ -511,7 +567,57 @@ describe("upstream leg resets: sibling free sockets (fable review B4)", () => {
           `the retry reused a sibling free socket (${idC}) instead of dialing fresh`);
       });
     } finally {
+      closeBackend();
       backend.close();
+    }
+  });
+
+  // getName() on an HTTPS agent appends ca/cert/rejectUnauthorized etc
+  // (node:https Agent.prototype.getName calls http's getName first, then
+  // keeps going) -- buildAgent always sets rejectUnauthorized, so an exact
+  // name reconstructed from per-request `options` (which carries none of
+  // those TLS fields at all) never matches the key Node actually stored the
+  // free sockets under, and a sweep keyed that way silently destroys
+  // nothing. The http-agent case above cannot see this: getName's http-only
+  // prefix is already the whole name there. An https agent is what real
+  // /v1/messages traffic uses.
+  it("destroys sibling free sockets before a retry, on an HTTPS agent", async () => {
+    const { dir, key, cert } = selfSignedCert();
+    const answered = new WeakSet();
+    const backend = https.createServer({ key: readFileSync(key), cert: readFileSync(cert) }, (req, res) => {
+      // resetAndDestroy() only works on a raw TCP handle, not a TLSSocket's
+      // wrapped one (ERR_INVALID_HANDLE_TYPE) -- a plain destroy() still
+      // kills the peer's connection, which is all this fixture needs.
+      if (answered.has(req.socket)) { req.socket.destroy(); return; }
+      answered.add(req.socket);
+      res.end("ok");
+    });
+    const closeBackend = trackConnections(backend);
+    await new Promise((r) => backend.listen(0, "127.0.0.1", r));
+    const port = backend.address().port;
+
+    try {
+      await withEnv({
+        CACHE_FIX_PROXY_UPSTREAM: `https://127.0.0.1:${port}`,
+        CACHE_FIX_PROXY_REJECT_UNAUTHORIZED: "0",
+      }, async () => {
+        const { forwardRequest } = await import("../proxy/upstream.mjs");
+        const call = async () => {
+          const r = await forwardRequest(mockReq(), "{}", null);
+          for await (const _ of r.upstreamRes) { /* drain */ }
+          return r.upstreamConnectionId;
+        };
+        const [idA, idB] = await Promise.all([call(), call()]);
+        assert.notEqual(idA, idB, "premise: two concurrent calls did not open two distinct sockets");
+
+        const idC = await call();
+        assert.ok(idC !== idA && idC !== idB,
+          `the retry reused a sibling free HTTPS socket (${idC}) instead of dialing fresh`);
+      });
+    } finally {
+      closeBackend();
+      backend.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

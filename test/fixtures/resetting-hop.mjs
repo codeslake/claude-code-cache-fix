@@ -1,6 +1,6 @@
 // A forward (CONNECT) proxy that reproduces a hop dropping a live connection
-// instead of answering it -- the shape privoxy->autossh showed on 2026-09-06
-// (accept, CONNECT, then RST, no retry, no response). See CCF's
+// instead of answering it -- the shape a hop dropping the leg below it showed
+// on 2026-09-06 (accept, CONNECT, then RST, no retry, no response). See CCF's
 // proxy/upstream.mjs forwardRequest(), which this fixture's own tests exercise
 // via resetFirstConnect / stallFirstConnect.
 //
