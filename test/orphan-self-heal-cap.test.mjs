@@ -27,18 +27,39 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { HOP_ENV, freePort, reapStamped } from "./proc-helpers.mjs";
+import { HOP_ENV, freePort, reapStamped, stamped } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
+const lineage = `orphan-cap-${process.pid}-${Date.now()}`;
+process.env.CACHE_FIX_TEST_LINEAGE = lineage;
+
+// A SYNCHRONOUS BACKSTOP, same shape as proxy-held-port.test.mjs's: `after()`
+// (here, the case's own `finally`, since there is only one case) is async and
+// can be skipped by a crash before it runs; `exit` cannot await, so this is
+// SIGKILL directly rather than the SIGHUP-then-wait reapStamped() gets to do.
+process.on("exit", () => {
+  for (const p of stamped(lineage)) {
+    try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
+  }
+});
+
 const get = (port) => new Promise((res) => {
-  http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
-    let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
-  }).on("error", (e) => res(`ERR:${e.code}`));
+  // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
+  // /health with a 503 and a JSON body of its own, and readiness on any body
+  // lets a loop finish against the relay instead of the real holder.
+  const r = http.get({ host: "127.0.0.1", port, path: "/health" }, (q) => {
+    let b = ""; q.on("data", (d) => (b += d));
+    q.on("end", () => res(q.statusCode === 200 ? b : `ERR:${q.statusCode} ${b.slice(0, 160)}`));
+  });
+  // `timeout:` in the options only EMITS 'timeout'; it does not destroy the
+  // request, so a standby holding an un-armed listen (completes the connect,
+  // never answers) leaves this promise unsettled forever.
+  r.setTimeout(3_000, () => { r.destroy(); res("ERR:HUNG"); });
+  r.on("error", (e) => res(`ERR:${e.code}`));
 });
 
 it("announces a self-heal respawn at most once per orphan", async () => {
-  const lineage = `orphan-cap-${process.pid}-${Date.now()}`;
   const port = await freePort();
   const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
                 CACHE_FIX_SELF_HEAL_MS: "50", CACHE_FIX_TEST_LINEAGE: lineage };

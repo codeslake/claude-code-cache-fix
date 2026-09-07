@@ -111,7 +111,11 @@ export function ours(port) {
 // unverified on macOS (no live box to measure this leg on) — a case there
 // still has the port sweep above as its floor, so nothing regresses.
 export function stamped(marker) {
-  return byEnv(new RegExp(`CACHE_FIX_TEST_LINEAGE=${marker}(?:\\s|$)`));
+  // Escaped: a marker built from a pid and Date.now() has no regex metachars
+  // today, but the marker is a caller-supplied string and `.` alone would
+  // silently widen the match to any single character in its place.
+  const safe = String(marker).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return byEnv(new RegExp(`CACHE_FIX_TEST_LINEAGE=${safe}(?:\\s|$)`));
 }
 
 // SIGHUP, THEN SIGKILL, BY LINEAGE. The shared shape of "reap what this run's

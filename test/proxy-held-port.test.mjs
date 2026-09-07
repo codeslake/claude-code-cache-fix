@@ -2402,7 +2402,10 @@ it("leaves a standby for the file-level sweep to find, on a port it never regist
     if (!relays.length) await new Promise((r) => setTimeout(r, 200));
   }
   assert.ok(relays.length, "the holder never opened a standby — this measures nothing");
-  writeFileSync(process.env.LEAK_PROBE_FILE, relays.join(","));
+  // The lineage rides along with the pids: a harness that only has the pids
+  // can do no better than a blind kill, and a recycled pid must still pass
+  // the marker+OURS filter before anything signals it.
+  writeFileSync(process.env.LEAK_PROBE_FILE, `${lineage}\n${relays.join(",")}`);
   holder.kill("SIGKILL");        // bypasses every handler, including closeStandby()
   await new Promise((r) => setTimeout(r, 500));
 });
