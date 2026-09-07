@@ -27,22 +27,16 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { HOP_ENV, freePort, reapStamped, stamped } from "./proc-helpers.mjs";
+import { HOP_ENV, armLineage, freePort, reapStamped } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
-const lineage = `orphan-cap-${process.pid}-${Date.now()}`;
-process.env.CACHE_FIX_TEST_LINEAGE = lineage;
-
-// A SYNCHRONOUS BACKSTOP, same shape as proxy-held-port.test.mjs's: `after()`
-// (here, the case's own `finally`, since there is only one case) is async and
-// can be skipped by a crash before it runs; `exit` cannot await, so this is
-// SIGKILL directly rather than the SIGHUP-then-wait reapStamped() gets to do.
-process.on("exit", () => {
-  for (const p of stamped(lineage)) {
-    try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
-  }
-});
+// EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
+// proxy-held-port.test.mjs's R3 fix, same shape. armLineage() also installs
+// the synchronous exit-time SIGKILL backstop `after()` gets elsewhere — here,
+// the case's own `finally` below is async and can be skipped by a crash
+// before it runs.
+const lineage = armLineage("orphan-cap");
 
 const get = (port) => new Promise((res) => {
   // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers

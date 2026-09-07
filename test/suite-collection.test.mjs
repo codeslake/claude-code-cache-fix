@@ -126,6 +126,53 @@ test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
     "that a live holder immediately replaces");
 });
 
+// EVENT #348, ROUND 4. The fix for one file (test/stdio-epipe-survival.test.mjs,
+// ledger #348 round 3) shipped with no check that keeps it — the whole class
+// (a detached standby that outlives a SIGKILLed holder) can come back the same
+// way it arrived: a new file spawns the launcher or relay and nobody notices it
+// never called armLineage()/reapStamped() (proc-helpers.mjs).
+//
+// Static, for the same reason the reaper guard above is: the sweep is cleanup
+// code, so nothing fails when a file skips it. FILE-WIDE rather than one named
+// case, because the next file to need this is not the one this guard was
+// written to watch.
+//
+// "Spawns the launcher or relay" is read off the SAME path-construction shape
+// every real spawn site in this tree uses -- `join(..., "bin", "X.mjs")` or a
+// single `"…/bin/X.mjs"` string -- with any readFileSync(...) call blanked
+// first, because two files (this one, and proxy-hop-fallback.test.mjs) name
+// that path only to read the BINARY'S OWN source as text, never to spawn it.
+test("every test file that spawns the launcher or relay carries a lineage marker", () => {
+  // Files that mention the binaries' paths but never spawn them, with why:
+  const EXEMPT = {
+    "fixture-reaping.test.mjs": "spawns a synthetic fixture script; never the real launcher or relay",
+    "proxy-hop-fallback.test.mjs": "reads gap-relay.mjs's source as text (a portOf() regex extraction); never spawns the real binary",
+  };
+  const spawnsOurs = /"bin"\s*,\s*"(?:claude-via-proxy|gap-relay)\.mjs"|["'`][./]*bin\/(?:claude-via-proxy|gap-relay)\.mjs["'`]/;
+  // Line comments blanked before every check below, mention or call alike:
+  // this guard's own added comments say "armLineage()/reapStamped()" in
+  // prose, in every file it arms, and a naive text match on the raw source
+  // cannot tell that from the real call it is standing next to. Not a full
+  // parse (a `//` inside a string survives as a false comment start, same
+  // known gap as everywhere else in this tree that does not reach for
+  // suite-collection.test.mjs's own stripComments()) — good enough for a
+  // guard whose subject never puts one there.
+  const decomment = (s) => s.split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const files = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"));
+  const missing = [];
+  for (const f of files) {
+    if (EXEMPT[f]) continue;
+    const code = decomment(readFileSync(join(testDir, f), "utf8"));
+    const stripped = code.replace(/readFileSync\([^)]*\)/g, "");
+    if (!spawnsOurs.test(stripped)) continue;
+    if (!/armLineage\(/.test(code) || !/reapStamped\(/.test(code)) missing.push(f);
+  }
+  assert.deepEqual(missing, [],
+    `these files spawn the launcher or relay but never call armLineage()/reapStamped() ` +
+    `(proc-helpers.mjs) -- a standby a case leaves behind (detached, outlives a SIGKILLed ` +
+    `holder) has nothing to reap it: ${missing.join(", ")}`);
+});
+
 // A FAILURE MESSAGE IS PUBLISHED OUTPUT. proxy-held-port's probes append the
 // 503 body to what they assert on, and the gap relay's 503 body carries the hop
 // it would forward to — so an env var that gives a child a hop and is not

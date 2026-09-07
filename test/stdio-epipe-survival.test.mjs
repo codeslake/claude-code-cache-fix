@@ -46,9 +46,15 @@ const lineage = armLineage("stdio-epipe-survival");
 const reap = (p) => { try { process.kill(-p.pid, "SIGKILL"); } catch {} try { p.kill("SIGKILL"); } catch {} };
 const cleanEnv = () => {
   const env = { ...process.env };
+  // CACHE_FIX_SELF_HEAL too: the holder cases below run with PROXY_PORT=0,
+  // which arms exitWithParent() (proxy/server.mjs) — left on, a SIGKILLed
+  // stamped holder spawns a stamped SUCCESSOR after this file's exit backstop
+  // has already taken its snapshot, so it survives the backstop even though
+  // it carries the marker. proxy-held-port.test.mjs:186/:471 scrub it for the
+  // same reason.
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                    "ALL_PROXY", "all_proxy", "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP",
-                   "CACHE_FIX_STANDBY", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+                   "CACHE_FIX_STANDBY", "CACHE_FIX_SELF_HEAL", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
   return env;
 };
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
