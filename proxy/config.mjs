@@ -28,23 +28,14 @@ const config = {
   bind: process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1",
   get upstream() { return process.env.CACHE_FIX_PROXY_UPSTREAM || "https://api.anthropic.com"; },
   timeout: envInt("CACHE_FIX_PROXY_TIMEOUT", 600_000),
-  // Bounds only the CONNECT/handshake phase of one upstream leg attempt (dial
-  // -> 'connect'/'secureConnect'), never the wait for a first response byte —
-  // that stays on `timeout` above, and a /v1/messages POST legitimately holds
-  // it for 10-60s. A hop that accepts the CONNECT and then answers nothing
-  // (2026-09-07 05:45-05:48Z: 20s of silence, the next try answered in 0.6s)
-  // was bounded only by `timeout` (600s) before this existed, because Node's
-  // Agent.createSocket prefers the per-request timeout over the agent's own
-  // (`req.timeout || this.options.timeout`) — this repo's OWN idle timeout on
-  // the Agent (below, buildAgent) never reaches the CONNECT sub-request hpagent
-  // issues. A getter, not a constant, for the same reason `upstream` is one:
-  // tests flip the env per case. 0 = off. Default not measured against this
-  // host's live chain (that needs a sandboxed probe against privoxy:8118,
-  // which this fix does not run); sized instead off the one number already on
-  // record here — full carriage (connect+TLS+request+response) measured
-  // 10.8-11.8s on 2026-09-04 — so 30s is generous headroom for connect+TLS
-  // alone, which is a fraction of that. Re-measure and lower it if a live
-  // sample says so.
+  // A keep-alive socket idle longer than this is destroyed rather than handed
+  // back out of the pool, well under a typical hop's own keep-alive timeout.
+  // Non-getter, like `timeout` above: read once, an env knob for a test to set
+  // before the first import (this repo's own test-seam idiom, see caLockWaitMs).
+  idleTimeoutMs: envInt("CACHE_FIX_UPSTREAM_IDLE_TIMEOUT_MS", 240_000),
+  // Bounds only the CONNECT/handshake phase (dial -> 'connect'/'secureConnect'),
+  // never the wait for a first response byte — that stays on `timeout` above.
+  // 0 = off. A getter, unlike `timeout`: tests flip the env per case.
   get upstreamConnectTimeoutMs() { return envInt("CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS", 30_000); },
   extensionsDir: process.env.CACHE_FIX_EXTENSIONS_DIR || join(__dirname, "extensions"),
   extensionsConfig: process.env.CACHE_FIX_EXTENSIONS_CONFIG || join(__dirname, "extensions.json"),

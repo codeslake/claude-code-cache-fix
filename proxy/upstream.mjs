@@ -397,25 +397,12 @@ export function hopAlive(proxyUrl, timeoutMs = 700) {
   });
 }
 
-// A keep-alive socket idle longer than this is destroyed rather than handed
-// back out of the pool. Well under privoxy's keep-alive-timeout 300 (2026-09-06
-// burst: 44 singleton ECONNRESETs were the hop closing an idle socket this
-// pool kept offering for reuse). Mutable only for tests — production always
-// gets the real default; see __setUpstreamIdleTimeoutMsForTests below.
-let _upstreamIdleTimeoutMs = 60_000;
-export function __setUpstreamIdleTimeoutMsForTests(ms) {
-  _upstreamIdleTimeoutMs = ms === undefined ? 60_000 : ms;
-  // _agents is cached by proxy/CA/rejectUnauthorized, not by this timeout, so
-  // an already-built Agent would otherwise keep the timeout it was built with.
-  _agents.clear();
-}
-
 function buildAgent(isHTTPS, proxyUrl) {
   const ca = loadCa();
   if (proxyUrl) {
     const opts = {
       keepAlive: true,
-      timeout: _upstreamIdleTimeoutMs,
+      timeout: config.idleTimeoutMs,
       proxy: proxyUrl,
       rejectUnauthorized: config.rejectUnauthorized,
       ...(ca ? { ca } : {}),
@@ -429,12 +416,12 @@ function buildAgent(isHTTPS, proxyUrl) {
     if (isHTTPS) {
       return new https.Agent({
         keepAlive: true,
-        timeout: _upstreamIdleTimeoutMs,
+        timeout: config.idleTimeoutMs,
         rejectUnauthorized: config.rejectUnauthorized,
         ...(ca ? { ca } : {}),
       });
     }
-    return new http.Agent({ keepAlive: true, timeout: _upstreamIdleTimeoutMs });
+    return new http.Agent({ keepAlive: true, timeout: config.idleTimeoutMs });
   }
   return null;
 }
@@ -604,17 +591,30 @@ export async function forwardRequest(clientReq, body, signal) {
     // already know which connection carried the request.
     const captureSocket = (sock) => {
       upstreamConnectionId = getOrAssignConnectionId(sock);
-      // A REUSED socket already passed this event, long before this attempt
-      // attached a listener for it — upstreamReq.reusedSocket is how that case
-      // is told apart, below.
-      sock.once(isHTTPS ? "secureConnect" : "connect", () => {
+      const onEstablished = () => {
         established = true;
         // PHASE SWITCH: the request started with the short connect budget as
         // its own timeout (see `options.timeout` above); re-arm it to the real
         // request timeout now that the handshake is done, or a slow first
         // response token would be cut by the budget meant for the CONNECT.
         if (connectBudgetMs > 0) upstreamReq.setTimeout(config.timeout);
-      });
+      };
+      // Three shapes hand back a socket that will NEVER fire the event below,
+      // because it already happened before we saw the socket: a REUSED
+      // keep-alive socket (any agent); the globalAgent/no-agent direct-dial
+      // path reusing one from Node's own pool; and hpagent's HttpProxyAgent
+      // (plain http upstream through a hop) — its CONNECT tunnel's raw socket
+      // is already TCP-connected by the time hpagent hands it over, and never
+      // fires 'connect' again. Missing this left `established` false for the
+      // rest of such a request's life: the short connect budget stayed armed
+      // through the whole response wait, and — worse, on the http-via-hop
+      // path — a genuine post-send reset read as pre-send and got retried.
+      // `reusedSocket` is set by Agent.reuseSocket before this event fires, so
+      // it is already readable here. hpagent's HttpsProxyAgent is the one
+      // shape this does NOT cover: it wraps the tunnel in a fresh TLSSocket,
+      // which has its own real 'secureConnect' still to come.
+      if (upstreamReq.reusedSocket || (!isHTTPS && !sock.connecting)) onEstablished();
+      else sock.once(isHTTPS ? "secureConnect" : "connect", onEstablished);
     };
 
     const upstreamReq = transport.request(options, (upstreamRes) => {
@@ -631,31 +631,37 @@ export async function forwardRequest(clientReq, body, signal) {
 
     upstreamReq.on("error", (err) => {
       if (settled) return;
+      // reused implies established (captureSocket marks a reused socket
+      // established immediately), so the old `!reusedSocket && !established`
+      // half was never true in a state `!established` did not already cover.
       const retryable = !isRetry && !(signal && signal.aborted) && (
-        (!upstreamReq.reusedSocket && !established) ||
-        (upstreamReq.reusedSocket && err.code === "ECONNRESET")
+        !established || (upstreamReq.reusedSocket && err.code === "ECONNRESET")
       );
       if (retryable) {
         settled = true;
+        if (upstreamReq.reusedSocket) {
+          // Every free socket sharing this name is equally likely to be
+          // dead -- the 2026-09-06 burst's own shape, a hop dropping every
+          // pooled connection together -- so leaving siblings in the pool
+          // lets the retry land on another dead one instead of a fresh dial.
+          const agent = options.agent || transport.globalAgent;
+          // getName() reads `.host`, and `options` here only ever carries
+          // `.hostname` (the field transport.request() itself accepts) — so
+          // the un-corrected call built "localhost:port:" and found nothing.
+          const name = agent.getName({ ...options, host: options.hostname });
+          for (const s of agent.freeSockets?.[name] ?? []) s.destroy();
+        }
         resolve(attempt(true));
         return;
       }
       reject(err);
     });
+    // Named so a rejection reads as which phase timed out; `established`
+    // already decides retry-eligibility above, this is cosmetic only.
     upstreamReq.on("timeout", () => {
-      // Pre-connect, this is the connect budget expiring (named so a caller
-      // reading the rejection can tell it apart from a real request timeout);
-      // post-connect it is the ordinary request timeout, unretried because
-      // `established` is already true by the time this destroy()'s 'error' is
-      // read above.
-      if (connectBudgetMs > 0 && !established) {
-        const budgetErr = new Error(
-          `upstream CONNECT/handshake exceeded the connect budget (${connectBudgetMs}ms)`);
-        budgetErr.code = "ETIMEDOUT";
-        upstreamReq.destroy(budgetErr);
-        return;
-      }
-      upstreamReq.destroy(new Error("Upstream timeout"));
+      upstreamReq.destroy(new Error(established
+        ? "Upstream timeout"
+        : `upstream connect budget (${connectBudgetMs}ms) exceeded`));
     });
 
     if (signal) {
