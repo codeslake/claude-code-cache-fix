@@ -14,8 +14,11 @@
 // answer); every CONNECT after that is served normally. Counting only a
 // connection that sent request bytes -- not merely one CCF accepted -- matters
 // because CCF's own hopAlive() probes a hop with a bytes-0 connect-and-close
-// before every request; that probe must never consume the injection meant for
-// the real CONNECT that follows it.
+// ahead of the real CONNECT whenever CACHE_FIX_FALLBACK_PROXIES is set (its
+// one caller, forwardRequest -> resolveHop, is gated on that list being
+// non-empty) -- true for the fleet's live config and the deployer's sandbox
+// proof, not for this test file; that probe must never consume the injection
+// meant for the real CONNECT that follows it.
 //
 // Exports only, no top-level side effects (test/proc-helpers.mjs,
 // test/child-deadline.mjs: same convention). Standalone, e.g. (run from the
@@ -46,6 +49,7 @@ export function startResettingHop({ forward, resetFirstConnect = false, stallFir
 
       if (resetFirstConnect && seen === 1) {
         console.error(`[resetting-hop] reset #1 on CONNECT ${match[1]}`);
+        server.injected += 1;
         // No CONNECT reply, no relay: the request was read but never
         // answered.
         client.resetAndDestroy();
@@ -53,6 +57,7 @@ export function startResettingHop({ forward, resetFirstConnect = false, stallFir
       }
       if (stallFirstConnect && seen === 1) {
         console.error(`[resetting-hop] stall #1 on CONNECT ${match[1]}`);
+        server.injected += 1;
         // Read; never replied, never relayed. Nothing to clean up on close
         // (the caller destroys/aborts its own side).
         return;
@@ -69,5 +74,6 @@ export function startResettingHop({ forward, resetFirstConnect = false, stallFir
     };
     client.on("data", onData);
   });
+  server.injected = 0;   // count of reset/stall injections actually fired
   return server;
 }

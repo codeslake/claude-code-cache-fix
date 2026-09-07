@@ -54,7 +54,7 @@ process.env.CACHE_FIX_UPSTREAM_IDLE_TIMEOUT_MS = "2000";
 // An ambient HTTPS_PROXY would route these cases past the fixture; scrub it.
 const ENV_KEYS = [
   "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_PROXY_UPSTREAM", "CACHE_FIX_PROXY_REJECT_UNAUTHORIZED",
-  "CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS",
+  "CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS", "CACHE_FIX_FALLBACK_PROXIES",
   "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
   "NO_PROXY", "no_proxy",
 ];
@@ -111,6 +111,7 @@ describe("upstream leg resets (PR fix/upstream-leg-resets)", () => {
         const chunks = [];
         for await (const c of upstreamRes) chunks.push(c);
         assert.equal(Buffer.concat(chunks).toString(), "backend-ok");
+        assert.equal(hop.injected, 1, "the reset injection did not fire exactly once");
       });
     } finally {
       closeBackend();
@@ -309,6 +310,7 @@ describe("upstream CONNECT-phase budget (PR fix/upstream-leg-resets)", () => {
         assert.equal(statusCode, 200, "the retry after the hop's silent CONNECT did not reach the real backend");
         assert.ok(took < 600, `retry took ${took}ms, more than ~3x the 200ms budget`);
         for await (const _ of upstreamRes) { /* drain */ }
+        assert.equal(hop.injected, 1, "the stall injection did not fire exactly once");
       });
     } finally {
       // The successful retry leaves a live keep-alive tunnel through the hop
