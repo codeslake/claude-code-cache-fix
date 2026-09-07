@@ -550,13 +550,26 @@ export async function forwardRequest(clientReq, body, signal) {
   const isHTTPS = upstreamUrl.protocol === "https:";
   const transport = isHTTPS ? https : http;
 
+  // BOUNDS ONLY THE CONNECT/HANDSHAKE PHASE (dial -> 'connect'/'secureConnect').
+  // A hop that accepts the CONNECT and then answers nothing (measured
+  // 2026-09-07 05:45-05:48Z: 20s silent, the next try 0.6s) was bounded only by
+  // `config.timeout` (600s) before this existed: Node's Agent.createSocket
+  // prefers the per-request timeout over the Agent's own (`req.timeout ||
+  // this.options.timeout`, lib/_http_agent.js) — so buildAgent's idle timeout
+  // never reaches the CONNECT sub-request hpagent issues, and this is the only
+  // value that does. Started as the request's OWN timeout so hpagent's
+  // internal CONNECT-phase request inherits it (same merge); re-armed to the
+  // real `config.timeout` the moment the handshake completes, in
+  // captureSocket below — a /v1/messages POST legitimately waits 10-60s for
+  // its first token, and that phase must never be cut by this budget.
+  const connectBudgetMs = config.upstreamConnectTimeoutMs;
   const options = {
     hostname: upstreamUrl.hostname,
     port: defaultPort(upstreamUrl),
     path: upstreamUrl.pathname + upstreamUrl.search,
     method: clientReq.method,
     headers,
-    timeout: config.timeout,
+    timeout: connectBudgetMs > 0 ? connectBudgetMs : config.timeout,
     agent: getAgent(isHTTPS, upstreamUrl.hostname, hop),
   };
 
@@ -594,7 +607,14 @@ export async function forwardRequest(clientReq, body, signal) {
       // A REUSED socket already passed this event, long before this attempt
       // attached a listener for it — upstreamReq.reusedSocket is how that case
       // is told apart, below.
-      sock.once(isHTTPS ? "secureConnect" : "connect", () => { established = true; });
+      sock.once(isHTTPS ? "secureConnect" : "connect", () => {
+        established = true;
+        // PHASE SWITCH: the request started with the short connect budget as
+        // its own timeout (see `options.timeout` above); re-arm it to the real
+        // request timeout now that the handshake is done, or a slow first
+        // response token would be cut by the budget meant for the CONNECT.
+        if (connectBudgetMs > 0) upstreamReq.setTimeout(config.timeout);
+      });
     };
 
     const upstreamReq = transport.request(options, (upstreamRes) => {
@@ -623,6 +643,18 @@ export async function forwardRequest(clientReq, body, signal) {
       reject(err);
     });
     upstreamReq.on("timeout", () => {
+      // Pre-connect, this is the connect budget expiring (named so a caller
+      // reading the rejection can tell it apart from a real request timeout);
+      // post-connect it is the ordinary request timeout, unretried because
+      // `established` is already true by the time this destroy()'s 'error' is
+      // read above.
+      if (connectBudgetMs > 0 && !established) {
+        const budgetErr = new Error(
+          `upstream CONNECT/handshake exceeded the connect budget (${connectBudgetMs}ms)`);
+        budgetErr.code = "ETIMEDOUT";
+        upstreamReq.destroy(budgetErr);
+        return;
+      }
       upstreamReq.destroy(new Error("Upstream timeout"));
     });
 
