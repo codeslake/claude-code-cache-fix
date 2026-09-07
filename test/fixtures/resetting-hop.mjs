@@ -5,12 +5,17 @@
 // via resetFirstConnect / stallFirstConnect.
 //
 // Every CONNECT is relayed byte-for-byte to `forward` once accepted. With
-// resetFirstConnect, the FIRST CONNECT this process sees is destroyed before
-// it is even read (a fresh, pre-handshake reset, no CONNECT reply); every
-// CONNECT after that is served normally. With stallFirstConnect, the FIRST
-// CONNECT is read and then never answered at all (the hop accepted it and
+// resetFirstConnect, the FIRST CONNECT REQUEST this process reads (a
+// connection that actually sent "CONNECT ...", not merely one that connected)
+// is destroyed right after being read, before any reply; every CONNECT after
+// that is served normally. With stallFirstConnect, that same first CONNECT
+// request is read and then never answered at all (the hop accepted it and
 // went silent — measured 2026-09-07 05:45-05:48Z, 20s of nothing then a 0.6s
-// answer); every CONNECT after that is served normally.
+// answer); every CONNECT after that is served normally. Counting only a
+// connection that sent request bytes -- not merely one CCF accepted -- matters
+// because CCF's own hopAlive() probes a hop with a bytes-0 connect-and-close
+// before every request; that probe must never consume the injection meant for
+// the real CONNECT that follows it.
 //
 // Exports only, no top-level side effects (test/proc-helpers.mjs,
 // test/child-deadline.mjs: same convention). Standalone, e.g. (run from the
@@ -24,16 +29,9 @@ export function startResettingHop({ forward, resetFirstConnect = false, stallFir
   const sep = String(forward).lastIndexOf(":");
   const fwdHost = forward.slice(0, sep);
   const fwdPort = Number(forward.slice(sep + 1));
-  let seen = 0;
+  let seen = 0;   // CONNECT REQUESTS seen (bytes sent), not raw accepts.
 
   const server = net.createServer((client) => {
-    seen += 1;
-    if (resetFirstConnect && seen === 1) {
-      // No CONNECT reply, no relay: the request never left this hop.
-      client.resetAndDestroy();
-      return;
-    }
-
     let buf = Buffer.alloc(0);
     const onData = (chunk) => {
       buf = Buffer.concat([buf, chunk]);
@@ -42,11 +40,21 @@ export function startResettingHop({ forward, resetFirstConnect = false, stallFir
       client.removeListener("data", onData);
       const head = buf.slice(0, end).toString();
       const rest = buf.slice(end + 4);
-      if (!/^CONNECT /.test(head)) { client.destroy(); return; }
+      const match = /^CONNECT (\S+)/.exec(head);
+      if (!match) { client.destroy(); return; }
+      seen += 1;
 
+      if (resetFirstConnect && seen === 1) {
+        console.error(`[resetting-hop] reset #1 on CONNECT ${match[1]}`);
+        // No CONNECT reply, no relay: the request was read but never
+        // answered.
+        client.resetAndDestroy();
+        return;
+      }
       if (stallFirstConnect && seen === 1) {
-        // Accepted and read; never replied, never relayed. Nothing to clean
-        // up on close (the caller destroys/aborts its own side).
+        console.error(`[resetting-hop] stall #1 on CONNECT ${match[1]}`);
+        // Read; never replied, never relayed. Nothing to clean up on close
+        // (the caller destroys/aborts its own side).
         return;
       }
 

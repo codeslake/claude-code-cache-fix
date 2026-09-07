@@ -49,7 +49,7 @@ function selfSignedCert() {
 // each file into its own process) -- so a small value for the idle-timeout
 // case below has to be set before ANYTHING in this file dynamically imports
 // proxy/upstream.mjs for the first time, not scoped to that one test.
-process.env.CACHE_FIX_UPSTREAM_IDLE_TIMEOUT_MS = "150";
+process.env.CACHE_FIX_UPSTREAM_IDLE_TIMEOUT_MS = "2000";
 
 // An ambient HTTPS_PROXY would route these cases past the fixture; scrub it.
 const ENV_KEYS = [
@@ -273,7 +273,7 @@ describe("upstream leg resets (PR fix/upstream-leg-resets)", () => {
         const idB = await call(); // back-to-back: shares the socket
         assert.equal(idA, idB, "two immediate requests did not share a pooled connection");
 
-        await new Promise((r) => setTimeout(r, 400)); // > the 150ms idle timeout (top of file)
+        await new Promise((r) => setTimeout(r, 2300)); // > the 2000ms idle timeout (top of file)
         const idC = await call();
         assert.notEqual(idB, idC, "an idle socket past the timeout was still reused");
       });
