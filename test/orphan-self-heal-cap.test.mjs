@@ -3,7 +3,7 @@
 // `setInterval`'s handle was never assigned — nothing could `clearInterval` it,
 // so the next tick re-entered and spawned again even while the previous
 // successor was still booting or had already died fighting the orphan for the
-// port. Measured on lmd42: 17 orphaned `run-service` daemons and 85+ orphaned
+// port. Measured on <linux-host>: 17 orphaned `run-service` daemons and 85+ orphaned
 // `bin/gap-relay.mjs` standbys, some 4-11 days old, 0 connections, owner
 // sessions long dead.
 //
@@ -27,7 +27,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { freePort, stamped } from "./proc-helpers.mjs";
+import { HOP_ENV, freePort, reapStamped } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -43,9 +43,7 @@ it("announces a self-heal respawn at most once per orphan", async () => {
   const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
                 CACHE_FIX_SELF_HEAL_MS: "50", CACHE_FIX_TEST_LINEAGE: lineage };
   // Heal ON: no CACHE_FIX_SELF_HEAL in the child's env at all (the default).
-  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
-                    "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "CACHE_FIX_FALLBACK_PROXIES",
-                    "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_SELF_HEAL", "CACHE_FIX_WATCH_DEPLOY_MS"])
+  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_SELF_HEAL", "CACHE_FIX_WATCH_DEPLOY_MS"])
     delete env[k];
   const holder = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
   // The orphan's own self-heal message is written to ITS stderr, which is
@@ -60,6 +58,7 @@ it("announces a self-heal respawn at most once per orphan", async () => {
     while (Date.now() < up) {
       const body = await get(port);
       if (!body.startsWith("ERR:")) break;
+      await new Promise((r) => setTimeout(r, 100));
     }
     try { kid = Number(execFileSync("pgrep", ["-P", String(holder.pid)]).toString().trim().split("\n")[0]); } catch {}
     assert.ok(kid > 1, "the holder never spawned a proxy, so this measures nothing");
@@ -84,12 +83,6 @@ it("announces a self-heal respawn at most once per orphan", async () => {
     // are still fighting over the original one.
     try { holder.kill("SIGKILL"); } catch {}
     if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
-    for (let i = 0; i < 5; i++) {
-      const survivors = stamped(lineage);
-      if (!survivors.length) break;
-      for (const p of survivors) { try { process.kill(Number(p), "SIGHUP"); } catch {} }
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    for (const p of stamped(lineage)) { try { process.kill(Number(p), "SIGKILL"); } catch {} }
+    await reapStamped(lineage);
   }
 });

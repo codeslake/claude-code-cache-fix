@@ -71,8 +71,10 @@ export function listeners(port) {
 //
 // Still filtered by OURS, for the same reason listeners() is: a port number is
 // not ownership, and freePort() hands the same number to neighbouring files.
-export function ours(port) {
-  const want = new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=${Number(port)}(?:\\s|$)`);
+// EVERY PID WHOSE ENVIRON MATCHES `want`, filtered by OURS. Shared by ours()
+// (keyed on a registered port) and stamped() (keyed on a lineage marker) —
+// same two platforms, same two markers to read, only the regex differs.
+function byEnv(want) {
   const out = [];
   try {
     // Linux: /proc is authoritative and needs no shell-out.
@@ -96,6 +98,10 @@ export function ours(port) {
   return out;
 }
 
+export function ours(port) {
+  return byEnv(new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=${Number(port)}(?:\\s|$)`));
+}
+
 // EVERY PROCESS DESCENDED FROM ONE TEST FILE'S RUN, by env marker rather than
 // by the port it ends up on. onPort()/ours() need a registered port; a
 // self-heal successor or a standby relay a case never asked freePort() for
@@ -105,26 +111,22 @@ export function ours(port) {
 // unverified on macOS (no live box to measure this leg on) — a case there
 // still has the port sweep above as its floor, so nothing regresses.
 export function stamped(marker) {
-  const want = new RegExp(`CACHE_FIX_TEST_LINEAGE=${marker}(?:\\s|$)`);
-  const out = [];
-  try {
-    for (const pid of readdirSync("/proc")) {
-      if (!/^\d+$/.test(pid)) continue;
-      let env = "";
-      try { env = readFileSync(`/proc/${pid}/environ`, "utf8").replace(/\0/g, " "); } catch { continue; }
-      if (want.test(env) && OURS.test(cmdOf(pid))) out.push(pid);
-    }
-    return out;
-  } catch { /* no /proc: ask ps below */ }
-  try {
-    const rows = execFileSync("ps", ["-wwEo", "pid=,command="],
-                              { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    for (const line of rows.split("\n")) {
-      const m = /^\s*(\d+)\s+(.*)$/.exec(line);
-      if (m && want.test(m[2]) && OURS.test(m[2])) out.push(m[1]);
-    }
-  } catch { /* no ps either */ }
-  return out;
+  return byEnv(new RegExp(`CACHE_FIX_TEST_LINEAGE=${marker}(?:\\s|$)`));
+}
+
+// SIGHUP, THEN SIGKILL, BY LINEAGE. The shared shape of "reap what this run's
+// lineage left behind": SIGHUP is the graceful release a standby only stands
+// down on (see bin/claude-via-proxy.mjs's forward()), tried a few times, then
+// whatever is still alive gets forced. Two callers had this loop hand-copied;
+// one copy is what stays in sync.
+export async function reapStamped(marker) {
+  for (let i = 0; i < 6; i++) {
+    const survivors = stamped(marker);
+    if (!survivors.length) break;
+    for (const p of survivors) { try { process.kill(Number(p), "SIGHUP"); } catch { /* gone already */ } }
+    await new Promise((r) => setTimeout(r, 700));
+  }
+  for (const p of stamped(marker)) { try { process.kill(Number(p), "SIGKILL"); } catch { /* gone already */ } }
 }
 
 // A port nobody is listening on RIGHT NOW. It is released before the caller

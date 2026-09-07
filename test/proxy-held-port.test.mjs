@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, stamped } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, reapStamped, stamped } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -2431,12 +2431,5 @@ after(async () => {
   // and a standby it left behind (measured: one, ppid 1, 10s after this file's
   // runner exited) was never swept. stamped() finds the whole lineage this
   // file caused by env marker instead, whatever port it landed on.
-  const lineage = process.env.CACHE_FIX_TEST_LINEAGE;
-  for (let i = 0; i < 6; i++) {
-    const survivors = stamped(lineage);
-    if (!survivors.length) break;
-    for (const p of survivors) { try { process.kill(Number(p), "SIGHUP"); } catch { } }
-    await new Promise((r) => setTimeout(r, 700));
-  }
-  for (const p of stamped(lineage)) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
+  await reapStamped(process.env.CACHE_FIX_TEST_LINEAGE);
 });
