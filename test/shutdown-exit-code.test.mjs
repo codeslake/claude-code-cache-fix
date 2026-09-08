@@ -926,8 +926,10 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       exited.catch(() => {});
       proc.kill("SIGUSR2");
       // A 1500ms stall window needs at most 2-3 ticks (the drain polls every
-      // 1s) to fire; 3s clears that with margin.
-      await new Promise((r) => setTimeout(r, 3_000));
+      // 1s) to fire. 4.5s left as little as ~950ms of headroom under
+      // CONCURRENCY scheduler jitter (measured: 2004-2052ms over 5 runs at
+      // CONCURRENCY 24); 4.5s clears the worst observation by >=2s.
+      await new Promise((r) => setTimeout(r, 4_500));
 
       assert.match(stderr(), /drain destroyed one connection .* \(before headers\)/,
         `the stall ended a byte-less response on the "ended" arm; it must be reset, ` +
@@ -986,9 +988,11 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       exited.catch(() => {});
       proc.kill("SIGUSR2");
       // A few ticks past DRAIN_MS: the stall test ends the connection by tick
-      // 2 (~2s), the backstop fires by tick 4 (~4s); 5s covers both with
-      // margin against poll-loop jitter.
-      await new Promise((r) => setTimeout(r, 5_000));
+      // 2 (~2s), the backstop fires by tick 4 (~4s). 5s left as little as
+      // ~985ms of headroom under CONCURRENCY scheduler jitter (measured:
+      // 3004-4015ms over 5 runs at CONCURRENCY 24, the tick-4 case landing
+      // once); 6.5s clears the worst observation by >=2s.
+      await new Promise((r) => setTimeout(r, 6_500));
 
       const back = stderr().match(/on the BACKSTOP budget[^\n]*/)?.[0];
       assert.ok(back, `premise: the backstop never fired; stderr was:\n${stderr()}`);
@@ -1824,8 +1828,12 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
 
       proc.kill("SIGHUP");
       // The unbind is synchronous inside server.close(), not gated by the
-      // reply that cannot flush; 800ms just clears the signal handler.
-      await new Promise((r) => setTimeout(r, 800));
+      // reply that cannot flush. 800ms was the smallest absolute margin in
+      // the file for signal delivery plus handler latency on a proxy
+      // competing with CONCURRENCY siblings — measured instead of assumed:
+      // the actual gap ran a stable 20-22ms over 5 runs at CONCURRENCY 24,
+      // so 2.5s clears the worst observation by >=2s.
+      await new Promise((r) => setTimeout(r, 2_500));
 
       const state = await new Promise((res) => {
         const s = net.connect(p, "127.0.0.1");
