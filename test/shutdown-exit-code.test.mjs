@@ -136,7 +136,13 @@ describe("SIGTERM exit code", () => {
   // So a `systemctl stop` during a slow upstream call turned a retryable
   // ECONNRESET into a well-formed empty SUCCESS. A client cannot tell that from
   // a real empty answer, and will not retry.
-  it("does not fabricate a 200 for a request that never got headers", async () => {
+  // MERGED with the former "names the routes it cut, and never writes a query
+  // string" case (2026-09-08, PR #356 test-weight cut): identical fixture —
+  // one never-answered connection, one SIGTERM, the standalone 5s ceiling —
+  // so the two cost that ceiling twice for two disjoint sets of assertions
+  // about the SAME forced-close line. A query string on the one connection
+  // this case already opens is enough to carry both.
+  it("does not fabricate a 200 for a request that never got headers, and never writes a query string", async () => {
     // The response is live with headersSent false when the watchdog fires.
     const hung = await hungUpstream();
     const { proc, port, stderr } = startProxy({
@@ -145,9 +151,13 @@ describe("SIGTERM exit code", () => {
     try {
       const p = await port;
       let firstLine = null, err = null;
+      // A QUERY STRING CARRYING SOMETHING THAT MUST NOT REACH A LOG. The proxy
+      // sees whole request URLs and this line is written to stderr, so the
+      // grouping is the only thing between an identifier in a path and a log
+      // file that outlives the process.
       const c = net.connect(p, "127.0.0.1", () => c.write(
-        "POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n" +
-        "content-length: 2\r\n\r\n{}"));
+        "POST /v1/messages?beta=true&tok=SHOULD-NOT-APPEAR HTTP/1.1\r\nHost: x\r\n" +
+        "content-type: application/json\r\ncontent-length: 2\r\n\r\n{}"));
       c.on("data", (d) => { firstLine = firstLine ?? String(d).split("\r\n")[0]; });
       c.on("error", (e) => (err = err || e.code));
       // Let the request reach the hung upstream, then stop.
@@ -170,6 +180,16 @@ describe("SIGTERM exit code", () => {
         `the shutdown answered a never-started response with ${JSON.stringify(firstLine)} — ` +
         `an empty 200 is indistinguishable from a real one, so the client keeps it ` +
         `instead of retrying`);
+
+      assert.match(stderr(), /routes: \/v1\/messages=1/,
+        `the cut line does not name what it cut; stderr was:\n${stderr()}`);
+      assert.doesNotMatch(stderr(), /SHOULD-NOT-APPEAR/,
+        "the route tally wrote the QUERY STRING into a log — this proxy sees whole " +
+        "request URLs, so the grouping is what keeps an identifier in a path out of " +
+        "a file that outlives the process");
+      assert.doesNotMatch(stderr(), /routes: \/v1\/messages\?/,
+        "the tally kept the `?` — grouping must cut at the query, not merely omit " +
+        "the value");
     } finally {
       try { proc.kill("SIGKILL"); } catch {}
       await hung.close();
@@ -476,68 +496,16 @@ describe("SIGTERM exit code", () => {
     }
   });
 
-  // THE 5s IS AN OUTAGE BUDGET, AND A HANDOVER IS NOT AN OUTAGE.
+  // "names the routes it cut, and never writes a query string" MERGED into
+  // "does not fabricate a 200 for a request that never got headers" above
+  // (2026-09-08): same fixture, same standalone 5s ceiling, so it cost that
+  // ceiling a second time for assertions the merged case now also carries.
   //
-  // A supervised stop is SERIAL — stop, wait for exit, start — so a longer grace
-  // there extends a real outage; at 120s against DefaultTimeoutStopSec=90s the
-  // stop was SIGKILLed and restart downtime went 5.0s -> 53.9s. That reasoning
-  // is sound and this case keeps it.
-  //
-  // On the handedOff path nothing waits: the successor was spawned detached with
-  // fd 3 and is serving, and the holder reads "(handed off)" as "do nothing".
-  // The same 5s applied there cut real replies on every deploy — measured on
-  // <linux-host>, cut 4 / 14 / 17 / 14 / 16, every one 100% mid-response.
-  //
-  // LIFTED AND EVALUATED, not grepped: the whole point is which VALUE comes out
-  // for which arm, and a grep for "handedOff" passes on the comment above it.
   // THE PREDICATE, END TO END, BOTH DIRECTIONS. A budget test can only ever
   // assert "it eventually stopped", which a ceiling also satisfies — so the pair
   // that matters is: a drain with nothing moving must end WITHOUT reaching the
   // ceiling, and a drain with bytes moving must NOT end while they move. Neither
   // alone distinguishes a stall predicate from a shorter clock.
-  // WHAT WAS CUT, not just how many. This port carries CLI turns alongside
-  // bridge traffic, quota polls, statusline and title generation; a cut of 15 is
-  // a different event depending on the mix, and the count alone cannot say. One
-  // host measured ~98 cuts against 6 user-visible events and neither of the two
-  // sessions looking at it could name the other ninety-two.
-  it("names the routes it cut, and never writes a query string", async () => {
-    // The never-answers upstream: the request is owed with headers unsent, which
-    // is the arm that reaches `destroyed` rather than `ended`.
-    const hung = await hungUpstream();
-    const { proc, port, stderr } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.port}`,
-    });
-    try {
-      const p = await port;
-      // A QUERY STRING CARRYING SOMETHING THAT MUST NOT REACH A LOG. The proxy
-      // sees whole request URLs and this line is written to stderr, so the
-      // grouping is the only thing between an identifier in a path and a log
-      // file that outlives the process.
-      const c = net.connect(p, "127.0.0.1", () => c.write(
-        "POST /v1/messages?beta=true&tok=SHOULD-NOT-APPEAR HTTP/1.1\r\nHost: x\r\n" +
-        "content-type: application/json\r\ncontent-length: 2\r\n\r\n{}"));
-      c.on("error", () => {});
-      await new Promise((r) => setTimeout(r, 500));
-
-      const exited = exitOf(proc);
-      proc.kill("SIGTERM");
-      await exited;
-      c.destroy();
-
-      assert.match(stderr(), /routes: \/v1\/messages=1/,
-        `the cut line does not name what it cut; stderr was:\n${stderr()}`);
-      assert.doesNotMatch(stderr(), /SHOULD-NOT-APPEAR/,
-        "the route tally wrote the QUERY STRING into a log — this proxy sees whole " +
-        "request URLs, so the grouping is what keeps an identifier in a path out of " +
-        "a file that outlives the process");
-      assert.doesNotMatch(stderr(), /routes: \/v1\/messages\?/,
-        "the tally kept the `?` — grouping must cut at the query, not merely omit " +
-        "the value");
-    } finally {
-      await hung.close();
-      proc.kill("SIGKILL");
-    }
-  });
 
   it("ends the only owed connection on the stall, not on the ceiling", async () => {
     // The same never-answers upstream the destroy-arm case uses: the proxy is
@@ -593,7 +561,7 @@ describe("SIGTERM exit code", () => {
     // reads; a CONTENT test would see the same thing and a rate test would have
     // to decide whether 10 bytes per 100ms is a reply or a heartbeat.
     const upstream = await sseUpstream();
-    const { proc, port } = startProxy({
+    const { proc, port, stderr } = startProxy({
       CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.port}`,
       CACHE_FIX_DRAIN_STALL_MS: "1500",
       CACHE_FIX_DRAIN_MS: "60000",
@@ -617,13 +585,22 @@ describe("SIGTERM exit code", () => {
       exited.then(() => (alive = false));
       const before = chunks;
       proc.kill("SIGUSR2");
-      // FOUR stall windows. A predicate that ignores movement ends at ~1.5s, so
-      // this fails on the arm it is aimed at rather than on timing noise.
-      await new Promise((r) => setTimeout(r, 6_000));
+      // A predicate that ignores movement ends the connection around tick 3
+      // (~3s: first tick stamps at ~1s, stallMs 1500 elapses from there), but
+      // the PROCESS does not exit until the now-idle socket clears Node's
+      // own keepAliveTimeout tail on top of that — so `alive` alone is a slow
+      // and, worse, an unreliable signal (a `before` snapshot taken at signal
+      // time already trails a stalled cut by dozens of chunks). The stderr
+      // line is immediate: assert its absence instead of waiting out the
+      // exit. 4.5s clears the tick-3 cutoff with a full tick of margin.
+      await new Promise((r) => setTimeout(r, 4_500));
       assert.ok(alive,
-        "the handover drain ended within 6s while the reply was still delivering " +
-        "a chunk every 100ms — movement does not hold it open, so this is a 1500ms " +
-        "clock and it cuts exactly what the 5s one did");
+        "the handover drain exited within 4.5s while the reply was still " +
+        "delivering a chunk every 100ms");
+      assert.doesNotMatch(stderr(), /drain (ended|destroyed) one connection/,
+        "the stall test cut a connection that was still delivering a chunk " +
+        `every 100ms — movement does not hold it open, so this is a 1500ms ` +
+        `clock and it cuts exactly what the 5s one did. stderr:\n${stderr()}`);
       assert.ok(chunks > before,
         `the reply stopped delivering during the drain (${before} -> ${chunks}), so ` +
         `"still alive" says nothing about movement — the fixture stalled, not the proxy`);
@@ -683,9 +660,11 @@ describe("SIGTERM exit code", () => {
       const before = chunks;
       proc.kill("SIGUSR2");          // the HANDOVER arm
 
-      // Four stall windows: long enough that a per-connection test has fired
-      // and far short of the 60s backstop, so neither outcome is timing noise.
-      await new Promise((r) => setTimeout(r, 6_000));
+      // A per-connection stall test ends the stalled socket by tick 3
+      // (~3s); an aggregate one never ends it at all (the moving reply keeps
+      // refreshing a shared clock forever), so 4.5s distinguishes the two
+      // without needing four whole windows to do it.
+      await new Promise((r) => setTimeout(r, 4_500));
 
       assert.ok(stalledClosed,
         "the stalled connection was still open four stall windows into the drain. " +
@@ -734,9 +713,11 @@ describe("SIGTERM exit code", () => {
       c.on("close", () => (closedAt = Date.now()));
 
       // IDLE LONGER THAN THE WINDOW BEFORE THE HANDOVER. This is the whole
-      // fixture: 6s of silence against a 4s window means an age-from-arrival
-      // test is already satisfied when the drain starts.
-      await new Promise((r) => setTimeout(r, 6_000));
+      // fixture: 4.5s of silence against a 4s window means an age-from-arrival
+      // test is already satisfied when the drain starts (the margin only has
+      // to clear the window, not multiply it — the tick-2 cutoff below does
+      // not move with a bigger margin).
+      await new Promise((r) => setTimeout(r, 4_500));
       assert.equal(closedAt, 0,
         "premise: the connection must still be open at the handover, or it was " +
         "ended by something other than the drain");
@@ -803,14 +784,16 @@ describe("SIGTERM exit code", () => {
       req.on("error", () => {});
       req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
 
-      // OLDER THAN THE WINDOW before we signal: 7s against 4000ms. That is the
-      // whole premise — a young request is immune and proves nothing.
+      // OLDER THAN THE WINDOW before we signal: 6.3s against 4000ms — bounded
+      // below by the `chunks >= 2` premise (two 3s writer ticks = 6s), not by
+      // the window itself. That is the whole premise — a young request is
+      // immune and proves nothing.
       // WAIT ON THE CLOCK, not on a chunk count: the count is satisfied within
       // the first seconds and would signal while the request is still younger
       // than the window, where every implementation keeps it and the case
       // proves nothing. Its own premise caught that.
       const t0 = Date.now();
-      while (Date.now() - t0 < 7_000) await new Promise((r) => setTimeout(r, 100));
+      while (Date.now() - t0 < 6_300) await new Promise((r) => setTimeout(r, 100));
       assert.ok(chunks >= 2, "premise: the reply must be delivering before the handover");
       assert.ok(Date.now() - t0 > 4_000,
         "premise: the request must be OLDER than the stall window at the handover");
@@ -823,7 +806,12 @@ describe("SIGTERM exit code", () => {
       exited.then(() => (alive = false)).catch(() => {});
       proc.kill("SIGUSR2");
 
-      await new Promise((r) => setTimeout(r, 7_000));
+      // Floor is the WRITER'S gap (3s), not the mutant's cutoff: `chunks >
+      // before` needs one more real chunk to arrive, which the correct code
+      // only delivers on its own 3s clock. 4s clears that with margin and
+      // still catches an arrival-dating regression, which cuts on the FIRST
+      // post-signal tick (~1s in) — long before the next legitimate chunk.
+      await new Promise((r) => setTimeout(r, 4_000));
       assert.ok(alive && chunks > before,
         `a reply that had been streaming for ${Math.round((Date.now() - t0) / 1000)}s was cut ` +
         `${Math.round(Date.now() - lastAt)}ms into the drain (alive=${alive}, ` +
@@ -876,7 +864,9 @@ describe("SIGTERM exit code", () => {
         c.pause();          // NEVER READ: both kernel buffers fill
       });
       c.on("error", () => {});
-      await new Promise((r) => setTimeout(r, 6_000));   // fill, then go quiet
+      // The writes ignore backpressure and land in one synchronous burst, so
+      // bytesWritten plateaus almost at once; this just clears that burst.
+      await new Promise((r) => setTimeout(r, 1_500));
 
       const exited = exitOf(proc);
       exited.catch(() => {});
@@ -939,7 +929,9 @@ describe("SIGTERM exit code", () => {
       const exited = exitOf(proc);
       exited.catch(() => {});
       proc.kill("SIGUSR2");
-      await new Promise((r) => setTimeout(r, 5_000));
+      // A 1500ms stall window needs at most 2-3 ticks (the drain polls every
+      // 1s) to fire; 3s clears that with margin.
+      await new Promise((r) => setTimeout(r, 3_000));
 
       assert.match(stderr(), /drain destroyed one connection .* \(before headers\)/,
         `the stall ended a byte-less response on the "ended" arm; it must be reset, ` +
@@ -975,9 +967,11 @@ describe("SIGTERM exit code", () => {
     await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
     const { proc, port, stderr } = startProxy({
       CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
-      CACHE_FIX_DRAIN_STALL_MS: "1500",
-      // Short enough that the backstop is reached inside the case.
-      CACHE_FIX_DRAIN_MS: "9000",
+      CACHE_FIX_DRAIN_STALL_MS: "800",
+      // Short enough that the backstop is reached inside the case, and still
+      // several ticks (the drain loop polls every 1s) past the stall window
+      // above so the stall test has already ended the connection first.
+      CACHE_FIX_DRAIN_MS: "3000",
     });
     let c;
     try {
@@ -988,12 +982,17 @@ describe("SIGTERM exit code", () => {
         c.pause();          // never read, so the FIN can never flush
       });
       c.on("error", () => {});
-      await new Promise((r) => setTimeout(r, 5_000));
+      // The BLOB writes ignore backpressure and land in one synchronous burst,
+      // so bytesWritten plateaus almost at once; this just clears the burst.
+      await new Promise((r) => setTimeout(r, 1_000));
 
       const exited = exitOf(proc);
       exited.catch(() => {});
       proc.kill("SIGUSR2");
-      await new Promise((r) => setTimeout(r, 12_000));
+      // A few ticks past DRAIN_MS: the stall test ends the connection by tick
+      // 2 (~2s), the backstop fires by tick 4 (~4s); 5s covers both with
+      // margin against poll-loop jitter.
+      await new Promise((r) => setTimeout(r, 5_000));
 
       const back = stderr().match(/on the BACKSTOP budget[^\n]*/)?.[0];
       assert.ok(back, `premise: the backstop never fired; stderr was:\n${stderr()}`);
@@ -1040,7 +1039,12 @@ describe("SIGTERM exit code", () => {
     const { proc, port, stderr } = startProxy({
       CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
       CACHE_FIX_DRAIN_STALL_MS: "1500",
-      CACHE_FIX_DRAIN_MS: "8000",
+      // Small: this response is writableEnded from the start (the BUFFERED
+      // branch's single `end(rawResponse)`), so the stall loop skips it every
+      // tick — only the backstop can end it, and this case just needs to
+      // reach that budget with the upstream reply already delivered (at
+      // 1200ms absolute, well before any small budget elapses).
+      CACHE_FIX_DRAIN_MS: "2500",
     });
     let c;
     try {
@@ -1493,7 +1497,7 @@ describe("SIGTERM exit code", () => {
       req.on("error", () => {});
       req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
 
-      await new Promise((r) => setTimeout(r, 2_000));   // let it go quiet
+      await new Promise((r) => setTimeout(r, 600));   // let it go quiet
       proc.kill("SIGTERM");
       await new Promise((r) => proc.once("exit", r));
 
@@ -1557,8 +1561,11 @@ describe("SIGTERM exit code", () => {
       while (chunks < 3) await new Promise((r) => setTimeout(r, 100));
       proc.kill("SIGUSR2");                       // handover arm, so the budget is ours
 
-      // PAST the budget, by a margin. A cut would already have happened.
-      await new Promise((r) => setTimeout(r, 6_000));
+      // PAST the budget, by a margin. The "still waiting" line fires on the
+      // first tick after elapsed >= budgetMs (2000ms), and its own 60s
+      // throttle only suppresses a REPEAT — `lastWaitSaid` starts unset, so
+      // the first crossing always logs. 3s clears one tick past the budget.
+      await new Promise((r) => setTimeout(r, 3_000));
 
       const err = stderr();
       assert.ok(chunks > 3, `premise: the reply stopped streaming on its own (${chunks} chunks)`);
@@ -1621,7 +1628,10 @@ describe("SIGTERM exit code", () => {
       // testing a signal this process never receives under a holder.
       proc.kill("SIGHUP");
 
-      await new Promise((r) => setTimeout(r, 6_000));   // well past the 2s budget
+      // The "still waiting" line fires on the first tick past the 2s budget
+      // and always logs on its first crossing (the 60s throttle only
+      // suppresses a repeat); 3s clears one tick past it.
+      await new Promise((r) => setTimeout(r, 3_000));
 
       const err = stderr();
       assert.ok(chunks > 3, `premise: the reply stopped streaming on its own (${chunks} chunks)`);
@@ -1715,9 +1725,14 @@ describe("SIGTERM exit code", () => {
       });
       try {
         const p = await port;
+        // "connection: close" so the socket closes the moment the reply
+        // finishes, rather than idling until Node's default 5s
+        // keepAliveTimeout — this case is about the exit CODE, not about
+        // keep-alive behaviour, and the idle wait added nothing to what it
+        // pins.
         const req = http.request(
           { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
-            headers: { "content-type": "application/json" } },
+            headers: { "content-type": "application/json", connection: "close" } },
           (res) => { res.on("data", () => {}); res.on("error", () => {}); });
         req.on("error", () => {});
         req.end(JSON.stringify({ model: "x", messages: [] }));
@@ -1758,9 +1773,12 @@ describe("SIGTERM exit code", () => {
     try {
       const p = await port;
       let done = false;
+      // "connection: close" so the socket closes the moment the reply
+      // finishes rather than idling on Node's default 5s keepAliveTimeout —
+      // this case is about the `owed at the start` field, not keep-alive.
       const req = http.request(
         { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
-          headers: { "content-type": "application/json" } },
+          headers: { "content-type": "application/json", connection: "close" } },
         (res) => { res.on("data", () => {}); res.on("end", () => { done = true; }); res.on("error", () => {}); });
       req.on("error", () => {});
       req.end(JSON.stringify({ model: "x", messages: [] }));
@@ -1841,7 +1859,9 @@ describe("SIGTERM exit code", () => {
       await new Promise((r) => setTimeout(r, 1_500));
 
       proc.kill("SIGHUP");
-      await new Promise((r) => setTimeout(r, 3_000));
+      // The unbind is synchronous inside server.close(), not gated by the
+      // reply that cannot flush; 800ms just clears the signal handler.
+      await new Promise((r) => setTimeout(r, 800));
 
       const state = await new Promise((res) => {
         const s = net.connect(p, "127.0.0.1");
@@ -1850,7 +1870,7 @@ describe("SIGTERM exit code", () => {
         setTimeout(() => { try { s.destroy(); } catch {} res("timeout"); }, 2_000);
       });
       assert.equal(state, "ECONNREFUSED",
-        `the port was ${state} 3s after the stop announced it had released the ` +
+        `the port was ${state} 800ms after the stop announced it had released the ` +
         `listening socket. The unbind is deferred behind a reply that cannot flush, ` +
         `so the address stays held for the whole drain budget -- 30 minutes by ` +
         `default -- and the dying proxy goes on ACCEPTING requests it will cut. ` +
@@ -1900,8 +1920,10 @@ describe("SIGTERM exit code", () => {
 
       while (chunks < 3) await new Promise((r) => setTimeout(r, 50));
       // OLDER THAN THE CEILING BY A MARGIN, and never silent for a moment of it.
-      // A young request cannot tell the two readings apart.
-      await new Promise((r) => setTimeout(r, 12_000));
+      // A young request cannot tell the two readings apart. 2.5s plus the 5s
+      // standalone ceiling gives a total age at cut (~7.5s) that still clears
+      // the `quiet < 6` assertion below if the age-not-silence bug returns.
+      await new Promise((r) => setTimeout(r, 2_500));
       assert.ok(Date.now() - lastAt < 2_000,
         "premise: the fixture stopped streaming on its own, so there is a real silence");
 
