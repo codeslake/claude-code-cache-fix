@@ -144,7 +144,7 @@ export const probeHealth = (port) => new Promise((res) => {
 // against a closed port for the whole ceiling instead of giving the holder
 // time to bind. 100ms matches the throttle already used by the sibling wait
 // in proxy-holder-handover.test.mjs.
-export async function waitForHolder(port, { ceilingMs = 60_000, probe = probeHealth } = {}) {
+export async function waitForHolder(port, { ceilingMs = 25_000, probe = probeHealth } = {}) {
   const up = Date.now() + ceilingMs;
   let body = await probe(port);
   while (body.startsWith("ERR:") && Date.now() < up) {
