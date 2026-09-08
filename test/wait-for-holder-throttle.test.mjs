@@ -24,26 +24,34 @@ describe("waitForHolder throttles its poll", () => {
       `spinning unthrottled or not polling at all`);
   });
 
-  it("defaults ceilingMs to the pre-#369 budget (25s), not #369's 60s", async () => {
-    // Mock Date.now() with a fixed step sequence: 0 at "up" computation,
-    // 25_000 (the constant itself, not merely past it) at the first loop
-    // check — the loop's `Date.now() < up` is strict, so this pins the
-    // default at EXACTLY 25_000, not merely "<= 30_000". Infinity on every
-    // later check, so a regressed default that is still greater FAILS on
-    // probeCalls instead of hanging the loop (and the case) forever.
-    const times = [0, 25_000, Infinity];
-    let n = -1;
+  it("defaults ceilingMs to exactly the pre-#369 budget (25s) — neither side", async () => {
+    // Mock Date.now() with a fixed step sequence: 0 at "up" computation, then
+    // a boundary value at the first loop check — the loop's `Date.now() < up`
+    // is strict, so pinning BOTH sides needs two runs: a first check reading
+    // 25_000 (the constant itself) must already have given up (any default
+    // > 25_000 fires a second probe), and one reading 24_999 must still be
+    // polling (any default < 25_000 exits after one). Infinity on every later
+    // check, so an arbitrarily wrong default fails fast instead of hanging
+    // the loop (and the case) forever.
     const origDateNow = Date.now;
-    Date.now = () => times[Math.min(++n, times.length - 1)];
-    let probeCalls = 0;
-    const neverUp = async () => { probeCalls++; return "ERR:refused"; };
-    try {
-      await waitForHolder(0, { probe: neverUp });
-    } finally {
-      Date.now = origDateNow;
-    }
-    assert.equal(probeCalls, 1,
-      `expected the 25s default to have already expired at the 25s mark (1 probe call) — ` +
-      `got ${probeCalls}, so ceilingMs is not exactly 25_000`);
+    const probeCallsAt = async (firstCheck) => {
+      const times = [0, firstCheck, Infinity];
+      let n = -1;
+      Date.now = () => times[Math.min(++n, times.length - 1)];
+      let calls = 0;
+      const neverUp = async () => { calls++; return "ERR:refused"; };
+      try {
+        await waitForHolder(0, { probe: neverUp });
+      } finally {
+        Date.now = origDateNow;
+      }
+      return calls;
+    };
+    assert.equal(await probeCallsAt(25_000), 1,
+      `at the 25s mark itself the wait must already have given up (1 probe call) — ` +
+      `got a second probe, so the default is greater than 25_000`);
+    assert.equal(await probeCallsAt(24_999), 2,
+      `one ms short of 25s the wait must still be polling (2 probe calls) — ` +
+      `got only 1, so the default is less than 25_000`);
   });
 });
