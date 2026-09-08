@@ -25,10 +25,13 @@ describe("waitForHolder throttles its poll", () => {
   });
 
   it("defaults ceilingMs to the pre-#369 budget (25s), not #369's 60s", async () => {
-    // Mock Date.now() with a fixed step sequence so this stays fast whichever
-    // default is live: 0 at "up" computation, 30_000 at the first loop check
-    // (past a 25s default, short of a 60s one), 90_000 at any second check.
-    const times = [0, 30_000, 90_000];
+    // Mock Date.now() with a fixed step sequence: 0 at "up" computation,
+    // 25_000 (the constant itself, not merely past it) at the first loop
+    // check — the loop's `Date.now() < up` is strict, so this pins the
+    // default at EXACTLY 25_000, not merely "<= 30_000". Infinity on every
+    // later check, so a regressed default that is still greater FAILS on
+    // probeCalls instead of hanging the loop (and the case) forever.
+    const times = [0, 25_000, Infinity];
     let n = -1;
     const origDateNow = Date.now;
     Date.now = () => times[Math.min(++n, times.length - 1)];
@@ -40,7 +43,7 @@ describe("waitForHolder throttles its poll", () => {
       Date.now = origDateNow;
     }
     assert.equal(probeCalls, 1,
-      `expected the 25s default to have already expired at the 30s mark (1 probe call) — ` +
-      `got ${probeCalls}, so ceilingMs is still defaulting past 25_000`);
+      `expected the 25s default to have already expired at the 25s mark (1 probe call) — ` +
+      `got ${probeCalls}, so ceilingMs is not exactly 25_000`);
   });
 });
