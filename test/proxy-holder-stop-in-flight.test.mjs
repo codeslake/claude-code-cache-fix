@@ -1,7 +1,3 @@
-// A private TMPDIR for this file, because the launcher spawned below writes
-// under os.tmpdir(). First, so nothing reads one before it is set.
-import "./file-tmpdir.mjs";
-
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -17,7 +13,7 @@ import { cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
 // node:test runs describes within one file serially but separate FILES in
 // parallel, so this case rode the suite's wall-clock as +8.4s no matter how
 // cheap it was; moved here it costs max(itself, the rest of the suite)
-// instead of a sum. See pr-subjects.md #356 (suite weight debt).
+// instead of a sum.
 
 // THE HOLDER DELIBERATELY LEAVES A STANDBY BEHIND, and killing the holder is
 // what ARMS it -- that is the standby's whole purpose (bin/gap-relay.mjs), so it
