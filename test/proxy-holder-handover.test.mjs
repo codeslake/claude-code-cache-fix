@@ -1116,9 +1116,25 @@ describe("a holder stop with a reply in flight", () => {
       // window it is trying to detect. Two late samples with growth required
       // between them is what separates "still delivering" from "delivered a lot,
       // then was severed".
-      await new Promise((r) => setTimeout(r, 8_000));
+      //
+      // THE FIRST SAMPLE IS A DEADLINE, NOT AN EVENT -- getting past the
+      // production 5s ceiling (server.mjs:1907) is just time passing, so it stays
+      // a sleep, timed from t0 rather than from `elapsed` so a slower port-free
+      // does not eat into the margin past it. 2s of headroom over the ceiling
+      // matches this file's own measured floor (see
+      // test/shutdown-exit-code.test.mjs's UNBIND_PROBE_WAIT_MS note); measured
+      // here over 5 runs at load average ~11/48, the port freed in 479-571ms, so
+      // this sleep alone clears the ceiling with room to spare on all five.
+      const pastCeiling = t0 + 5_000 + 2_000 - Date.now();
+      if (pastCeiling > 0) await new Promise((r) => setTimeout(r, pastCeiling));
       const late = chunks;
-      await new Promise((r) => setTimeout(r, 2_500));
+      // THE SECOND SAMPLE'S GROWTH IS AN EVENT -- poll for it instead of paying
+      // a fixed sleep no passing run needs (measured: chunks grow every
+      // 40-60ms here, so a passing run resolves this in well under 200ms). The
+      // 2s ceiling is the same margin as above, reached only when this case is
+      // about to fail regardless.
+      const grew = Date.now() + 2_000;
+      while (chunks <= late && Date.now() < grew) await new Promise((r) => setTimeout(r, 100));
       assert.ok(chunks > before,
         `premise: no byte arrived after the stop at all (${before}), so the drain ` +
         `ended before this could measure anything`);
