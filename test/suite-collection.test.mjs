@@ -142,18 +142,27 @@ test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
 // single `"…/bin/X.mjs"` string -- with any readFileSync(...) call blanked
 // first, because two files (this one, and proxy-hop-fallback.test.mjs) name
 // that path only to read the BINARY'S OWN source as text, never to spawn it.
-// ANY SPELLING OF THE SWEEP COUNTS, exactly as the port-sweep guard does with
-// onPort()/listeners()/process.kill(-) -- what is required is that the file
-// reaps what it spawned, not that it reaches for one helper. Measured
-// 2026-09-08 on the integrated build: proxy-holder-stop-in-flight.test.mjs was
-// named here while genuinely reaping (its exit hook removed, one gap-relay.mjs
-// survived at +20s; intact, none did), and the helpers it was told to call are
-// on this branch only, so the file could not have called them. A guard that
-// reds a file which does the thing is a guard people route around.
+// ANY SPELLING OF THE SWEEP COUNTS -- what is required is that the file reaps
+// what it spawned, not that it reaches for one helper. Exactly two spellings,
+// stated in REAP_SPELLINGS below and nowhere else, because the failure message
+// is the only description of this predicate anyone reads. Measured 2026-09-08
+// on the integrated build: proxy-holder-stop-in-flight.test.mjs was named here
+// while genuinely reaping (its exit hook removed, one gap-relay.mjs survived at
+// +20s; intact, none did), and the helpers it was told to call are on this
+// branch only, so the file could not have called them. A guard that reds a file
+// which does the thing is a guard people route around.
 //
-// Hoisted out of the sweep so the case below can put a bare spawner through it:
-// widening this into a predicate that is always true would look exactly like a
-// pass.
+// KNOWN LIMIT, recorded rather than closed: this tests CO-OCCURRENCE, not
+// containment -- the kill may sit anywhere in the file rather than inside the
+// exit handler. Requiring containment would red this guard's own subject again,
+// which spells it `process.on("exit", reapStandbys)` with the kill inside the
+// NAMED FUNCTION; separating that from a decoy needs a parser, not a regex.
+//
+// Hoisted out of the sweep so the case below can put code through it directly:
+// widening this into a predicate that is always true, or loosening either `&&`,
+// would look exactly like a pass.
+const REAP_SPELLINGS = 'armLineage() with reapStamped() (proc-helpers.mjs), or ' +
+                       'process.on("exit", ...) with process.kill(...)';
 const reapsItsLineage = (code) =>
   (/armLineage\(/.test(code) && /reapStamped\(/.test(code))
   || (/process\.on\("exit"/.test(code) && /process\.kill\(/.test(code));
@@ -184,28 +193,39 @@ test("every test file that spawns the launcher or relay carries a lineage marker
     if (!reapsItsLineage(code)) missing.push(f);
   }
   assert.deepEqual(missing, [],
-    `these files spawn the launcher or relay and reap it by no spelling -- neither ` +
-    `armLineage()/reapStamped() (proc-helpers.mjs) nor an exit-time reap of their own, so ` +
-    `a standby a case leaves behind (detached, outlives a SIGKILLed holder) has nothing ` +
-    `to reap it: ${missing.join(", ")}`);
+    `these files spawn the launcher or relay and carry neither spelling of the reap ` +
+    `-- ${REAP_SPELLINGS} -- so a standby a case leaves behind (detached, outlives a ` +
+    `SIGKILLed holder) has nothing to reap it: ${missing.join(", ")}`);
 });
 
 // A WIDENED GUARD THAT CATCHES NOTHING IS THE REGRESSION, and it is invisible:
-// the sweep above goes green either way. So the predicate is exercised directly
-// on a file that spawns the launcher and reaps by no spelling at all.
-test("the lineage predicate still catches a spawner that reaps by no spelling", () => {
-  // The launcher path is a variable, not spelled out: a fixture carrying the
-  // literal would enrol THIS file in the sweep above, which spawns nothing. The
-  // predicate never reads the path -- the sweep decides who is asked, this
-  // decides what the answer is.
-  const bare = 'const h = spawn(process.execPath, [launcherPath, "run-service"]);';
-  assert.equal(reapsItsLineage(bare), false,
-    "a file that spawns the launcher and never reaps now passes the lineage guard -- " +
-    "the predicate was widened into a no-op and the sweep above is decoration");
-  assert.equal(reapsItsLineage(bare + '\narmLineage("f"); reapStamped("f");'), true,
+// the sweep above goes green either way, so the predicate is exercised here
+// directly. The fixtures are the reap spellings and nothing else -- the
+// predicate never reads whether the code around them looks like a spawner, and
+// a fixture that spelled a launcher path out would enrol THIS file in the sweep
+// above (measured: it did, and 993a2fc took it back out).
+//
+// HALF OF EACH PAIRING IS A NEGATIVE, because "not always true" is all a
+// no-op injection proves: loosening either `&&` to `||` leaves every positive
+// below green, and only these four say so.
+test("the lineage predicate rejects code with no reap, and neither half alone", () => {
+  assert.equal(reapsItsLineage("const h = spawn(process.execPath, [launcherPath]);"), false,
+    "code that never reaps now passes the lineage guard -- the predicate was widened " +
+    "into a no-op and the sweep above is decoration");
+
+  assert.equal(reapsItsLineage('armLineage("f"); reapStamped("f");'), true,
     "the shared proc-helpers spelling stopped counting as a reap");
-  assert.equal(reapsItsLineage(bare + '\nprocess.on("exit", r);\nprocess.kill(q, "SIGKILL");'), true,
+  assert.equal(reapsItsLineage('armLineage("f");'), false,
+    "arming a lineage nobody reaps counts as a reap -- the first `&&` was loosened");
+  assert.equal(reapsItsLineage('reapStamped("f");'), false,
+    "reaping a lineage nobody armed counts as a reap -- the first `&&` was loosened");
+
+  assert.equal(reapsItsLineage('process.on("exit", r);\nprocess.kill(q, "SIGKILL");'), true,
     "a file's own exit-time reap stopped counting -- this is the widening itself");
+  assert.equal(reapsItsLineage('process.on("exit", r);'), false,
+    "an exit hook that kills nothing counts as a reap -- the second `&&` was loosened");
+  assert.equal(reapsItsLineage('process.kill(q, "SIGKILL");'), false,
+    "a kill with no exit-time hook counts as a reap -- the second `&&` was loosened");
 });
 
 // A FAILURE MESSAGE IS PUBLISHED OUTPUT. proxy-held-port's probes append the
