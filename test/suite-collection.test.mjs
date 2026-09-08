@@ -142,6 +142,22 @@ test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
 // single `"…/bin/X.mjs"` string -- with any readFileSync(...) call blanked
 // first, because two files (this one, and proxy-hop-fallback.test.mjs) name
 // that path only to read the BINARY'S OWN source as text, never to spawn it.
+// ANY SPELLING OF THE SWEEP COUNTS, exactly as the port-sweep guard does with
+// onPort()/listeners()/process.kill(-) -- what is required is that the file
+// reaps what it spawned, not that it reaches for one helper. Measured
+// 2026-09-08 on the integrated build: proxy-holder-stop-in-flight.test.mjs was
+// named here while genuinely reaping (its exit hook removed, one gap-relay.mjs
+// survived at +20s; intact, none did), and the helpers it was told to call are
+// on this branch only, so the file could not have called them. A guard that
+// reds a file which does the thing is a guard people route around.
+//
+// Hoisted out of the sweep so the case below can put a bare spawner through it:
+// widening this into a predicate that is always true would look exactly like a
+// pass.
+const reapsItsLineage = (code) =>
+  (/armLineage\(/.test(code) && /reapStamped\(/.test(code))
+  || (/process\.on\("exit"/.test(code) && /process\.kill\(/.test(code));
+
 test("every test file that spawns the launcher or relay carries a lineage marker", () => {
   // Files that mention the binaries' paths but never spawn them, with why:
   const EXEMPT = {
@@ -165,12 +181,27 @@ test("every test file that spawns the launcher or relay carries a lineage marker
     const code = decomment(readFileSync(join(testDir, f), "utf8"));
     const stripped = code.replace(/readFileSync\([^)]*\)/g, "");
     if (!spawnsOurs.test(stripped)) continue;
-    if (!/armLineage\(/.test(code) || !/reapStamped\(/.test(code)) missing.push(f);
+    if (!reapsItsLineage(code)) missing.push(f);
   }
   assert.deepEqual(missing, [],
-    `these files spawn the launcher or relay but never call armLineage()/reapStamped() ` +
-    `(proc-helpers.mjs) -- a standby a case leaves behind (detached, outlives a SIGKILLed ` +
-    `holder) has nothing to reap it: ${missing.join(", ")}`);
+    `these files spawn the launcher or relay and reap it by no spelling -- neither ` +
+    `armLineage()/reapStamped() (proc-helpers.mjs) nor an exit-time reap of their own, so ` +
+    `a standby a case leaves behind (detached, outlives a SIGKILLed holder) has nothing ` +
+    `to reap it: ${missing.join(", ")}`);
+});
+
+// A WIDENED GUARD THAT CATCHES NOTHING IS THE REGRESSION, and it is invisible:
+// the sweep above goes green either way. So the predicate is exercised directly
+// on a file that spawns the launcher and reaps by no spelling at all.
+test("the lineage predicate still catches a spawner that reaps by no spelling", () => {
+  const bare = 'const h = spawn(process.execPath, [join(d, "bin", "claude-via-proxy.mjs"), "run-service"]);';
+  assert.equal(reapsItsLineage(bare), false,
+    "a file that spawns the launcher and never reaps now passes the lineage guard -- " +
+    "the predicate was widened into a no-op and the sweep above is decoration");
+  assert.equal(reapsItsLineage(bare + '\narmLineage("f"); reapStamped("f");'), true,
+    "the shared proc-helpers spelling stopped counting as a reap");
+  assert.equal(reapsItsLineage(bare + '\nprocess.on("exit", r);\nprocess.kill(q, "SIGKILL");'), true,
+    "a file's own exit-time reap stopped counting -- this is the widening itself");
 });
 
 // A FAILURE MESSAGE IS PUBLISHED OUTPUT. proxy-held-port's probes append the
