@@ -1014,7 +1014,8 @@ test("the suite derives its parallelism from the machine", () => {
     .filter((f) => /^\s*(?:export\s+)?const\s+CONCURRENCY\b/m
       .test(readFileSync(join(testDir, f), "utf8")))
     .sort();
-  assert.deepEqual(bounded, ["proxy-held-port.test.mjs", "proxy-wrapper.test.mjs"],
+  assert.deepEqual(bounded,
+    ["proxy-held-port.test.mjs", "proxy-wrapper.test.mjs", "shutdown-exit-code.test.mjs"],
     `the set of files declaring a CONCURRENCY bound changed: ${bounded.join(", ") || "(none)"}. ` +
     `A new one is fine — add it here and make it derive from availableParallelism(). ` +
     `A missing one means the bound was renamed, and this guard stopped watching it.`);

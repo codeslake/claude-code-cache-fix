@@ -8,8 +8,16 @@ import { readFileSync } from "node:fs";
 import { drainBudgetMs, drainRoute, forcedCloseLine } from "../proxy/server.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { availableParallelism } from "node:os";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
+
+// Same bound as proxy-held-port.test.mjs and proxy-wrapper.test.mjs, same
+// reason (halved to avoid oversubscribing the runner; floor 1, not 2, so a
+// two-core CI runner does not boot two real proxies at once). Text pinned by
+// suite-collection.test.mjs, which also checks every describe below spends
+// this and nothing else.
+const CONCURRENCY = Math.max(1, Math.floor(availableParallelism() / 2));
 
 // A supervised stop must exit 0 whichever path it takes. server.close() waits
 // for in-flight requests, and a live session always has one (the streaming
@@ -123,7 +131,7 @@ async function sseUpstream({ everyMs = 100, stallHeader = null } = {}) {
   return { port: srv.address().port, close: () => new Promise((r) => srv.close(r)) };
 }
 
-describe("SIGTERM exit code", { concurrency: 4 }, () => {
+describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
   // A REQUEST THAT NEVER GOT HEADERS MUST NOT BE ANSWERED "200".
   //
   // The 5s watchdog res.end()s every live response so a client that already
@@ -211,7 +219,6 @@ describe("SIGTERM exit code", { concurrency: 4 }, () => {
       assert.match(err, /cut 2 in-flight request\(s\) after 5s \(1 mid-response, 1 before headers\)/,
         `the forced close miscounted the mix of a mid-response and a never-answered ` +
         `request; stderr was:\n${err}`);
-      assert.match(err, /after 5s/, "the standalone ceiling is no longer 5s");
 
       assert.ok(firstLine === null || !/^HTTP\/1\.[01] 2\d\d/.test(firstLine),
         `the shutdown answered a never-started response with ${JSON.stringify(firstLine)} — ` +
@@ -793,10 +800,14 @@ describe("SIGTERM exit code", { concurrency: 4 }, () => {
 
       // Floor is the WRITER'S gap (3s), not the mutant's cutoff: `chunks >
       // before` needs one more real chunk to arrive, which the correct code
-      // only delivers on its own 3s clock. 4s clears that with margin and
-      // still catches an arrival-dating regression, which cuts on the FIRST
-      // post-signal tick (~1s in) — long before the next legitimate chunk.
-      await new Promise((r) => setTimeout(r, 4_000));
+      // only delivers on its own 3s clock. 5s clears that with >=2s of
+      // headroom under CONCURRENCY scheduler jitter (measured: the actual
+      // post-signal gap to the next chunk ran 2703-2998ms over 8 runs at
+      // CONCURRENCY 24 on a loaded 48-core box, so 4s left as little as
+      // ~1000ms) and still catches an arrival-dating regression, which cuts
+      // on the FIRST post-signal tick (~1s in) — long before the next
+      // legitimate chunk.
+      await new Promise((r) => setTimeout(r, 5_000));
       assert.ok(alive && chunks > before,
         `a reply that had been streaming for ${Math.round((Date.now() - t0) / 1000)}s was cut ` +
         `${Math.round(Date.now() - lastAt)}ms into the drain (alive=${alive}, ` +
@@ -1549,8 +1560,12 @@ describe("SIGTERM exit code", { concurrency: 4 }, () => {
       // PAST the budget, by a margin. The "still waiting" line fires on the
       // first tick after elapsed >= budgetMs (2000ms), and its own 60s
       // throttle only suppresses a REPEAT — `lastWaitSaid` starts unset, so
-      // the first crossing always logs. 3s clears one tick past the budget.
-      await new Promise((r) => setTimeout(r, 3_000));
+      // the first crossing always logs. 4s clears one tick past the budget
+      // with >=2s of headroom under CONCURRENCY scheduler jitter (measured:
+      // this line fired at a consistent ~2005-2010ms post-signal at
+      // CONCURRENCY 24 on this box, but the sibling case with the identical
+      // shape flaked once against a 3s wait under the same setting).
+      await new Promise((r) => setTimeout(r, 4_000));
 
       const err = stderr();
       assert.ok(chunks > 3, `premise: the reply stopped streaming on its own (${chunks} chunks)`);
@@ -1619,8 +1634,13 @@ describe("SIGTERM exit code", { concurrency: 4 }, () => {
 
       // The "still waiting" line fires on the first tick past the 2s budget
       // and always logs on its first crossing (the 60s throttle only
-      // suppresses a repeat); 3s clears one tick past it.
-      await new Promise((r) => setTimeout(r, 3_000));
+      // suppresses a repeat); 4s clears one tick past it with >=2s of
+      // headroom under CONCURRENCY scheduler jitter (measured: this case
+      // failed once in 5 repeats against a 3s wait at CONCURRENCY 24 on a
+      // loaded 48-core box — `AssertionError: ... expected: /still waiting/`
+      // — while the gap re-measured at ~2005-2010ms across the other runs;
+      // 1s of margin was not enough).
+      await new Promise((r) => setTimeout(r, 4_000));
 
       const err = stderr();
       assert.ok(chunks > 3, `premise: the reply stopped streaming on its own (${chunks} chunks)`);
