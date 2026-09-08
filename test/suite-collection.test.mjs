@@ -159,13 +159,23 @@ test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
 // NAMED FUNCTION; separating that from a decoy needs a parser, not a regex.
 //
 // Hoisted out of the sweep so the case below can put code through it directly:
-// widening this into a predicate that is always true, or loosening either `&&`,
-// would look exactly like a pass.
-const REAP_SPELLINGS = 'armLineage() with reapStamped() (proc-helpers.mjs), or ' +
-                       'process.on("exit", ...) with process.kill(...)';
-const reapsItsLineage = (code) =>
-  (/armLineage\(/.test(code) && /reapStamped\(/.test(code))
-  || (/process\.on\("exit"/.test(code) && /process\.kill\(/.test(code));
+// widening this into a predicate that is always true, loosening a pairing, or
+// appending a third one, would all look exactly like a pass.
+//
+// ONE SOURCE OF TRUTH, and the message is DERIVED rather than kept in step: a
+// prose copy of the accept-set drifts the moment a pattern is tightened, and CI
+// then names a file for lacking a spelling it has -- which is the false
+// positive this guard was widened to remove, wearing the message's clothes.
+//
+// The exit hook is matched the tolerant way this file already uses at :88:
+// `process.on('exit'` and `process.on( "exit"` reap exactly as well as the
+// double-quoted, tight-spaced form, and reddening a file over its quoting is
+// the same false positive in a narrower dress.
+const REAP_SPELLINGS = [
+  [/armLineage\(/, /reapStamped\(/],
+  [/process\.on\(\s*["']exit["']/, /process\.kill\(/],
+];
+const reapsItsLineage = (code) => REAP_SPELLINGS.some(([arm, reap]) => arm.test(code) && reap.test(code));
 
 test("every test file that spawns the launcher or relay carries a lineage marker", () => {
   // Files that mention the binaries' paths but never spawn them, with why:
@@ -193,9 +203,21 @@ test("every test file that spawns the launcher or relay carries a lineage marker
     if (!reapsItsLineage(code)) missing.push(f);
   }
   assert.deepEqual(missing, [],
-    `these files spawn the launcher or relay and carry neither spelling of the reap ` +
-    `-- ${REAP_SPELLINGS} -- so a standby a case leaves behind (detached, outlives a ` +
-    `SIGKILLed holder) has nothing to reap it: ${missing.join(", ")}`);
+    `these files spawn the launcher or relay and carry none of the reap spellings ` +
+    `-- ${REAP_SPELLINGS.map(([arm, reap]) => `${arm.source} with ${reap.source}`).join("; or ")} ` +
+    `-- so a standby a case leaves behind (detached, outlives a SIGKILLed holder) has ` +
+    `nothing to reap it: ${missing.join(", ")}`);
+
+  // THIS FILE MUST NOT ENROL ITSELF IN THE SWEEP IT RUNS. The predicate's case
+  // below carries every reap token as a decoy literal, so enrolment stopped
+  // being impossible and became merely absent: a future fixture that spells a
+  // bin path would enrol this file and PASS on decoys, silently. 993a2fc is
+  // this going wrong once already, caught by inspection rather than by a check.
+  const self = decomment(readFileSync(join(testDir, "suite-collection.test.mjs"), "utf8"));
+  assert.equal(spawnsOurs.test(self.replace(/readFileSync\([^)]*\)/g, "")), false,
+    "a fixture in this file now spells a launcher or relay path, so the sweep above " +
+    "counts this file as one that spawns them -- it spawns nothing, and it would pass " +
+    "on the decoy reap tokens its own predicate case carries");
 });
 
 // A WIDENED GUARD THAT CATCHES NOTHING IS THE REGRESSION, and it is invisible:
@@ -206,26 +228,38 @@ test("every test file that spawns the launcher or relay carries a lineage marker
 // above (measured: it did, and 993a2fc took it back out).
 //
 // HALF OF EACH PAIRING IS A NEGATIVE, because "not always true" is all a
-// no-op injection proves: loosening either `&&` to `||` leaves every positive
-// below green, and only these four say so.
-test("the lineage predicate rejects code with no reap, and neither half alone", () => {
+// no-op injection proves: loosening a pairing to an `||` leaves every positive
+// below green, and only the negatives say so.
+//
+// AND ONE NEGATIVE BELONGS TO NO PAIRING, because the ones that do cannot see a
+// THIRD entry appended to the list. `[/spawn\(/, /SIGKILL/]` passes every other
+// assert here -- the no-reap fixture has `spawn(` without SIGKILL, the kill
+// fixture has SIGKILL without `spawn(` -- while accepting a file that spawns a
+// launcher and SIGKILLs a holder and reaps nothing, which is the whole class.
+test("the lineage predicate rejects code with no reap, and no half of a pairing alone", () => {
   assert.equal(reapsItsLineage("const h = spawn(process.execPath, [launcherPath]);"), false,
     "code that never reaps now passes the lineage guard -- the predicate was widened " +
     "into a no-op and the sweep above is decoration");
+  assert.equal(reapsItsLineage('spawn(launcherPath); process.kill(pid, "SIGKILL");'), false,
+    "spawning a launcher and killing it counts as reaping its lineage -- a pairing was " +
+    "appended that is satisfied by the defect this guard exists to catch");
 
   assert.equal(reapsItsLineage('armLineage("f"); reapStamped("f");'), true,
     "the shared proc-helpers spelling stopped counting as a reap");
   assert.equal(reapsItsLineage('armLineage("f");'), false,
-    "arming a lineage nobody reaps counts as a reap -- the first `&&` was loosened");
+    "arming a lineage nobody reaps counts as a reap -- the first pairing was loosened");
   assert.equal(reapsItsLineage('reapStamped("f");'), false,
-    "reaping a lineage nobody armed counts as a reap -- the first `&&` was loosened");
+    "reaping a lineage nobody armed counts as a reap -- the first pairing was loosened");
 
   assert.equal(reapsItsLineage('process.on("exit", r);\nprocess.kill(q, "SIGKILL");'), true,
     "a file's own exit-time reap stopped counting -- this is the widening itself");
+  assert.equal(reapsItsLineage("process.on( 'exit', r);\nprocess.kill(q, 'SIGKILL');"), true,
+    "the exit hook is matched by exact spelling again -- a file that quotes or spaces it " +
+    "differently reds while genuinely reaping, the false positive in a narrower dress");
   assert.equal(reapsItsLineage('process.on("exit", r);'), false,
-    "an exit hook that kills nothing counts as a reap -- the second `&&` was loosened");
+    "an exit hook that kills nothing counts as a reap -- the second pairing was loosened");
   assert.equal(reapsItsLineage('process.kill(q, "SIGKILL");'), false,
-    "a kill with no exit-time hook counts as a reap -- the second `&&` was loosened");
+    "a kill with no exit-time hook counts as a reap -- the second pairing was loosened");
 });
 
 // A FAILURE MESSAGE IS PUBLISHED OUTPUT. proxy-held-port's probes append the
