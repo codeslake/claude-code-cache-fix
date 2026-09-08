@@ -590,10 +590,11 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       // direction: a false RED there is noisy, but a window too tight here
       // is a false GREEN, where the fault injection silently stops catching
       // the defect it exists to catch and nothing notices.
-      await new Promise((r) => setTimeout(r, 6_000));
+      const NO_CUT_WINDOW_MS = 6_000;   // read by BOTH the wait and the message
+      await new Promise((r) => setTimeout(r, NO_CUT_WINDOW_MS));
       assert.ok(alive,
-        "the handover drain exited within 6s while the reply was still " +
-        "delivering a chunk every 100ms");
+        `the handover drain exited within ${NO_CUT_WINDOW_MS}ms while the reply was ` +
+        "still delivering a chunk every 100ms");
       assert.doesNotMatch(stderr(), /drain (ended|destroyed) one connection/,
         "the stall test cut a connection that was still delivering a chunk " +
         `every 100ms — movement does not hold it open, so this is a 1500ms ` +
@@ -722,11 +723,12 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       const exited = exitOf(proc);
       const t0 = Date.now();
       proc.kill("SIGUSR2");
-      const deadline = t0 + 12_000;
+      const CLOSE_DEADLINE_MS = 12_000;   // read by BOTH the poll and the message
+      const deadline = t0 + CLOSE_DEADLINE_MS;
       while (!closedAt && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
       await exited.catch(() => {});
 
-      assert.ok(closedAt, "the connection was never ended at all within 12s");
+      assert.ok(closedAt, `the connection was never ended at all within ${CLOSE_DEADLINE_MS}ms`);
       const took = closedAt - t0;
       // Ages from arrival: stamped on tick 1 with a 6s age, ended on tick 2.
       // Ages from first sight: stamped at 0 on tick 1, so it waits out a fresh
