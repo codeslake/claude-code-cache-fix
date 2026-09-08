@@ -195,10 +195,12 @@ test("every test file that spawns the launcher or relay carries a lineage marker
   const decomment = (s) => s.split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
   const files = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"));
   const missing = [];
+  let selfEnrolled;
   for (const f of files) {
     if (EXEMPT[f]) continue;
     const code = decomment(readFileSync(join(testDir, f), "utf8"));
     const stripped = code.replace(/readFileSync\([^)]*\)/g, "");
+    if (f === "suite-collection.test.mjs") selfEnrolled = spawnsOurs.test(stripped);
     if (!spawnsOurs.test(stripped)) continue;
     if (!reapsItsLineage(code)) missing.push(f);
   }
@@ -213,11 +215,18 @@ test("every test file that spawns the launcher or relay carries a lineage marker
   // being impossible and became merely absent: a future fixture that spells a
   // bin path would enrol this file and PASS on decoys, silently. 993a2fc is
   // this going wrong once already, caught by inspection rather than by a check.
-  const self = decomment(readFileSync(join(testDir, "suite-collection.test.mjs"), "utf8"));
-  assert.equal(spawnsOurs.test(self.replace(/readFileSync\([^)]*\)/g, "")), false,
+  //
+  // Read off the LOOP'S OWN verdict rather than recomputed. A second copy of
+  // "what counts as spawning" would go quiet, not red, the day the blanking
+  // above changes: the sweep would enrol under the new rule while this asserted
+  // under the old. `undefined` if the loop never reached this file at all, which
+  // is not `false` -- so a rename or an EXEMPT entry reds here instead of
+  // disarming the pin.
+  assert.equal(selfEnrolled, false,
     "a fixture in this file now spells a launcher or relay path, so the sweep above " +
     "counts this file as one that spawns them -- it spawns nothing, and it would pass " +
-    "on the decoy reap tokens its own predicate case carries");
+    "on the decoy reap tokens its own predicate case carries (undefined here means the " +
+    "sweep never reached this file, so the pin was reading nothing)");
 });
 
 // A WIDENED GUARD THAT CATCHES NOTHING IS THE REGRESSION, and it is invisible:
@@ -237,6 +246,15 @@ test("every test file that spawns the launcher or relay carries a lineage marker
 // fixture has SIGKILL without `spawn(` -- while accepting a file that spawns a
 // launcher and SIGKILLs a holder and reaps nothing, which is the whole class.
 test("the lineage predicate rejects code with no reap, and no half of a pairing alone", () => {
+  // THE LIST ITSELF, because no number of fixtures can bound an open-ended one:
+  // `[/detached/, /kill\(/]` and `[/afterEach\(/, /kill/]` both pass every
+  // assertion below while accepting a file that spawns detached, kills
+  // something, and reaps nothing. Same contract this file puts on the
+  // CONCURRENCY roster at :1084 -- a new one is fine, add it HERE, deliberately.
+  assert.equal(REAP_SPELLINGS.length, 2,
+    "a reap spelling was added or dropped without a fixture pair to say what it accepts " +
+    "-- a new one is fine, add it here with a positive and a negative for each half");
+
   assert.equal(reapsItsLineage("const h = spawn(process.execPath, [launcherPath]);"), false,
     "code that never reaps now passes the lineage guard -- the predicate was widened " +
     "into a no-op and the sweep above is decoration");
