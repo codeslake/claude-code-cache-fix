@@ -926,7 +926,7 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       exited.catch(() => {});
       proc.kill("SIGUSR2");
       // A 1500ms stall window needs at most 2-3 ticks (the drain polls every
-      // 1s) to fire. 4.5s left as little as ~950ms of headroom under
+      // 1s) to fire. 3s left as little as ~950ms of headroom under
       // CONCURRENCY scheduler jitter (measured: 2004-2052ms over 5 runs at
       // CONCURRENCY 24); 4.5s clears the worst observation by >=2s.
       await new Promise((r) => setTimeout(r, 4_500));
@@ -1830,9 +1830,12 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       // The unbind is synchronous inside server.close(), not gated by the
       // reply that cannot flush. 800ms was the smallest absolute margin in
       // the file for signal delivery plus handler latency on a proxy
-      // competing with CONCURRENCY siblings — measured instead of assumed:
-      // the actual gap ran a stable 20-22ms over 5 runs at CONCURRENCY 24,
-      // so 2.5s clears the worst observation by >=2s.
+      // competing with CONCURRENCY siblings. Measured: the actual gap ran a
+      // stable 20-22ms over 5 runs at CONCURRENCY 24 on this 48-core box —
+      // not evidence against a tail on a 4-core CI runner, where 5 runs at
+      // low CONCURRENCY do not sample it. 2.5s is TAIL INSURANCE against a
+      // deschedule this measurement cannot see, not a figure derived from
+      // the 20-22ms observation.
       await new Promise((r) => setTimeout(r, 2_500));
 
       const state = await new Promise((res) => {
