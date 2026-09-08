@@ -123,7 +123,7 @@ async function sseUpstream({ everyMs = 100, stallHeader = null } = {}) {
   return { port: srv.address().port, close: () => new Promise((r) => srv.close(r)) };
 }
 
-describe("SIGTERM exit code", () => {
+describe("SIGTERM exit code", { concurrency: 4 }, () => {
   // A REQUEST THAT NEVER GOT HEADERS MUST NOT BE ANSWERED "200".
   //
   // The 5s watchdog res.end()s every live response so a client that already
@@ -142,57 +142,101 @@ describe("SIGTERM exit code", () => {
   // so the two cost that ceiling twice for two disjoint sets of assertions
   // about the SAME forced-close line. A query string on the one connection
   // this case already opens is enough to carry both.
-  it("does not fabricate a 200 for a request that never got headers, and never writes a query string", async () => {
-    // The response is live with headersSent false when the watchdog fires.
-    const hung = await hungUpstream();
+  //
+  // ALSO MERGED with the former "exits 0 via the watchdog, ending an
+  // in-flight response with FIN not RST" (2026-09-08, same cut): both put
+  // exactly one connection through this SAME standalone SIGTERM and the same
+  // 5s ceiling — a never-headers connection and an already-streaming one are
+  // not exclusive states on one connection, they are two DISTINCT
+  // connections, so `stallHeader` (used elsewhere in this file to put a
+  // stalled and a moving connection on one upstream) lets one stop prove
+  // both: the never-answered request still gets no fabricated 200, and the
+  // live SSE reply is ended with FIN, not RST.
+  it("does not fabricate a 200 for a request that never got headers, never writes a query string, and ends a live reply with FIN not RST", async () => {
+    // The never-answered response is live with headersSent false when the
+    // watchdog fires; the x-fixture:hang request gets no reply at all, same
+    // upstream, same port, as the case that keeps a moving connection alive
+    // beside a stalled one.
+    const upstream = await sseUpstream({ stallHeader: "hang" });
     const { proc, port, stderr } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.port}`,
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.port}`,
     });
+    let c;
     try {
       const p = await port;
-      let firstLine = null, err = null;
+      let firstLine = null, connErr = null;
       // A QUERY STRING CARRYING SOMETHING THAT MUST NOT REACH A LOG. The proxy
       // sees whole request URLs and this line is written to stderr, so the
       // grouping is the only thing between an identifier in a path and a log
       // file that outlives the process.
-      const c = net.connect(p, "127.0.0.1", () => c.write(
+      c = net.connect(p, "127.0.0.1", () => c.write(
         "POST /v1/messages?beta=true&tok=SHOULD-NOT-APPEAR HTTP/1.1\r\nHost: x\r\n" +
-        "content-type: application/json\r\ncontent-length: 2\r\n\r\n{}"));
+        "content-type: application/json\r\nx-fixture: hang\r\ncontent-length: 2\r\n\r\n{}"));
       c.on("data", (d) => { firstLine = firstLine ?? String(d).split("\r\n")[0]; });
-      c.on("error", (e) => (err = err || e.code));
-      // Let the request reach the hung upstream, then stop.
-      await new Promise((r) => setTimeout(r, 500));
+      c.on("error", (e) => (connErr = connErr || e.code));
+
+      // The live streaming request, already delivering bytes.
+      let chunks = 0, outcome = null;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => {
+          res.on("data", () => chunks++);
+          res.on("end", () => (outcome = outcome || "FIN"));
+          res.on("error", (e) => (outcome = outcome || e.code));
+        });
+      req.on("error", (e) => (outcome = outcome || e.code));
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      const flowing = Date.now() + 10_000;
+      while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(chunks > 0, "premise: bytes must have reached the client before the shutdown");
+      // Let the hung request actually reach the upstream before stopping.
+      await new Promise((r) => setTimeout(r, 200));
+
       const exited = exitOf(proc);
+      const started = Date.now();
       proc.kill("SIGTERM");
-      await exited;
-      await new Promise((r) => setTimeout(r, 300));
-      c.destroy();
+      const { code } = await exited;
+      const elapsed = Date.now() - started;
+
+      assert.equal(code, 0, "watchdog shutdown must exit 0, not 1");
+      assert.ok(elapsed >= 4500, `expected the 5s watchdog path, exited after ${elapsed}ms`);
 
       // AND THAT THE COUNT SAW IT. This is the only fixture that drives the
-      // destroy arm — headers never sent, because upstream never answered — so
-      // without this assertion `destroyed++` is untested end to end. Measured:
-      // deleting `destroyed++`, and folding the destroy branch into `ended`,
-      // both left the suite green before this line existed.
-      assert.match(stderr(), /cut 1 in-flight request\(s\) after 5s \(0 mid-response, 1 before headers\)/,
-        `the forced close miscounted the never-answered request; stderr was:\n${stderr()}`);
+      // destroy arm — headers never sent, because upstream never answered —
+      // beside a request that had already sent bytes, so `destroyed++` and
+      // `ended++` are both proven end to end in one line.
+      const err = stderr();
+      assert.match(err, /cut 2 in-flight request\(s\) after 5s \(1 mid-response, 1 before headers\)/,
+        `the forced close miscounted the mix of a mid-response and a never-answered ` +
+        `request; stderr was:\n${err}`);
+      assert.match(err, /after 5s/, "the standalone ceiling is no longer 5s");
 
       assert.ok(firstLine === null || !/^HTTP\/1\.[01] 2\d\d/.test(firstLine),
         `the shutdown answered a never-started response with ${JSON.stringify(firstLine)} — ` +
         `an empty 200 is indistinguishable from a real one, so the client keeps it ` +
         `instead of retrying`);
 
-      assert.match(stderr(), /routes: \/v1\/messages=1/,
-        `the cut line does not name what it cut; stderr was:\n${stderr()}`);
-      assert.doesNotMatch(stderr(), /SHOULD-NOT-APPEAR/,
+      assert.match(err, /routes: \/v1\/messages=2/,
+        `the cut line does not name what it cut; stderr was:\n${err}`);
+      assert.doesNotMatch(err, /SHOULD-NOT-APPEAR/,
         "the route tally wrote the QUERY STRING into a log — this proxy sees whole " +
         "request URLs, so the grouping is what keeps an identifier in a path out of " +
         "a file that outlives the process");
-      assert.doesNotMatch(stderr(), /routes: \/v1\/messages\?/,
+      assert.doesNotMatch(err, /routes: \/v1\/messages\?/,
         "the tally kept the `?` — grouping must cut at the query, not merely omit " +
         "the value");
+
+      const deadline = Date.now() + 5000;
+      while (outcome === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      assert.equal(outcome, "FIN",
+        `the forced shutdown reset the connection (${outcome}); a client that ` +
+        `already had every byte reads that as ECONNRESET and throws the data away`);
     } finally {
       try { proc.kill("SIGKILL"); } catch {}
-      await hung.close();
+      try { c?.destroy(); } catch {}
+      await upstream.close();
     }
   });
 
@@ -322,65 +366,6 @@ describe("SIGTERM exit code", () => {
     // hardcoded "after 5s" misreported a handover.
     assert.match(stderr(), /\[cache-fix\] shutdown: drained clean in \d+\.\d+s of 5s budget/,
       `no clean-drain measurement on the supervised path: ${JSON.stringify(stderr().slice(-200))}`);
-  });
-
-  // One shutdown, both questions. A streaming response holds server.close()
-  // open, so this takes the same watchdog path a half-sent request does — and
-  // unlike that fixture it has a RESPONSE to end, which is what separates FIN
-  // from RST. Destroying the laggards makes the kernel answer RST, and a client
-  // that had already received every byte reads that as ECONNRESET and discards
-  // the delivered data. Merged rather than run twice: the grace is 5 s.
-  it("exits 0 via the watchdog, ending an in-flight response with FIN not RST", async () => {
-    const upstream = await sseUpstream();
-    const { proc, port, stderr } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.port}`,
-    });
-    try {
-      const p = await port;
-      let chunks = 0, outcome = null;
-      const req = http.request(
-        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
-          headers: { "content-type": "application/json" } },
-        (res) => {
-          res.on("data", () => chunks++);
-          res.on("end", () => (outcome = outcome || "FIN"));
-          res.on("error", (e) => (outcome = outcome || e.code));
-        });
-      req.on("error", (e) => (outcome = outcome || e.code));
-      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
-
-      const flowing = Date.now() + 10_000;
-      while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 50));
-      assert.ok(chunks > 0, "premise: bytes must have reached the client before the shutdown");
-
-      const exited = exitOf(proc);
-      const started = Date.now();
-      proc.kill("SIGTERM");
-      const { code } = await exited;
-      const elapsed = Date.now() - started;
-
-      assert.equal(code, 0, "watchdog shutdown must exit 0, not 1");
-      assert.ok(elapsed >= 4500, `expected the 5s watchdog path, exited after ${elapsed}ms`);
-      assert.match(stderr(), /forcing close/, "the forced path must stay visible on stderr");
-      // AND SAY HOW MANY IT CUT. "forcing close" alone carries no number, so a
-      // recycle that ended a live /v1/messages stream and one that merely
-      // outwaited an idle socket print the same string. This fixture has
-      // exactly one streaming response open, so the count is knowable: 1, and
-      // it is mid-response because bytes already reached the client above.
-      assert.match(stderr(), /cut 1 in-flight request\(s\)/,
-        `the forced close did not report what it cut; stderr was:\n${stderr()}`);
-      assert.match(stderr(), /1 mid-response/,
-        "a response that had already sent bytes must be counted as mid-response");
-
-      const deadline = Date.now() + 5000;
-      while (outcome === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-      assert.equal(outcome, "FIN",
-        `the forced shutdown reset the connection (${outcome}); a client that ` +
-        `already had every byte reads that as ECONNRESET and throws the data away`);
-    } finally {
-      try { proc.kill("SIGKILL"); } catch {}
-      await upstream.close();
-    }
   });
 
   // A REFUSED HANDOVER MUST NOT STILL CLAIM THE SOCKET.
@@ -1592,7 +1577,11 @@ describe("SIGTERM exit code", () => {
   // the holder now settles on the release announcement instead of on this
   // process's exit; before that, patience here was downtime and the ceiling was
   // buying something real (120s against a 90s TimeoutStopSec took restart
-  // downtime 5.0s -> 53.9s). Delete either half and this case must fail.
+  // downtime 5.0s -> 53.9s). The standalone half of the pair is "exits 0 via
+  // the watchdog, ending an in-flight response with FIN not RST" above — it
+  // already proves a live SSE reply is severed on the 5s ceiling with no
+  // holder; delete either that case's `elapsed >= 4500` proof or this one and
+  // the pair fails.
   it("a stop under a live holder waits for a reply instead of severing it", async () => {
     const upstream = http.createServer((q, r) => {
       q.resume();
@@ -1651,51 +1640,6 @@ describe("SIGTERM exit code", () => {
       assert.equal(proc.exitCode, null,
         "the drain ended anyway, so this case is no longer showing what not-cutting " +
         "costs — one resident process per stop, unbounded in count");
-    } finally {
-      try { proc.kill("SIGKILL"); } catch {}
-      upstream.close();
-    }
-  });
-
-  // THE CONTROL, and without it the case above only proves the ceiling was
-  // deleted. Standalone, nothing supervising: this process IS what a caller is
-  // waiting on, so the bet a ceiling makes is real here and it must still cut.
-  it("a standalone stop keeps its ceiling and does sever a live reply", async () => {
-    const upstream = http.createServer((q, r) => {
-      q.resume();
-      r.writeHead(200, { "content-type": "text/event-stream" });
-      let i = 0;
-      const t = setInterval(() => { try { r.write(`data: ${++i}\n\n`); } catch {} }, 200);
-      r.on("close", () => clearInterval(t));
-    });
-    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
-    const { proc, port, stderr } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
-      CACHE_FIX_HELD_BY: "",              // no holder — the whole difference
-      CACHE_FIX_DRAIN_STALL_MS: "5000",
-      CACHE_FIX_DRAIN_MS: "2000",         // ignored on this arm; asserted above
-    });
-    try {
-      const p = await port;
-      let chunks = 0;
-      const req = http.request(
-        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
-          headers: { "content-type": "application/json" } },
-        (res) => { res.on("data", () => { chunks++; }); res.on("error", () => {}); });
-      req.on("error", () => {});
-      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
-
-      while (chunks < 3) await new Promise((r) => setTimeout(r, 100));
-      proc.kill("SIGHUP");
-      const { code } = await exitOf(proc);
-
-      const err = stderr();
-      assert.match(err, /forcing close/,
-        `a standalone stop waited past its ceiling. Nothing here settles early on our ` +
-        `behalf, so patience is somebody's downtime. stderr:\n${err}`);
-      assert.match(err, /after 5s/,
-        `the standalone ceiling is no longer 5s. stderr:\n${err}`);
-      assert.equal(code, 0, "a deliberate stop must not look like a crash");
     } finally {
       try { proc.kill("SIGKILL"); } catch {}
       upstream.close();
