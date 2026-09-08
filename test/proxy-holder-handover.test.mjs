@@ -1102,6 +1102,7 @@ describe("a holder stop with a reply in flight", () => {
         left = listeners(port);
       }
       const elapsed = Date.now() - t0;
+      const released = Date.now();
       assert.deepEqual(left.filter((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q))), [],
         `the holder and its proxy were still on the port ${elapsed}ms after SIGTERM — ` +
         `a stop must free the address whatever its child is still finishing`);
@@ -1118,14 +1119,20 @@ describe("a holder stop with a reply in flight", () => {
       // then was severed".
       //
       // THE FIRST SAMPLE IS A DEADLINE, NOT AN EVENT -- getting past the
-      // production 5s ceiling (server.mjs:1907) is just time passing, so it stays
-      // a sleep, timed from t0 rather than from `elapsed` so a slower port-free
-      // does not eat into the margin past it. 2s of headroom over the ceiling
-      // matches this file's own measured floor (see
-      // test/shutdown-exit-code.test.mjs's UNBIND_PROBE_WAIT_MS note); measured
-      // here over 5 runs at load average ~11/48, the port freed in 479-571ms, so
-      // this sleep alone clears the ceiling with room to spare on all five.
-      const pastCeiling = t0 + 5_000 + 2_000 - Date.now();
+      // production 5s ceiling (server.mjs:1907, pinned at test/shutdown-exit-
+      // code.test.mjs:1135-1144 -- move the ceiling there and this line's
+      // literal has to move too) is just time passing, so it stays a sleep. Timed
+      // from `released`, NOT from `t0`: the ceiling's own clock starts inside the
+      // proxy (SIGTERM -> holder forwards SIGHUP -> drainStart), `d` ms after t0,
+      // and a margin measured from t0 shrinks by exactly `d` -- silently, since a
+      // regressed arm would still show growth within ~100ms of a `late` sample
+      // taken too early, and PASS. `released` is measured after signal delivery
+      // already happened (the port-free loop that produced it polls for the
+      // holder's process to leave the port), so counting from there is margin
+      // that does not erode with how long the signal takes to land. 2s of
+      // headroom over the ceiling matches this file's own measured floor (see
+      // test/shutdown-exit-code.test.mjs's UNBIND_PROBE_WAIT_MS note).
+      const pastCeiling = released + 5_000 + 2_000 - Date.now();
       if (pastCeiling > 0) await new Promise((r) => setTimeout(r, pastCeiling));
       const late = chunks;
       // THE SECOND SAMPLE'S GROWTH IS AN EVENT -- poll for it instead of paying
