@@ -194,7 +194,11 @@ test("every test file that spawns the launcher or relay carries a lineage marker
 // the sweep above goes green either way. So the predicate is exercised directly
 // on a file that spawns the launcher and reaps by no spelling at all.
 test("the lineage predicate still catches a spawner that reaps by no spelling", () => {
-  const bare = 'const h = spawn(process.execPath, [join(d, "bin", "claude-via-proxy.mjs"), "run-service"]);';
+  // The launcher path is a variable, not spelled out: a fixture carrying the
+  // literal would enrol THIS file in the sweep above, which spawns nothing. The
+  // predicate never reads the path -- the sweep decides who is asked, this
+  // decides what the answer is.
+  const bare = 'const h = spawn(process.execPath, [launcherPath, "run-service"]);';
   assert.equal(reapsItsLineage(bare), false,
     "a file that spawns the launcher and never reaps now passes the lineage guard -- " +
     "the predicate was widened into a no-op and the sweep above is decoration");
