@@ -584,10 +584,15 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       // and, worse, an unreliable signal (a `before` snapshot taken at signal
       // time already trails a stalled cut by dozens of chunks). The stderr
       // line is immediate: assert its absence instead of waiting out the
-      // exit. 4.5s clears the tick-3 cutoff with a full tick of margin.
-      await new Promise((r) => setTimeout(r, 4_500));
+      // exit. 6s clears the tick-3 cutoff with a wider margin than 4.5s under
+      // CONCURRENCY scheduler jitter — the same tail argument that kept the
+      // unbind probe's wait wide applies here in the more dangerous
+      // direction: a false RED there is noisy, but a window too tight here
+      // is a false GREEN, where the fault injection silently stops catching
+      // the defect it exists to catch and nothing notices.
+      await new Promise((r) => setTimeout(r, 6_000));
       assert.ok(alive,
-        "the handover drain exited within 4.5s while the reply was still " +
+        "the handover drain exited within 6s while the reply was still " +
         "delivering a chunk every 100ms");
       assert.doesNotMatch(stderr(), /drain (ended|destroyed) one connection/,
         "the stall test cut a connection that was still delivering a chunk " +
@@ -1836,7 +1841,8 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       // low CONCURRENCY do not sample it. 2.5s is TAIL INSURANCE against a
       // deschedule this measurement cannot see, not a figure derived from
       // the 20-22ms observation.
-      await new Promise((r) => setTimeout(r, 2_500));
+      const UNBIND_PROBE_WAIT_MS = 2_500;
+      await new Promise((r) => setTimeout(r, UNBIND_PROBE_WAIT_MS));
 
       const state = await new Promise((res) => {
         const s = net.connect(p, "127.0.0.1");
@@ -1845,7 +1851,7 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
         setTimeout(() => { try { s.destroy(); } catch {} res("timeout"); }, 2_000);
       });
       assert.equal(state, "ECONNREFUSED",
-        `the port was ${state} 800ms after the stop announced it had released the ` +
+        `the port was ${state} ${UNBIND_PROBE_WAIT_MS}ms after the stop announced it had released the ` +
         `listening socket. The unbind is deferred behind a reply that cannot flush, ` +
         `so the address stays held for the whole drain budget -- 30 minutes by ` +
         `default -- and the dying proxy goes on ACCEPTING requests it will cut. ` +
