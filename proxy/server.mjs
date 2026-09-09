@@ -1491,13 +1491,20 @@ function exitWithParent() {
   // that legitimately changes on every handover.
   const heldBy = process.env.CACHE_FIX_HELD_BY;
   const advertised = process.env.CACHE_FIX_HELD_PORT;
-  setInterval(() => {
+  // THE HANDLE, so a successor already spawned can stop this tick from firing
+  // again. Unassigned before, this ran unclearable forever: a fast-dying
+  // successor (or one that just takes longer than the tick to come up) left
+  // us re-entering every tick while we were already spawning or waiting for
+  // it, and a KILLED holder produced a whole ladder of successors — measured,
+  // 2 "holder died; started a new one" lines from ONE orphan in 20s, and
+  // dozens more of the same orphan's children on a box left running for days.
+  const healTick = setInterval(() => {
     // Two facts, both free, and no probe: the marker outlives the holder
     // because it is our own environment, while our ppid moves to 1 the instant
     // the holder dies. The two disagreeing IS the orphaning. `born` is no
     // longer consulted — it could not tell a dead holder from a predecessor
     // that exited on purpose.
-    if (releasingPort) return;          // asked to let go: do not resurrect the lineage
+    if (releasingPort) { clearInterval(healTick); return; }  // asked to let go: do not resurrect the lineage
     if (!heldBy || heldBy === String(process.ppid)) return;
     // The holder is gone and every session on this box has HTTPS_PROXY baked at
     // exec — they cannot be re-pointed, so the address must get an owner back.
@@ -1544,6 +1551,11 @@ function exitWithParent() {
           env: { ...process.env, CACHE_FIX_PROXY_PORT: advertised,
                  CACHE_FIX_HELD_PORT: undefined, CACHE_FIX_HELD_BY: undefined },
         }).unref();
+        // ONE SUCCESSOR AT A TIME. Cleared here, not after the wait below: the
+        // wait can run past the next 1s tick, and a tick that fires while we
+        // are already waiting for THIS successor would spawn a second one
+        // before the first has even bound the port.
+        clearInterval(healTick);
         process.stderr.write(`[cache-fix] holder died; started a new one on ${advertised}\n`);
         // KEEP SERVING UNTIL THE SUCCESSOR IS UP. Exiting the instant we have
         // spawned a holder leaves the port with no owner for that holder's

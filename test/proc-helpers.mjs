@@ -71,8 +71,10 @@ export function listeners(port) {
 //
 // Still filtered by OURS, for the same reason listeners() is: a port number is
 // not ownership, and freePort() hands the same number to neighbouring files.
-export function ours(port) {
-  const want = new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=${Number(port)}(?:\\s|$)`);
+// EVERY PID WHOSE ENVIRON MATCHES `want`, filtered by OURS. Shared by ours()
+// (keyed on a registered port) and stamped() (keyed on a lineage marker) —
+// same two platforms, same two markers to read, only the regex differs.
+function byEnv(want) {
   const out = [];
   try {
     // Linux: /proc is authoritative and needs no shell-out.
@@ -94,6 +96,60 @@ export function ours(port) {
     }
   } catch { /* no ps either: the caller falls back to listeners() */ }
   return out;
+}
+
+export function ours(port) {
+  return byEnv(new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=${Number(port)}(?:\\s|$)`));
+}
+
+// EVERY PROCESS DESCENDED FROM ONE TEST FILE'S RUN, by env marker rather than
+// by the port it ends up on. onPort()/ours() need a registered port; a
+// self-heal successor or a standby relay a case never asked freePort() for
+// (born on a kernel-picked port nobody recorded) is still ours to find here,
+// because every spawn in this tree forwards `{...process.env, ...}` and so
+// inherits whatever the top of the file stamped. Same two platforms as ours();
+// unverified on macOS (no live box to measure this leg on) — a case there
+// still has the port sweep above as its floor, so nothing regresses.
+export function stamped(marker) {
+  // Escaped: a marker built from a pid and Date.now() has no regex metachars
+  // today, but the marker is a caller-supplied string and `.` alone would
+  // silently widen the match to any single character in its place.
+  const safe = String(marker).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return byEnv(new RegExp(`CACHE_FIX_TEST_LINEAGE=${safe}(?:\\s|$)`));
+}
+
+// SIGHUP, THEN SIGKILL, BY LINEAGE. The shared shape of "reap what this run's
+// lineage left behind": SIGHUP is the graceful release a standby only stands
+// down on (see bin/claude-via-proxy.mjs's forward()), tried a few times, then
+// whatever is still alive gets forced. Two callers had this loop hand-copied;
+// one copy is what stays in sync.
+export async function reapStamped(marker) {
+  for (let i = 0; i < 6; i++) {
+    const survivors = stamped(marker);
+    if (!survivors.length) break;
+    for (const p of survivors) { try { process.kill(Number(p), "SIGHUP"); } catch { /* gone already */ } }
+    await new Promise((r) => setTimeout(r, 700));
+  }
+  for (const p of stamped(marker)) { try { process.kill(Number(p), "SIGKILL"); } catch { /* gone already */ } }
+}
+
+// ARM A FILE'S LINEAGE, ONE CALL. `=`, not `||=`: nothing calls this with
+// CACHE_FIX_TEST_LINEAGE already set in ITS OWN env (a harness passes a
+// marker back through LEAK_PROBE_FILE, never through env), so `||=` here
+// would only ever pick up an AMBIENT value the process inherited from
+// whatever started it — widening the sweep to a marker this file never
+// chose. Installs the synchronous exit-time SIGKILL backstop over it (see the
+// note this replaces in proxy-held-port.test.mjs: `after()` is async and can
+// be skipped by a crash before teardown) and returns the marker so the
+// caller can also `await reapStamped(marker)` from its own async teardown.
+export function armLineage(name) {
+  const marker = process.env.CACHE_FIX_TEST_LINEAGE = `${name}-${process.pid}`;
+  process.on("exit", () => {
+    for (const p of stamped(marker)) {
+      try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
+    }
+  });
+  return marker;
 }
 
 // A port nobody is listening on RIGHT NOW. It is released before the caller

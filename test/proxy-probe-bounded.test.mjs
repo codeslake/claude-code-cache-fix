@@ -15,7 +15,7 @@
 //
 // This test replaces `lsof` with one that never returns and asserts the
 // launcher still finishes. Without a timeout on the probe it hangs forever.
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { spawn } from "node:child_process";
@@ -24,7 +24,13 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 
+import { armLineage, reapStamped } from "./proc-helpers.mjs";
+
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
+// EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
+// proxy-held-port.test.mjs's R3 fix, same shape.
+const lineage = armLineage("proxy-probe-bounded");
+after(async () => { await reapStamped(lineage); });
 
 describe("probe bounding", () => {
   // ONE CASE PER HANGING COMMAND, because they sit at different depths of the
