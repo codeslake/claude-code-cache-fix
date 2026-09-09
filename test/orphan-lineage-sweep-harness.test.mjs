@@ -31,13 +31,10 @@ it("reaps the standby the lineage sweep in proxy-held-port.test.mjs is meant to 
     // path, and not just the case's own budget — this timeout waits for
     // after() too. The case (proxy-held-port.test.mjs) tolerates 15s to bind
     // (:2386) + 5s relay wait (:2389) + 500ms settle (:2401) = 20.5s, and CI
-    // has hit that for real ("Proxy failed to start within 10s", :83-84). Its
-    // file-level after() (:2410) then runs two more retry loops before it can
-    // exit — a port sweep and reapStamped (proc-helpers.mjs:126), each up to
-    // 6 * 700ms — adding up to 8.4s more. ~28.9s tolerated end to end; 40s
-    // still leaves it well under the 56.9s critical-path file
-    // (proxy-holder-handover.test.mjs), so a genuine hang here still can't
-    // become the suite's slowest file.
+    // has really exceeded 10s on a boot (:83-84). Its file-level after()
+    // (:2410) then runs two more retry loops before it can exit — a port
+    // sweep and reapStamped (proc-helpers.mjs:126), each up to 6 * 700ms —
+    // adding up to 8.4s more. ~28.9s tolerated end to end.
     const NESTED_CEILING_MS = 40_000;
     const r = spawnSync(process.execPath,
       ["--test", "--test-name-pattern", "leaves a standby for the file-level sweep", testFile],
@@ -53,7 +50,7 @@ it("reaps the standby the lineage sweep in proxy-held-port.test.mjs is meant to 
       pids = (pidLine || "").trim().split(",").filter(Boolean);
     } catch { }
 
-    assert.ok(!r.error, `the nested run hit its ${NESTED_CEILING_MS / 1000}s ceiling: ${r.error}`);
+    assert.ok(!r.error, `the nested run did not complete within ${NESTED_CEILING_MS / 1000}s: ${r.error}`);
     assert.equal(r.status, 0, `the case itself failed:\n${r.stdout}\n${r.stderr}`);
     assert.ok(lineage && pids.length, "the case never recorded a lineage marker and standby pid — this measures nothing");
 
