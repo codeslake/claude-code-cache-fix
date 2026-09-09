@@ -180,10 +180,15 @@ const reapsItsLineage = (code) => REAP_SPELLINGS.some(([arm, reap]) => arm.test(
 test("every test file that spawns the launcher or relay carries a lineage marker", () => {
   // Files that mention the binaries' paths but never spawn them, with why:
   const EXEMPT = {
-    "fixture-reaping.test.mjs": "spawns a synthetic fixture script; never the real launcher or relay",
     "proxy-hop-fallback.test.mjs": "reads gap-relay.mjs's source as text (a portOf() regex extraction); never spawns the real binary",
   };
-  const spawnsOurs = /"bin"\s*,\s*"(?:claude-via-proxy|gap-relay)\.mjs"|["'`][./]*bin\/(?:claude-via-proxy|gap-relay)\.mjs["'`]/;
+  // A THIRD BINARY SPAWNS detached:true TOO: proxy/server.mjs. It is also an
+  // importable module (startProxy, capOwnLog, ...), so a bare path-text match
+  // would enrol every file that only imports it and never spawns it. Scoped
+  // to the actual spawn call instead, the same shape every real spawner here
+  // uses: `spawn(process.execPath, [<target>], ...)` with the target either
+  // the literal path or the file's own `serverPath` variable.
+  const spawnsOurs = /"bin"\s*,\s*"(?:claude-via-proxy|gap-relay)\.mjs"|["'`][./]*bin\/(?:claude-via-proxy|gap-relay)\.mjs["'`]|spawn\(\s*process\.execPath,\s*\[\s*(?:serverPath|["'`][./]*proxy\/server\.mjs["'`])\s*\]/;
   // Line comments blanked before every check below, mention or call alike:
   // this guard's own added comments say "armLineage()/reapStamped()" in
   // prose, in every file it arms, and a naive text match on the raw source

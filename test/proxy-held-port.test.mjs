@@ -183,7 +183,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // measured, an exported WATCH_DEPLOY_MS turns "is off unless asked for"
   // into a failure about the shell rather than about the code.
   const env = { ...process.env };
-  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
+  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
   Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
                        CACHE_FIX_SELF_HEAL: "off",
                        // A SIGKILLed runner runs no cleanup, so ask the holder to

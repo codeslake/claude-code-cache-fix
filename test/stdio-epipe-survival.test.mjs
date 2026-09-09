@@ -46,20 +46,35 @@ const lineage = armLineage("stdio-epipe-survival");
 const reap = (p) => { try { process.kill(-p.pid, "SIGKILL"); } catch {} try { p.kill("SIGKILL"); } catch {} };
 const cleanEnv = () => {
   const env = { ...process.env };
-  // CACHE_FIX_SELF_HEAL too: the holder cases below run with PROXY_PORT=0,
-  // which arms exitWithParent() (proxy/server.mjs) — left on, a SIGKILLed
-  // stamped holder spawns a stamped SUCCESSOR after this file's exit backstop
-  // has already taken its snapshot, so it survives the backstop even though
-  // it carries the marker. proxy-held-port.test.mjs:186/:471 scrub it for the
-  // same reason.
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                    "ALL_PROXY", "all_proxy", "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP",
-                   "CACHE_FIX_STANDBY", "CACHE_FIX_SELF_HEAL", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+                   "CACHE_FIX_STANDBY", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+  // ASSIGNED, not deleted: proxy/server.mjs:1519 gates on `!== "off"`, so an
+  // absent var reads as self-heal ON. A delete only clears an ambient value —
+  // where the shell already had CACHE_FIX_SELF_HEAL=off, deleting it would
+  // have turned self-heal back ON, the opposite of this file's premise.
+  Object.assign(env, { CACHE_FIX_SELF_HEAL: "off" });
   return env;
 };
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 
 describe("a dead stdio reader does not kill the port's process", () => {
+  // cleanEnv() DELETES CACHE_FIX_SELF_HEAL rather than forcing it "off", but
+  // proxy/server.mjs:1519 gates on `!== "off"` — so where the ambient shell
+  // already exported CACHE_FIX_SELF_HEAL=off, the delete REMOVES that "off"
+  // and self-heal ends up ON, the opposite of what this file's own comment
+  // above cleanEnv() claims.
+  it("cleanEnv() forces self-heal off even when the ambient shell already set it off", () => {
+    const had = "CACHE_FIX_SELF_HEAL" in process.env;
+    const prior = process.env.CACHE_FIX_SELF_HEAL;
+    process.env.CACHE_FIX_SELF_HEAL = "off";
+    try {
+      assert.equal(cleanEnv().CACHE_FIX_SELF_HEAL, "off");
+    } finally {
+      if (had) process.env.CACHE_FIX_SELF_HEAL = prior; else delete process.env.CACHE_FIX_SELF_HEAL;
+    }
+  });
+
   // The relay is the last line of defence: if it dies the address is gone. It
   // needs a REAL socket on fd 3 — handed a pipe it exits 1 by design, which
   // would read as "killed by EPIPE" and prove nothing.

@@ -143,8 +143,7 @@ export async function reapStamped(marker) {
 // be skipped by a crash before teardown) and returns the marker so the
 // caller can also `await reapStamped(marker)` from its own async teardown.
 export function armLineage(name) {
-  process.env.CACHE_FIX_TEST_LINEAGE = `${name}-${process.pid}`;
-  const marker = process.env.CACHE_FIX_TEST_LINEAGE;
+  const marker = process.env.CACHE_FIX_TEST_LINEAGE = `${name}-${process.pid}`;
   process.on("exit", () => {
     for (const p of stamped(marker)) {
       try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
