@@ -27,9 +27,16 @@ it("reaps the standby the lineage sweep in proxy-held-port.test.mjs is meant to 
     const env = { ...process.env, LEAK_PROBE_FILE: leakFile };
     delete env.NODE_TEST_CONTEXT;
     for (const k of HOP_ENV) delete env[k];
+    // 20s: ~20x the loaded single-case wall (~1s, measured at loadavg ~18 on
+    // 48 cores) and well under the 56.9s critical-path file
+    // (proxy-holder-handover.test.mjs), so a hang here can never become the
+    // suite's slowest file.
+    const NESTED_CEILING_MS = 20_000;
     const r = spawnSync(process.execPath,
       ["--test", "--test-name-pattern", "leaves a standby for the file-level sweep", testFile],
-      { env, encoding: "utf8", timeout: 120_000, killSignal: "SIGKILL" });
+      { env, encoding: "utf8", timeout: NESTED_CEILING_MS, killSignal: "SIGKILL" });
+    assert.ok(!r.error && r.signal !== "SIGKILL",
+      `the nested run hit its ${NESTED_CEILING_MS / 1000}s ceiling: ${r.error ?? `killed by ${r.signal}`}`);
     assert.equal(r.status, 0, `the case itself failed:\n${r.stdout}\n${r.stderr}`);
 
     let pids = [];
