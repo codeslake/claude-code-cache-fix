@@ -1,11 +1,11 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
+import { armLineage, cmdOf, freePort as takePort, listeners, reapStamped } from "./proc-helpers.mjs";
 
 // ITS OWN FILE, not tidiness: this case used to sit at the end of
 // proxy-holder-handover.test.mjs, serially after that file's ~56s "holder
@@ -51,6 +51,10 @@ process.on("exit", reapStandbys);
 const spawnHolder = (...args) => { const h = spawn(...args); spawnedHolders.add(h.pid); return h; };
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
+// EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
+// proxy-held-port.test.mjs's R3 fix, same shape.
+const lineage = armLineage("proxy-holder-stop-in-flight");
+after(async () => { await reapStamped(lineage); });
 
 const probe = (port) => new Promise((res) => {
   const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
