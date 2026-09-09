@@ -35,8 +35,7 @@ it("reaps the standby the lineage sweep in proxy-held-port.test.mjs is meant to 
     const r = spawnSync(process.execPath,
       ["--test", "--test-name-pattern", "leaves a standby for the file-level sweep", testFile],
       { env, encoding: "utf8", timeout: NESTED_CEILING_MS, killSignal: "SIGKILL" });
-    assert.ok(!r.error && r.signal !== "SIGKILL",
-      `the nested run hit its ${NESTED_CEILING_MS / 1000}s ceiling: ${r.error ?? `killed by ${r.signal}`}`);
+    assert.ok(!r.error, `the nested run hit its ${NESTED_CEILING_MS / 1000}s ceiling: ${r.error}`);
     assert.equal(r.status, 0, `the case itself failed:\n${r.stdout}\n${r.stderr}`);
 
     let pids = [];
