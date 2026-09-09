@@ -575,7 +575,8 @@ describe("holder handover (SIGUSR2)", () => {
     });
     try {
       const body = await waitForHolder(port);
-      assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+      assert.equal(body, "ok",
+        `the holder never came up, so nothing was measured. Launcher stderr: ${JSON.stringify(err.slice(-300))}`);
       assert.equal(await carries(), "pong", "premise: the live proxy must carry a CONNECT");
 
       // Kill the supervisor AND the proxy, and nothing else. Killing the standby
