@@ -34,7 +34,7 @@ it("reaps the standby the lineage sweep in proxy-held-port.test.mjs is meant to 
     // has hit that for real ("Proxy failed to start within 10s", :83-84). Its
     // file-level after() (:2410) then runs two more retry loops before it can
     // exit — a port sweep and reapStamped (proc-helpers.mjs:126), each up to
-    // 6 * 700ms — adding up to 8.4s more. ~29.9s tolerated end to end; 40s
+    // 6 * 700ms — adding up to 8.4s more. ~28.9s tolerated end to end; 40s
     // still leaves it well under the 56.9s critical-path file
     // (proxy-holder-handover.test.mjs), so a genuine hang here still can't
     // become the suite's slowest file.
