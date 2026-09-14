@@ -48,17 +48,21 @@ const SCOPE_FALLBACK = "user:inference user:profile";
 // default-derived name). Without lockfilePath set, lock(credPath) would lock
 // ${credPath}.lock and silently lose mutual exclusion against the client.
 // realpath:false because the credential file is a real regular file (we
-// don't need realpath resolution and it adds a stat). stale:10000 matches
-// the client's 10s stale-break window.
+// don't need realpath resolution and it adds a stat). stale:60000,
+// update:5000 matches the client's real lock options — measured directly
+// off Claude Code 2.1.269, 2.1.270 and 2.1.271 (2026-09-14); the 10s figure
+// used before was proper-lockfile's own library default, never what the
+// client passes for this lock.
 function lockOpts() {
   return {
     lockfilePath: join(dirname(credPath()), ".oauth_refresh.lock"),
     realpath: false,
-    stale: 10_000,
+    stale: 60_000,
+    update: 5_000,
     retries: 0, // we manage retry timing ourselves via the tick interval
   };
 }
-const CLIENT_STALE_WINDOW_MS = 10_000;
+const CLIENT_STALE_WINDOW_MS = 60_000;
 
 let _interval = null;
 let _running = false; // in-process serialize: an ongoing tick blocks the next
@@ -211,11 +215,12 @@ async function postRefresh(refreshToken, deadlineMs, credScopes) {
   });
   // CRITICAL (Codex r1 blocker 2): the AbortController must remain armed
   // across both the response-headers wait AND the body read. A server can
-  // flush 200 OK headers in 1 s then stall the body past 10 s — that path
+  // flush 200 OK headers in 1 s then stall the body past 60 s — that path
   // would leave the proxy holding the lock while the client stale-breaks,
-  // exactly the second-refresher scenario §2a exists to prevent. So we
-  // keep `signal: ac.signal` (which the fetch body reader honors) and only
-  // clearTimeout after `res.text()` has resolved or rejected.
+  // exactly the second-refresher scenario §2a exists to prevent. The
+  // proxy's own 5 s heartbeat keeps a held lock fresh in the meantime, so
+  // we keep `signal: ac.signal` (which the fetch body reader honors) and
+  // only clearTimeout after `res.text()` has resolved or rejected.
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), deadlineMs);
   let res;
