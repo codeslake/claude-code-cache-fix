@@ -42,27 +42,27 @@ const CLIENT_ID_DEFAULT = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 // remote-bridge / code-session calls that required user:sessions:claude_code.
 const SCOPE_FALLBACK = "user:inference user:profile";
 
+// The client's real lock window — measured directly off Claude Code 2.1.269,
+// 2.1.270 and 2.1.271 (2026-09-14).
+const CLIENT_STALE_WINDOW_MS = 60_000;
+const CLIENT_UPDATE_MS = 5_000;
+
 // proper-lockfile compatibility settings — must match the client's call shape
 // byte-for-byte. CRITICAL: lockfilePath points at .oauth_refresh.lock (the
 // client's lockfile name), NOT at .credentials.json.lock (proper-lockfile's
 // default-derived name). Without lockfilePath set, lock(credPath) would lock
 // ${credPath}.lock and silently lose mutual exclusion against the client.
 // realpath:false because the credential file is a real regular file (we
-// don't need realpath resolution and it adds a stat). stale:60000,
-// update:5000 matches the client's real lock options — measured directly
-// off Claude Code 2.1.269, 2.1.270 and 2.1.271 (2026-09-14); the 10s figure
-// used before was proper-lockfile's own library default, never what the
-// client passes for this lock.
+// don't need realpath resolution and it adds a stat).
 function lockOpts() {
   return {
     lockfilePath: join(dirname(credPath()), ".oauth_refresh.lock"),
     realpath: false,
-    stale: 60_000,
-    update: 5_000,
+    stale: CLIENT_STALE_WINDOW_MS,
+    update: CLIENT_UPDATE_MS,
     retries: 0, // we manage retry timing ourselves via the tick interval
   };
 }
-const CLIENT_STALE_WINDOW_MS = 60_000;
 
 let _interval = null;
 let _running = false; // in-process serialize: an ongoing tick blocks the next
