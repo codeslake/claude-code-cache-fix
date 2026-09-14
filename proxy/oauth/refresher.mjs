@@ -215,11 +215,12 @@ async function postRefresh(refreshToken, deadlineMs, credScopes) {
   });
   // CRITICAL (Codex r1 blocker 2): the AbortController must remain armed
   // across both the response-headers wait AND the body read. A server can
-  // flush 200 OK headers in 1 s then stall the body past 60 s — that path
-  // would leave the proxy holding the lock while the client stale-breaks,
-  // exactly the second-refresher scenario §2a exists to prevent. The
-  // proxy's own 5 s heartbeat keeps a held lock fresh in the meantime, so
-  // we keep `signal: ac.signal` (which the fetch body reader honors) and
+  // flush 200 OK headers in 1 s then stall the body indefinitely; without
+  // this deadline the proxy would hold the lock (and its own tick loop)
+  // for the life of that connection. The proxy's own 5 s heartbeat keeps
+  // its held lock from going stale on its own, so what this deadline
+  // bounds is the UNKNOWN-outcome window (§2a), not a stale-break. So we
+  // keep `signal: ac.signal` (which the fetch body reader honors) and
   // only clearTimeout after `res.text()` has resolved or rejected.
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), deadlineMs);
