@@ -729,7 +729,7 @@ chmod +x ~/.claude/hooks/quota-statusline.sh
 
 ### 권장: git-status 주입 비활성화
 
-Claude Code는 모든 호출 시 실시간 `git status`를 시스템 프롬프트에 주입합니다. 파일 편집은 git 상태를 변경하여 전체 접두사 캐시를 파괴합니다. 이를 비활성화하면 호출당 약 1,800 토큰을 절약할 수 있습니다:
+Claude Code는 `git status` 블록을 시스템 프롬프트에 주입합니다. 2.1.267부터는 시스템 프롬프트가 세션당 한 번만 기록되어 재사용됩니다(CHANGELOG 2.1.267: `--system-prompt-snapshot off`가 매 요청마다 새로 렌더링하는 옵트아웃 플래그; 2.1.269는 컴팩션 이후에만 git status를 갱신하며, 이때는 어차피 캐시가 재구축됩니다). 따라서 파일 편집으로는 호출 사이의 접두사가 더 이상 바뀌지 않습니다: 2.1.268과 2.1.270에서 추적 파일 편집 후에도 고정되어 있음을 측정했습니다. 이전 바이너리에서는, 또는 `--system-prompt-snapshot off`를 쓰면, 이 블록이 매 호출마다 다시 렌더링되어 파일 편집이 전체 접두사 캐시를 파괴했습니다. 이를 비활성화하면 여전히 호출당 약 1,800 토큰을 절약할 수 있습니다:
 
 ```bash
 export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1

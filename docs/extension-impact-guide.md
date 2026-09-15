@@ -357,7 +357,7 @@ This fails the request entirely. Common triggers: hi-res manuscript scans, retin
 
 ### Git-status stripping (`CACHE_FIX_STRIP_GIT_STATUS`)
 
-**What it fixes:** CC injects live `git status` output into the system prompt on every call. Any file edit changes git status → system prompt changes → entire prefix cache busts.
+**What it fixes:** CC injects a `git status` block into the system prompt. Before 2.1.267, or with `--system-prompt-snapshot off`, it was re-rendered on every call: any file edit changed git status → system prompt changed → entire prefix cache busted. Since 2.1.267 the prompt is recorded once per session (measured frozen across a tracked-file edit on 2.1.268 and 2.1.270), so this fix only shortens the prefix by ~1,800 tokens.
 
 **Better alternative:** Use the CC native flag `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` instead of this preload fix. Same effect, no interceptor needed.
 
