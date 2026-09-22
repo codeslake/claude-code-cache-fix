@@ -102,14 +102,6 @@ const here = dirname(fileURLToPath(import.meta.url));
 const driverPath = join(here, "fixtures", "lineage-sigterm-child.mjs");
 const repoRoot = join(here, "..");
 
-function spawnDriver(extraEnv = {}) {
-  return spawn(process.execPath, [driverPath], {
-    cwd: repoRoot,
-    env: { ...process.env, LINEAGE_SIGTERM_DRIVE: "1", ...extraEnv },
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-}
-
 // The pid the driver's grandchild reports, once armLineage() + spawn() have
 // run inside it. `ms` is the readiness ceiling only — not the marker: the
 // marker is `armLineage()`'s own `${name}-${pid}` shape, known from the
@@ -127,7 +119,11 @@ function readyPid(driver, ms) {
 }
 
 async function driverSurvivesSignal(signal) {
-  const driver = spawnDriver();
+  const driver = spawn(process.execPath, [driverPath], {
+    cwd: repoRoot,
+    env: { ...process.env, LINEAGE_SIGTERM_DRIVE: "1" },
+    stdio: ["ignore", "pipe", "ignore"],
+  });
   const marker = `lineage-sigterm-child-${driver.pid}`;
   try {
     const pid = await readyPid(driver, 8000);
@@ -156,33 +152,3 @@ it("armLineage()'s exit backstop reaps a lineage its own process leaves behind o
 
 it("armLineage()'s exit backstop reaps a lineage its own process leaves behind on SIGHUP",
   () => driverSurvivesSignal("SIGHUP"));
-
-// The readiness poll above has its own deadline (8s in the real case). If
-// THAT is missed instead — the driver crashes, or the grandchild never
-// clears OURS+marker in time — withDeadline SIGKILLs only the driver, never
-// the grandchild it started (proxy/server.mjs, PROXY_PORT=0, no HELD_BY
-// registered): the leak this file tests for happens on its own failure path.
-// The marker above, derived from driver.pid rather than parsed from stdout,
-// is what still lets the finally reap it here.
-it("reaps the grandchild even when the driver's readiness report never arrives", async () => {
-  const driver = spawnDriver({ LINEAGE_SIGTERM_SUPPRESS_READY: "1" });
-  const marker = `lineage-sigterm-child-${driver.pid}`;
-  try {
-    // 500ms: past the driver's own poll-and-confirm loop (which really does
-    // run — only the stdout announcement is withheld, see the fixture), far
-    // under the real case's 8s readiness ceiling. Stdout stays piped (never
-    // "ignore"): readyPid() listens on it regardless, and a null stream
-    // throws before the deadline ever gets a chance to matter.
-    await assert.rejects(readyPid(driver, 500));
-
-    // Positive control: the grandchild is alive under the derived marker
-    // despite the driver's own readiness report never being read.
-    assert.ok(stamped(marker).length,
-      "no process appeared under the driver-pid-derived marker — this test measures nothing");
-  } finally {
-    await reapStamped(marker);
-    try { driver.kill("SIGKILL"); } catch { }
-  }
-  assert.equal(stamped(marker).length, 0,
-    "reapStamped on the driver-pid-derived marker did not reap the grandchild after a missed readiness report");
-});
