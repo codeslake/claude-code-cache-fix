@@ -5,13 +5,14 @@
 // after() included) to exit, then check every pid it recorded is gone.
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
-import { HOP_ENV, reapStamped, stamped } from "./proc-helpers.mjs";
+import { withDeadline, exitWithin } from "./child-deadline.mjs";
+import { HOP_ENV, OURS, reapStamped, stamped } from "./proc-helpers.mjs";
 
 const testFile = join(dirname(fileURLToPath(import.meta.url)), "proxy-held-port.test.mjs");
 
@@ -67,5 +68,63 @@ it("reaps the standby the lineage sweep in proxy-held-port.test.mjs is meant to 
     // must still pass the marker+OURS filter before it is worth signalling.
     if (lineage) await reapStamped(lineage);
     try { rmSync(dir, { recursive: true, force: true }); } catch { }
+  }
+});
+
+// shutdown-exit-code.test.mjs:32 and proxy-integration.test.mjs:75 both spawn
+// `process.execPath` with the RELATIVE script path "proxy/server.mjs" — so
+// the child's argv never has a `/` before `proxy/`. Measured argv, node
+// v24.11.1 on lmd42-docker: OURS required a leading `/`, so byEnv() (which
+// every one of stamped()/ours()/armLineage()'s exit backstop routes through)
+// never saw these proxies at all.
+it("OURS matches our own script spawned by a relative path, not a same-named test file", () => {
+  assert.equal(OURS.test("/home/j.lee8/.nvm/versions/node/v24.11.1/bin/node proxy/server.mjs"), true,
+    "OURS must match the exact argv shutdown-exit-code.test.mjs and proxy-integration.test.mjs spawn with, " +
+    "or byEnv() filters every proxy those files start out of stamped()/armLineage()'s exit backstop and reapStamped()");
+  // The rule OURS exists to keep (proc-helpers.mjs:22-26): a bare filename
+  // that only happens to share a name with one of ours is NOT ours.
+  assert.equal(OURS.test("node test/proxy-server.test.mjs"), false,
+    "a same-named test file must still not match OURS");
+});
+
+// Second half of the same gap: armLineage() installs only `process.on("exit")`,
+// and a SIGTERM under the default disposition never fires "exit" — so even a
+// working OURS reaps nothing on the path shutdown-exit-code.test.mjs's own
+// `finally { proc.kill("SIGKILL") }` is what actually stops today. Reproduces
+// the file child of `node --test` holding a lineage and dying to SIGTERM.
+it("armLineage()'s exit backstop reaps a lineage its own process leaves behind on SIGTERM", async () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const driverPath = join(here, "fixtures", "lineage-sigterm-child.mjs");
+  const repoRoot = join(here, "..");
+  const driver = spawn(process.execPath, [driverPath], { cwd: repoRoot, stdio: ["ignore", "pipe", "ignore"] });
+
+  let marker, pid;
+  let out = "";
+  try {
+    const ready = new Promise((resolve) => {
+      driver.stdout.on("data", (c) => {
+        out += c.toString();
+        const m = /MARKER:(\S+)\nPID:(\d+)/.exec(out);
+        if (m) { marker = m[1]; pid = m[2]; resolve(); }
+      });
+    });
+    await withDeadline(ready, 8000, driver, "the driver never reported readiness");
+
+    // Positive control: the grandchild really is alive and OURS+marker
+    // visible before the signal, so a later 0 means the backstop reaped it
+    // rather than it never having existed.
+    assert.ok(stamped(marker).includes(pid),
+      `setup did not produce a live OURS-matching process carrying ${marker} — this test measures nothing`);
+
+    driver.kill("SIGTERM");
+    await exitWithin(driver, 5000, "the driver never exited after SIGTERM");
+
+    const survivors = stamped(marker);
+    assert.equal(survivors.length, 0,
+      `${survivors.length} process(es) carrying ${marker} survived the driver's SIGTERM — ` +
+      "armLineage()'s exit backstop did not run");
+  } finally {
+    if (marker) await reapStamped(marker);
+    try { driver.kill("SIGKILL"); } catch { }
   }
 });
