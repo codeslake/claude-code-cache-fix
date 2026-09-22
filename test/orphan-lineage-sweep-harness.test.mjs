@@ -74,45 +74,63 @@ it("reaps the standby the lineage sweep in proxy-held-port.test.mjs is meant to 
 // shutdown-exit-code.test.mjs:32 and proxy-integration.test.mjs:75 both spawn
 // `process.execPath` with the RELATIVE script path "proxy/server.mjs" — so
 // the child's argv never has a `/` before `proxy/`. Measured argv, node
-// v24.11.1 on lmd42-docker: OURS required a leading `/`, so byEnv() (which
+// v24.11.1 on <linux-host>: OURS required a leading `/`, so byEnv() (which
 // every one of stamped()/ours()/armLineage()'s exit backstop routes through)
 // never saw these proxies at all.
 it("OURS matches our own script spawned by a relative path, not a same-named test file", () => {
-  assert.equal(OURS.test("/home/j.lee8/.nvm/versions/node/v24.11.1/bin/node proxy/server.mjs"), true,
+  assert.equal(OURS.test("/usr/bin/node proxy/server.mjs"), true,
     "OURS must match the exact argv shutdown-exit-code.test.mjs and proxy-integration.test.mjs spawn with, " +
     "or byEnv() filters every proxy those files start out of stamped()/armLineage()'s exit backstop and reapStamped()");
   // The rule OURS exists to keep (proc-helpers.mjs:22-26): a bare filename
   // that only happens to share a name with one of ours is NOT ours.
   assert.equal(OURS.test("node test/proxy-server.test.mjs"), false,
     "a same-named test file must still not match OURS");
+  // "proxy/server.mjs" is a literal substring of "notproxy/server.mjs" too —
+  // this is what pins the (?:^|[\s/]) anchor itself: drop it, and the regex
+  // starts matching a path segment that merely ends in "proxy".
+  assert.equal(OURS.test("node notproxy/server.mjs"), false,
+    "a path segment that only ends in \"proxy\" must not match OURS");
 });
 
 // Second half of the same gap: armLineage() installs only `process.on("exit")`,
 // and a SIGTERM under the default disposition never fires "exit" — so even a
 // working OURS reaps nothing on the path shutdown-exit-code.test.mjs's own
 // `finally { proc.kill("SIGKILL") }` is what actually stops today. Reproduces
-// the file child of `node --test` holding a lineage and dying to SIGTERM.
-it("armLineage()'s exit backstop reaps a lineage its own process leaves behind on SIGTERM", async () => {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const driverPath = join(here, "fixtures", "lineage-sigterm-child.mjs");
-  const repoRoot = join(here, "..");
-  const driver = spawn(process.execPath, [driverPath], {
+// the file child of `node --test` holding a lineage and dying to SIGTERM (or
+// SIGHUP — how a killed tmux window or a dropped ssh session ends a run here).
+const here = dirname(fileURLToPath(import.meta.url));
+const driverPath = join(here, "fixtures", "lineage-sigterm-child.mjs");
+const repoRoot = join(here, "..");
+
+function spawnDriver(extraEnv = {}) {
+  return spawn(process.execPath, [driverPath], {
     cwd: repoRoot,
-    env: { ...process.env, LINEAGE_SIGTERM_DRIVE: "1" },
+    env: { ...process.env, LINEAGE_SIGTERM_DRIVE: "1", ...extraEnv },
     stdio: ["ignore", "pipe", "ignore"],
   });
+}
 
-  let marker, pid;
+// The pid the driver's grandchild reports, once armLineage() + spawn() have
+// run inside it. `ms` is the readiness ceiling only — not the marker: the
+// marker is `armLineage()`'s own `${name}-${pid}` shape, known from the
+// driver's pid alone, before any stdout is ever read.
+function readyPid(driver, ms) {
   let out = "";
-  try {
-    const ready = new Promise((resolve) => {
-      driver.stdout.on("data", (c) => {
-        out += c.toString();
-        const m = /MARKER:(\S+)\nPID:(\d+)/.exec(out);
-        if (m) { marker = m[1]; pid = m[2]; resolve(); }
-      });
+  const ready = new Promise((resolve) => {
+    driver.stdout.on("data", (c) => {
+      out += c.toString();
+      const m = /PID:(\d+)/.exec(out);
+      if (m) resolve(m[1]);
     });
-    await withDeadline(ready, 8000, driver, "the driver never reported readiness");
+  });
+  return withDeadline(ready, ms, driver, "the driver never reported readiness");
+}
+
+async function driverSurvivesSignal(signal) {
+  const driver = spawnDriver();
+  const marker = `lineage-sigterm-child-${driver.pid}`;
+  try {
+    const pid = await readyPid(driver, 8000);
 
     // Positive control: the grandchild really is alive and OURS+marker
     // visible before the signal, so a later 0 means the backstop reaped it
@@ -120,15 +138,51 @@ it("armLineage()'s exit backstop reaps a lineage its own process leaves behind o
     assert.ok(stamped(marker).includes(pid),
       `setup did not produce a live OURS-matching process carrying ${marker} — this test measures nothing`);
 
-    driver.kill("SIGTERM");
-    await exitWithin(driver, 5000, "the driver never exited after SIGTERM");
+    driver.kill(signal);
+    await exitWithin(driver, 5000, `the driver never exited after ${signal}`);
 
     const survivors = stamped(marker);
     assert.equal(survivors.length, 0,
-      `${survivors.length} process(es) carrying ${marker} survived the driver's SIGTERM — ` +
+      `${survivors.length} process(es) carrying ${marker} survived the driver's ${signal} — ` +
       "armLineage()'s exit backstop did not run");
   } finally {
-    if (marker) await reapStamped(marker);
+    await reapStamped(marker);
     try { driver.kill("SIGKILL"); } catch { }
   }
+}
+
+it("armLineage()'s exit backstop reaps a lineage its own process leaves behind on SIGTERM",
+  () => driverSurvivesSignal("SIGTERM"));
+
+it("armLineage()'s exit backstop reaps a lineage its own process leaves behind on SIGHUP",
+  () => driverSurvivesSignal("SIGHUP"));
+
+// The readiness poll above has its own deadline (8s in the real case). If
+// THAT is missed instead — the driver crashes, or the grandchild never
+// clears OURS+marker in time — withDeadline SIGKILLs only the driver, never
+// the grandchild it started (proxy/server.mjs, PROXY_PORT=0, no HELD_BY
+// registered): the leak this file tests for happens on its own failure path.
+// The marker above, derived from driver.pid rather than parsed from stdout,
+// is what still lets the finally reap it here.
+it("reaps the grandchild even when the driver's readiness report never arrives", async () => {
+  const driver = spawnDriver({ LINEAGE_SIGTERM_SUPPRESS_READY: "1" });
+  const marker = `lineage-sigterm-child-${driver.pid}`;
+  try {
+    // 500ms: past the driver's own poll-and-confirm loop (which really does
+    // run — only the stdout announcement is withheld, see the fixture), far
+    // under the real case's 8s readiness ceiling. Stdout stays piped (never
+    // "ignore"): readyPid() listens on it regardless, and a null stream
+    // throws before the deadline ever gets a chance to matter.
+    await assert.rejects(readyPid(driver, 500));
+
+    // Positive control: the grandchild is alive under the derived marker
+    // despite the driver's own readiness report never being read.
+    assert.ok(stamped(marker).length,
+      "no process appeared under the driver-pid-derived marker — this test measures nothing");
+  } finally {
+    await reapStamped(marker);
+    try { driver.kill("SIGKILL"); } catch { }
+  }
+  assert.equal(stamped(marker).length, 0,
+    "reapStamped on the driver-pid-derived marker did not reap the grandchild after a missed readiness report");
 });

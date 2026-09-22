@@ -33,7 +33,13 @@ while (Date.now() < deadline) {
   await new Promise((r) => setTimeout(r, 25));
 }
 
-process.stdout.write(`MARKER:${marker}\nPID:${grandchild.pid}\n`);
+// LINEAGE_SIGTERM_SUPPRESS_READY: the harness's own missed-deadline case sets
+// this to model a driver that armed its lineage and spawned the grandchild
+// but never got to report it — the poll above still ran, so the grandchild
+// really is up, only the announcement is withheld.
+if (!process.env.LINEAGE_SIGTERM_SUPPRESS_READY) {
+  process.stdout.write(`MARKER:${marker}\nPID:${grandchild.pid}\n`);
+}
 
 // Idle until the parent's SIGTERM arrives; armLineage()'s own backstop is
 // what is under test.

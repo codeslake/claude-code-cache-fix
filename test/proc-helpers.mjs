@@ -152,10 +152,12 @@ export function armLineage(name) {
       try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
     }
   });
-  // SIGTERM/SIGINT have a fatal DEFAULT disposition with no listener attached:
-  // the process is torn down by the kernel and the "exit" backstop above never
-  // fires. Turning the signal into a normal exit is what lets that backstop run.
-  for (const sig of ["SIGTERM", "SIGINT"]) {
+  // SIGTERM/SIGINT/SIGHUP have a fatal DEFAULT disposition with no listener
+  // attached: the process is torn down by the kernel and the "exit" backstop
+  // above never fires. Turning the signal into a normal exit is what lets
+  // that backstop run. SIGHUP is how a killed tmux window or a dropped ssh
+  // session ends a run here, not just an interactive shell's own hangup.
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
     process.once(sig, () => process.exit(128 + osConstants.signals[sig]));
   }
   return marker;
