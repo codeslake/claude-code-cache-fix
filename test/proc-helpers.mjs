@@ -13,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
+import { constants as osConstants } from "node:os";
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
 // and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
@@ -24,8 +25,10 @@ import net from "node:net";
 // here: matching `node` alone claims every node process on the box, and matching
 // a bare filename claims a test file that happens to be named for one of ours.
 // A path segment of `bin/` or `proxy/` ending in `.mjs` is what only our
-// binaries have.
-export const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
+// binaries have — RELATIVE too (`node proxy/server.mjs`, argv[1] with no
+// leading `/`), which is why the segment can also start at word start, not
+// only after a `/`.
+export const OURS = /(?:^|[\s/])(?:bin|proxy)\/[\w.-]+\.mjs\b/;
 
 // The command line of a pid, or "" if it is gone. Every case has to tell a
 // holder from a proxy from a standby relay, and they are only distinguishable
@@ -150,6 +153,14 @@ export function armLineage(name) {
       try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
     }
   });
+  // SIGTERM/SIGINT/SIGHUP have a fatal DEFAULT disposition with no listener
+  // attached: the process is torn down by the kernel and the "exit" backstop
+  // above never fires. Turning the signal into a normal exit is what lets
+  // that backstop run. SIGHUP is how a killed tmux window or a dropped ssh
+  // session ends a run here, not just an interactive shell's own hangup.
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.once(sig, () => process.exit(128 + osConstants.signals[sig]));
+  }
   return marker;
 }
 
