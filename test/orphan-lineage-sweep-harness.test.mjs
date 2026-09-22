@@ -96,7 +96,11 @@ it("armLineage()'s exit backstop reaps a lineage its own process leaves behind o
   const here = dirname(fileURLToPath(import.meta.url));
   const driverPath = join(here, "fixtures", "lineage-sigterm-child.mjs");
   const repoRoot = join(here, "..");
-  const driver = spawn(process.execPath, [driverPath], { cwd: repoRoot, stdio: ["ignore", "pipe", "ignore"] });
+  const driver = spawn(process.execPath, [driverPath], {
+    cwd: repoRoot,
+    env: { ...process.env, LINEAGE_SIGTERM_DRIVE: "1" },
+    stdio: ["ignore", "pipe", "ignore"],
+  });
 
   let marker, pid;
   let out = "";
