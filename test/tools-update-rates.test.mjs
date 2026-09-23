@@ -9,7 +9,8 @@ import { parsePricing } from "../tools/update-rates.mjs";
 // direct-API-key users is a literal dollar ceiling. The failure mode that
 // matters is a plausible-looking WRONG number, so these tests are mostly about
 // what the parser REFUSES to emit. Fixture is the <table> blocks of the real
-// pricing page as of 2026-07-27.
+// pricing page as of 2026-07-27, with the Claude Opus 5.5 row copied in from
+// the later live page — it had not shipped on 2026-07-27.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = readFileSync(join(__dirname, "fixtures", "pricing-page-2026-07-27.html"), "utf8");
@@ -35,6 +36,14 @@ test("prices the models live traffic actually uses", () => {
     { input: 10, output: 50, cache_read: 1, cache_write_5m: 12.5, cache_write_1h: 20 });
   assert.deepEqual(rates["claude-haiku-4-5"], rates["claude-haiku-4-5-20251001"],
     "alias and dated snapshot must price identically");
+});
+
+test("prices Claude Opus 5.5, footnoted cache-read discount included", () => {
+  // The pricing page marks Opus 5.5's cache-read cell with a footnote
+  // (<sup>2</sup>, "0.05x on Claude Opus 5.5") instead of the usual 0.1x.
+  const { rates } = parsePricing(FIXTURE, AUG);
+  assert.deepEqual(rates["claude-opus-5-5"],
+    { input: 4, output: 20, cache_read: 0.2, cache_write_5m: 5, cache_write_1h: 8 });
 });
 
 // --- dated-variant disambiguation (Codex r1 blocker 1) ---
@@ -113,7 +122,7 @@ test("a partial parse aborts instead of writing a plausible-looking file", () =>
 test("markup with no parseable rows at all reports every required model missing", () => {
   const { rates, errors } = parsePricing("<html><body><p>pricing moved</p></body></html>", AUG);
   assert.deepEqual(rates, {});
-  assert.equal(errors.length, 7, "one error per required wire id");
+  assert.equal(errors.length, 8, "one error per required wire id");
 });
 
 // --- silent-corruption guards ---
@@ -134,6 +143,26 @@ test("cache prices that contradict the documented multipliers are rejected", () 
   const { rates, errors } = parsePricing(html, AUG);
   assert.equal(rates["claude-fable-5"], undefined);
   assert.ok(errors.some((e) => /contradicts the documented/.test(e)), JSON.stringify(errors));
+});
+
+test("the Opus 5.5 cache-read override does not loosen the guard for other models", () => {
+  // Claude Fable 5 at the 0.05x rate Opus 5.5 uses would be $0.20/MTok, not the
+  // documented 0.1x ($0.40/MTok) — must still be rejected as a misparse.
+  const html = `<table><tr><td>Claude Fable 5</td><td>$4 / MTok</td><td>$5 / MTok</td><td>$8 / MTok</td><td>$0.20 / MTok</td><td>$20 / MTok</td></tr></table>`;
+  const { rates, errors } = parsePricing(html, AUG);
+  assert.equal(rates["claude-fable-5"], undefined);
+  assert.ok(errors.some((e) => /contradicts the documented/.test(e)), JSON.stringify(errors));
+});
+
+test("a footnote-shaped suffix with no space or too many digits fails closed", () => {
+  // tableRows() always leaves exactly one literal space where a stripped tag
+  // was, so a real footnote marker reads "$4 / MTok 2" (one space, 1-2
+  // digits). "$4 / MTok2026" has no such space — not a footnote, a misparse —
+  // and must be dropped rather than read as a $4 price.
+  const html = `<table><tr><td>Claude Fable 5</td><td>$4 / MTok2026</td><td>$5 / MTok</td><td>$8 / MTok</td><td>$0.40 / MTok</td><td>$20 / MTok</td></tr></table>`;
+  const { rates, errors } = parsePricing(html, AUG);
+  assert.equal(rates["claude-fable-5"], undefined);
+  assert.ok(errors.some((e) => /required model "claude-fable-5" missing/.test(e)), JSON.stringify(errors));
 });
 
 test("published cent-rounding still passes the multiplier check", () => {
@@ -182,7 +211,7 @@ test("parsing is deterministic for a fixed input and date", () => {
 test("checked-in rates.json agrees with the fixture parse for required models", () => {
   const shipped = JSON.parse(readFileSync(join(__dirname, "..", "tools", "rates.json"), "utf8")).models;
   const { rates } = parsePricing(FIXTURE, Date.parse("2026-07-27T12:00:00Z"));
-  for (const id of ["claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+  for (const id of ["claude-fable-5", "claude-opus-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-7",
                     "claude-opus-4-6", "claude-sonnet-5", "claude-haiku-4-5"]) {
     assert.ok(shipped[id], `rates.json is missing ${id} — the cost lever prices it at zero`);
     const { note, ...s } = shipped[id];
