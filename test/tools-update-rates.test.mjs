@@ -37,6 +37,14 @@ test("prices the models live traffic actually uses", () => {
     "alias and dated snapshot must price identically");
 });
 
+test("prices Claude Opus 5.5, footnoted cache-read discount included", () => {
+  // The pricing page marks Opus 5.5's cache-read cell with a footnote
+  // (<sup>2</sup>, "0.05x on Claude Opus 5.5") instead of the usual 0.1x.
+  const { rates } = parsePricing(FIXTURE, AUG);
+  assert.deepEqual(rates["claude-opus-5-5"],
+    { input: 4, output: 20, cache_read: 0.2, cache_write_5m: 5, cache_write_1h: 8 });
+});
+
 // --- dated-variant disambiguation (Codex r1 blocker 1) ---
 
 test("Claude Sonnet 5 resolves to the window in effect on the fetch date", () => {
@@ -113,7 +121,7 @@ test("a partial parse aborts instead of writing a plausible-looking file", () =>
 test("markup with no parseable rows at all reports every required model missing", () => {
   const { rates, errors } = parsePricing("<html><body><p>pricing moved</p></body></html>", AUG);
   assert.deepEqual(rates, {});
-  assert.equal(errors.length, 7, "one error per required wire id");
+  assert.equal(errors.length, 8, "one error per required wire id");
 });
 
 // --- silent-corruption guards ---
@@ -131,6 +139,15 @@ test("cache prices that contradict the documented multipliers are rejected", () 
   // Plausible-looking numbers, wrong relationship — the exact class of quiet
   // corruption a column-order change would produce.
   const html = `<table><tr><td>Claude Fable 5</td><td>$10 / MTok</td><td>$11 / MTok</td><td>$13 / MTok</td><td>$4 / MTok</td><td>$50 / MTok</td></tr></table>`;
+  const { rates, errors } = parsePricing(html, AUG);
+  assert.equal(rates["claude-fable-5"], undefined);
+  assert.ok(errors.some((e) => /contradicts the documented/.test(e)), JSON.stringify(errors));
+});
+
+test("the Opus 5.5 cache-read override does not loosen the guard for other models", () => {
+  // Claude Fable 5 at the 0.05x rate Opus 5.5 uses would be $0.20/MTok, not the
+  // documented 0.1x ($0.40/MTok) — must still be rejected as a misparse.
+  const html = `<table><tr><td>Claude Fable 5</td><td>$4 / MTok</td><td>$5 / MTok</td><td>$8 / MTok</td><td>$0.20 / MTok</td><td>$20 / MTok</td></tr></table>`;
   const { rates, errors } = parsePricing(html, AUG);
   assert.equal(rates["claude-fable-5"], undefined);
   assert.ok(errors.some((e) => /contradicts the documented/.test(e)), JSON.stringify(errors));
@@ -182,7 +199,7 @@ test("parsing is deterministic for a fixed input and date", () => {
 test("checked-in rates.json agrees with the fixture parse for required models", () => {
   const shipped = JSON.parse(readFileSync(join(__dirname, "..", "tools", "rates.json"), "utf8")).models;
   const { rates } = parsePricing(FIXTURE, Date.parse("2026-07-27T12:00:00Z"));
-  for (const id of ["claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+  for (const id of ["claude-fable-5", "claude-opus-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-7",
                     "claude-opus-4-6", "claude-sonnet-5", "claude-haiku-4-5"]) {
     assert.ok(shipped[id], `rates.json is missing ${id} — the cost lever prices it at zero`);
     const { note, ...s } = shipped[id];

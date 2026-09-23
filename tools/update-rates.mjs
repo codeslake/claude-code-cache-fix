@@ -44,6 +44,7 @@ const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const NAME_TO_WIRE = {
   "Claude Fable 5": ["claude-fable-5"],
   "Claude Mythos 5": ["claude-mythos-5"],
+  "Claude Opus 5.5": ["claude-opus-5-5"],
   "Claude Opus 5": ["claude-opus-5"],
   "Claude Opus 4.8": ["claude-opus-4-8"],
   "Claude Opus 4.7": ["claude-opus-4-7"],
@@ -77,6 +78,7 @@ const NAME_TO_WIRE = {
 const REQUIRED_WIRE_IDS = [
   "claude-fable-5",
   "claude-opus-5",
+  "claude-opus-5-5",
   "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-opus-4-6",
@@ -100,6 +102,13 @@ const MULTIPLIERS = { cache_write_5m: 1.25, cache_write_1h: 2, cache_read: 0.1 }
 // Published prices are rounded to the cent, so an exact multiplier check would
 // reject legitimate rows. Allow a cent of slack either way.
 const MULTIPLIER_EPSILON = 0.011;
+
+// Per-model cache_read multiplier overrides, for the rare row that documents a
+// different discount than the standard 0.1x (Claude Opus 5.5 prices cache
+// reads at 0.05x input, per the pricing page's footnote). Only the named field
+// on the named wire id is affected; every other row and every other field
+// still goes through the standard MULTIPLIERS check above.
+const CACHE_READ_MULTIPLIER_OVERRIDES = { "claude-opus-5-5": 0.05 };
 
 const MONTHS = {
   january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
@@ -163,7 +172,10 @@ function tableRows(html) {
   return rows;
 }
 
-const PRICE_CELL = /^\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*MTok$/;
+// A trailing footnote marker (e.g. "$0.20 / MTok 2" once the <sup>2</sup> tag
+// is stripped to plain text by tableRows()) is part of the page's own markup,
+// not a second price — allow and ignore it.
+const PRICE_CELL = /^\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*MTok(?:\s*\d+)?$/;
 
 // A model-pricing row is exactly: name cell + the five price columns
 // (input | 5m write | 1h write | cache read | output). This shape requirement is
@@ -199,9 +211,12 @@ function validateRates(wireId, r) {
     if (v < MIN_PRICE || v > MAX_PRICE) return `${wireId}.${field}=${v} outside sane range $${MIN_PRICE}–$${MAX_PRICE}`;
   }
   for (const [field, mult] of Object.entries(MULTIPLIERS)) {
-    const expected = r.input * mult;
+    const effectiveMult = field === "cache_read" && wireId in CACHE_READ_MULTIPLIER_OVERRIDES
+      ? CACHE_READ_MULTIPLIER_OVERRIDES[wireId]
+      : mult;
+    const expected = r.input * effectiveMult;
     if (Math.abs(r[field] - expected) > MULTIPLIER_EPSILON) {
-      return `${wireId}.${field}=${r[field]} contradicts the documented ${mult}x input multiplier ` +
+      return `${wireId}.${field}=${r[field]} contradicts the documented ${effectiveMult}x input multiplier ` +
         `(input=${r.input} → expected ${expected.toFixed(4)})`;
     }
   }

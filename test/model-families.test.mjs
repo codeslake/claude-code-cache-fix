@@ -47,6 +47,12 @@ test("modelFamily: returns 'unknown' for unmatched / empty / non-string", () => 
   assert.equal(modelFamily(123), "unknown");
 });
 
+test("modelFamily: bare Opus 5 and Sonnet 5 ids, and the 5.5 point release, classify correctly", () => {
+  assert.equal(modelFamily("claude-opus-5"), "opus");
+  assert.equal(modelFamily("claude-opus-5-5"), "opus");
+  assert.equal(modelFamily("claude-sonnet-5"), "sonnet");
+});
+
 // --- Back-compat: cache-telemetry re-exports modelFamily ---
 
 test("back-compat: `modelFamily` is also exported from cache-telemetry.mjs (one indirection)", async () => {
