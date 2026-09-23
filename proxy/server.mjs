@@ -1774,13 +1774,17 @@ if (invokedAsScript) {
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    // Set BEFORE anything else in this function: every request that arrives from
-    // here on is arriving at a process that is leaving, and must be told so.
-    active.server._draining = true;
+    // startProxy() may still be pending (loading extensions, binding) when a
+    // signal lands — the handlers above are registered before that await
+    // resolves. There is no server to drain yet, so leave at once.
     if (!active) {
       process.exit(0);
       return;
     }
+    // Set BEFORE anything else past this point: every request that arrives
+    // from here on is arriving at a process that is leaving, and must be
+    // told so.
+    active.server._draining = true;
     // Stop listening FIRST, then say so. server.close() unbinds at once and
     // only then drains in-flight requests — up to the 5s below — so a
     // supervisor that waits for our EXIT sees the port unowned for the whole
