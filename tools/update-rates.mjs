@@ -175,7 +175,7 @@ function tableRows(html) {
 // A trailing footnote marker (e.g. "$0.20 / MTok 2" once the <sup>2</sup> tag
 // is stripped to plain text by tableRows()) is part of the page's own markup,
 // not a second price — allow and ignore it.
-const PRICE_CELL = /^\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*MTok(?:\s*\d+)?$/;
+const PRICE_CELL = /^\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*MTok(?:\s\d{1,2})?$/;
 
 // A model-pricing row is exactly: name cell + the five price columns
 // (input | 5m write | 1h write | cache read | output). This shape requirement is
