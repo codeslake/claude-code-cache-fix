@@ -7,8 +7,9 @@ import { spawn } from "node:child_process";
 import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { drainBudgetMs, drainRoute, forcedCloseLine } from "../proxy/server.mjs";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { availableParallelism, tmpdir } from "node:os";
+import { availableParallelism } from "node:os";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 
@@ -442,42 +443,45 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
   // Signal handlers are registered before `startProxy()` is awaited (so a
   // SIGTERM during boot does not fall through to node's default action), and
   // `shutdown()` already has a not-yet-listening guard for exactly that
-  // window — `if (!active) { process.exit(0); return; }`. But the line above
-  // it, `active.server._draining = true`, runs FIRST, so a signal landing
-  // while `active` is still `undefined` throws `TypeError: Cannot read
-  // properties of undefined (reading 'server')` instead of ever reaching the
-  // guard, and the process exits 1 (or hangs, once installSelfHeal's
-  // uncaughtException swallower is armed) rather than exiting 0.
+  // window — `if (!active) { process.exit(0); return; }`. Before the fix,
+  // `active.server._draining = true` ran first: a signal landing while
+  // `active` was still `undefined` threw `TypeError: Cannot read properties
+  // of undefined (reading 'server')` before reaching the guard, exiting 1
+  // instead of 0 (or hanging, once installSelfHeal's swallower armed).
   //
   // A slow extension is the deterministic seam: loadExtensions() awaits each
   // file's import in turn, so a `.mjs` whose top level delays 1.5s holds
   // startProxy() unsettled — and therefore `active` undefined — for that
   // whole window, well after the signal handlers above are already live. The
   // "hot-reload:" banner prints before loadExtensions() is called, so waiting
-  // for it on stderr lands the SIGTERM inside that window without a race.
+  // for it on stderr lands the SIGTERM before extensions finish loading; the
+  // assertion below — stdout never carried "listening on" — proves it.
   it("exits 0, not a TypeError, when SIGTERM lands before startProxy settles", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cache-fix-slow-ext-"));
     writeFileSync(join(dir, "slow.mjs"),
       'await new Promise((r) => setTimeout(r, 1500));\n' +
       'export default { name: "slow" };\n');
     // A bespoke spawn, not the shared `startProxy()` helper: that helper's
-    // `port` promise only settles on "listening on" (never reached here, by
-    // design) or its own uncleared 5s timer, which would hold this case's
-    // wall time at ~5s for a timer whose result nothing here needs.
+    // `port` promise also rejects when the process exits, so using it here
+    // would reject with "Proxy exited 0" as an unhandled rejection.
     const env = { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_EXTENSIONS_DIR: dir };
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env[k];
     const proc = spawn(process.execPath, ["proxy/server.mjs"], { env, stdio: ["pipe", "pipe", "pipe"] });
     let err = "";
+    let out = "";
     proc.stderr.on("data", (c) => (err += c.toString()));
+    proc.stdout.on("data", (c) => (out += c.toString()));
     try {
       const banner = new Promise((resolve) => {
         const onData = () => { if (/hot-reload:/.test(err)) { proc.stderr.off("data", onData); resolve(); } };
         proc.stderr.on("data", onData);
       });
-      await withDeadline(banner, 2000, proc, "hot-reload banner never printed");
+      await withDeadline(banner, 5000, proc, "hot-reload banner never printed");
       const exited = exitOf(proc);
       proc.kill("SIGTERM");
       const { code } = await exited;
+      assert.ok(!out.includes("listening on"),
+        `child printed "listening on" before exit — the signal missed the startProxy()-pending window; stdout:\n${out}`);
       assert.equal(code, 0, `startup-window SIGTERM must exit 0, got ${code}; stderr:\n${err}`);
     } finally {
       try { proc.kill("SIGKILL"); } catch {}
