@@ -52,6 +52,7 @@ const NAME_TO_WIRE = {
   "Claude Opus 4.5": ["claude-opus-4-5-20251101"],
   "Claude Opus 4.1": ["claude-opus-4-1-20250805"],
   "Claude Opus 4": ["claude-opus-4-20250514"],
+  "Claude Sonnet 5.5": ["claude-sonnet-5-5"],
   "Claude Sonnet 5": ["claude-sonnet-5"],
   "Claude Sonnet 4.6": ["claude-sonnet-4-6"],
   "Claude Sonnet 4.5": ["claude-sonnet-4-5-20250929"],
@@ -83,6 +84,7 @@ const REQUIRED_WIRE_IDS = [
   "claude-opus-4-7",
   "claude-opus-4-6",
   "claude-sonnet-5",
+  "claude-sonnet-5-5",
   "claude-haiku-4-5",
 ];
 

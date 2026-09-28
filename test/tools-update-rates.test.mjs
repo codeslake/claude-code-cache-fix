@@ -9,8 +9,8 @@ import { parsePricing } from "../tools/update-rates.mjs";
 // direct-API-key users is a literal dollar ceiling. The failure mode that
 // matters is a plausible-looking WRONG number, so these tests are mostly about
 // what the parser REFUSES to emit. Fixture is the <table> blocks of the real
-// pricing page as of 2026-07-27, with the Claude Opus 5.5 row copied in from
-// the later live page — it had not shipped on 2026-07-27.
+// pricing page as of 2026-07-27, with the Claude Opus 5.5 and Claude Sonnet 5.5
+// rows copied in from the later live page — neither had shipped on 2026-07-27.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = readFileSync(join(__dirname, "fixtures", "pricing-page-2026-07-27.html"), "utf8");
@@ -44,6 +44,15 @@ test("prices Claude Opus 5.5, footnoted cache-read discount included", () => {
   const { rates } = parsePricing(FIXTURE, AUG);
   assert.deepEqual(rates["claude-opus-5-5"],
     { input: 4, output: 20, cache_read: 0.2, cache_write_5m: 5, cache_write_1h: 8 });
+});
+
+test("prices Claude Sonnet 5.5 as its own row, not as Claude Sonnet 5's", () => {
+  // In the September window Sonnet 5 stands at $3/$15 while Sonnet 5.5 stays at
+  // $2/$10, so a 5.5 id resolved onto Sonnet 5's dated rows would read wrong.
+  const { rates } = parsePricing(FIXTURE, SEP);
+  assert.deepEqual(rates["claude-sonnet-5-5"],
+    { input: 2, output: 10, cache_read: 0.2, cache_write_5m: 2.5, cache_write_1h: 4 });
+  assert.equal(rates["claude-sonnet-5"].input, 3);
 });
 
 // --- dated-variant disambiguation (Codex r1 blocker 1) ---
@@ -122,7 +131,7 @@ test("a partial parse aborts instead of writing a plausible-looking file", () =>
 test("markup with no parseable rows at all reports every required model missing", () => {
   const { rates, errors } = parsePricing("<html><body><p>pricing moved</p></body></html>", AUG);
   assert.deepEqual(rates, {});
-  assert.equal(errors.length, 8, "one error per required wire id");
+  assert.equal(errors.length, 9, "one error per required wire id");
 });
 
 // --- silent-corruption guards ---
@@ -212,7 +221,7 @@ test("checked-in rates.json agrees with the fixture parse for required models", 
   const shipped = JSON.parse(readFileSync(join(__dirname, "..", "tools", "rates.json"), "utf8")).models;
   const { rates } = parsePricing(FIXTURE, Date.parse("2026-07-27T12:00:00Z"));
   for (const id of ["claude-fable-5", "claude-opus-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-7",
-                    "claude-opus-4-6", "claude-sonnet-5", "claude-haiku-4-5"]) {
+                    "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-4-5"]) {
     assert.ok(shipped[id], `rates.json is missing ${id} — the cost lever prices it at zero`);
     const { note, ...s } = shipped[id];
     assert.deepEqual(s, rates[id], `rates.json ${id} disagrees with the published table`);

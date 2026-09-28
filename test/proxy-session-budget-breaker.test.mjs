@@ -204,6 +204,14 @@ test("cost lever prices cache_creation at the higher cache_write_1h rate", async
   assert.ok(Math.abs(ext.__testOnly.costUsd(SID) - 1.0) < 1e-9, `expected ~$1.00, got ${ext.__testOnly.costUsd(SID)}`);
 });
 
+test("cost lever prices claude-sonnet-5-5, the default Sonnet, instead of failing open", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "1";
+  // 100k input tokens at Sonnet 5.5's $2/M = $0.20; an unpriced id would read $0.
+  await ext.onStreamEvent(start(100000, 0, "claude-sonnet-5-5"));
+  assert.ok(Math.abs(ext.__testOnly.costUsd(SID) - 0.2) < 1e-9, `expected ~$0.20, got ${ext.__testOnly.costUsd(SID)}`);
+});
+
 test("cost lever UNDER the ceiling → forward", async () => {
   process.env.CACHE_FIX_SESSION_BUDGET = "on";
   process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "1";

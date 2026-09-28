@@ -51,6 +51,7 @@ test("modelFamily: bare Opus 5 and Sonnet 5 ids, and the 5.5 point release, clas
   assert.equal(modelFamily("claude-opus-5"), "opus");
   assert.equal(modelFamily("claude-opus-5-5"), "opus");
   assert.equal(modelFamily("claude-sonnet-5"), "sonnet");
+  assert.equal(modelFamily("claude-sonnet-5-5"), "sonnet");
 });
 
 // --- Back-compat: cache-telemetry re-exports modelFamily ---
