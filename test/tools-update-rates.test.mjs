@@ -11,9 +11,21 @@ import { parsePricing } from "../tools/update-rates.mjs";
 // what the parser REFUSES to emit. Fixture is the <table> blocks of the real
 // pricing page as of 2026-07-27, with the Claude Opus 5.5 and Claude Sonnet 5.5
 // rows copied in from the later live page — neither had shipped on 2026-07-27.
+//
+// pricing-page-2026-09-28.html is the model-pricing <table> of the live page as
+// of 2026-09-28, fetched through update-rates' own fetchPricing (817995 bytes,
+// sha256 94e6c8aca38da16741bb160c8339b34d6164b8de954a6f4225927da22f5bc91a) with
+// every other block dropped. It has TWO header rows and a different column
+// order from the 2026-07-27 page (Output right after Input, before the cache
+// columns).
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = readFileSync(join(__dirname, "fixtures", "pricing-page-2026-07-27.html"), "utf8");
+const LIVE_0928 = readFileSync(join(__dirname, "fixtures", "pricing-page-2026-09-28.html"), "utf8");
+
+// Prices are read in the column order the table's own header names, so every
+// inline table below carries a header row (a table without one yields no rows).
+const HEAD = "<tr><th>Model</th><th>Input</th><th>5m</th><th>1h</th><th>Hits</th><th>Output</th></tr>";
 
 const AUG = Date.parse("2026-08-15T12:00:00Z"); // introductory Sonnet 5 window
 const SEP = Date.parse("2026-09-15T12:00:00Z"); // standard Sonnet 5 window
@@ -53,6 +65,34 @@ test("prices Claude Sonnet 5.5 as its own row, not as Claude Sonnet 5's", () => 
   assert.deepEqual(rates["claude-sonnet-5-5"],
     { input: 2, output: 10, cache_read: 0.2, cache_write_5m: 2.5, cache_write_1h: 4 });
   assert.equal(rates["claude-sonnet-5"].input, 3);
+});
+
+// --- column order comes from the header, not from a fixed position ---
+
+test("the two-header-row page of 2026-09-28 parses every required model with no errors", () => {
+  const { rates, errors } = parsePricing(LIVE_0928, Date.parse("2026-09-28T12:00:00Z"));
+  assert.deepEqual(errors, [], "a name-cell tagline must not read as a date qualifier either");
+  // Output follows Input on this page; read by position it landed in cache_write_5m.
+  assert.deepEqual(rates["claude-opus-5-5"],
+    { input: 4, output: 20, cache_read: 0.2, cache_write_5m: 5, cache_write_1h: 8 });
+  const shipped = JSON.parse(readFileSync(join(__dirname, "..", "tools", "rates.json"), "utf8")).models;
+  for (const id of ["claude-fable-5", "claude-opus-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-7",
+                    "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-4-5"]) {
+    const { note, ...s } = shipped[id];
+    // Compared as JSON so key order counts: an unchanged page must stay a byte-identical no-op.
+    assert.equal(JSON.stringify(rates[id]), JSON.stringify(s), `${id} disagrees with the 2026-09-28 table`);
+  }
+});
+
+test("a header that does not name each price column once is refused, not read by position", () => {
+  // Old-order prices that the pre-header parser accepted whatever the header said.
+  const row = `<tr><td>Claude Fable 5</td><td>$10 / MTok</td><td>$12.50 / MTok</td><td>$20 / MTok</td><td>$1 / MTok</td><td>$50 / MTok</td></tr>`;
+  for (const cols of [["A", "B", "C", "D", "E"], ["Input", "Input", "5m", "1h", "Hits"]]) {
+    const head = `<tr><th>Model</th>${cols.map((c) => `<th>${c}</th>`).join("")}</tr>`;
+    const { rates, errors } = parsePricing(`<table>${head}${row}</table>`, AUG);
+    assert.equal(rates["claude-fable-5"], undefined, `header ${cols} must not be guessed`);
+    assert.ok(errors.some((e) => /required model "claude-fable-5" missing/.test(e)), JSON.stringify(errors));
+  }
 });
 
 // --- dated-variant disambiguation (Codex r1 blocker 1) ---
@@ -139,7 +179,7 @@ test("markup with no parseable rows at all reports every required model missing"
 test("a price outside the sane range is rejected", () => {
   // Multipliers are internally consistent, so only the range check catches this
   // 1000x transcription error.
-  const html = `<table><tr><td>Claude Fable 5</td><td>$10000 / MTok</td><td>$12500 / MTok</td><td>$20000 / MTok</td><td>$1000 / MTok</td><td>$50000 / MTok</td></tr></table>`;
+  const html = `<table>${HEAD}<tr><td>Claude Fable 5</td><td>$10000 / MTok</td><td>$12500 / MTok</td><td>$20000 / MTok</td><td>$1000 / MTok</td><td>$50000 / MTok</td></tr></table>`;
   const { rates, errors } = parsePricing(html, AUG);
   assert.equal(rates["claude-fable-5"], undefined);
   assert.ok(errors.some((e) => /outside sane range/.test(e)), JSON.stringify(errors));
@@ -148,7 +188,7 @@ test("a price outside the sane range is rejected", () => {
 test("cache prices that contradict the documented multipliers are rejected", () => {
   // Plausible-looking numbers, wrong relationship — the exact class of quiet
   // corruption a column-order change would produce.
-  const html = `<table><tr><td>Claude Fable 5</td><td>$10 / MTok</td><td>$11 / MTok</td><td>$13 / MTok</td><td>$4 / MTok</td><td>$50 / MTok</td></tr></table>`;
+  const html = `<table>${HEAD}<tr><td>Claude Fable 5</td><td>$10 / MTok</td><td>$11 / MTok</td><td>$13 / MTok</td><td>$4 / MTok</td><td>$50 / MTok</td></tr></table>`;
   const { rates, errors } = parsePricing(html, AUG);
   assert.equal(rates["claude-fable-5"], undefined);
   assert.ok(errors.some((e) => /contradicts the documented/.test(e)), JSON.stringify(errors));
@@ -157,7 +197,7 @@ test("cache prices that contradict the documented multipliers are rejected", () 
 test("the Opus 5.5 cache-read override does not loosen the guard for other models", () => {
   // Claude Fable 5 at the 0.05x rate Opus 5.5 uses would be $0.20/MTok, not the
   // documented 0.1x ($0.40/MTok) — must still be rejected as a misparse.
-  const html = `<table><tr><td>Claude Fable 5</td><td>$4 / MTok</td><td>$5 / MTok</td><td>$8 / MTok</td><td>$0.20 / MTok</td><td>$20 / MTok</td></tr></table>`;
+  const html = `<table>${HEAD}<tr><td>Claude Fable 5</td><td>$4 / MTok</td><td>$5 / MTok</td><td>$8 / MTok</td><td>$0.20 / MTok</td><td>$20 / MTok</td></tr></table>`;
   const { rates, errors } = parsePricing(html, AUG);
   assert.equal(rates["claude-fable-5"], undefined);
   assert.ok(errors.some((e) => /contradicts the documented/.test(e)), JSON.stringify(errors));
@@ -168,7 +208,7 @@ test("a footnote-shaped suffix with no space or too many digits fails closed", (
   // was, so a real footnote marker reads "$4 / MTok 2" (one space, 1-2
   // digits). "$4 / MTok2026" has no such space — not a footnote, a misparse —
   // and must be dropped rather than read as a $4 price.
-  const html = `<table><tr><td>Claude Fable 5</td><td>$4 / MTok2026</td><td>$5 / MTok</td><td>$8 / MTok</td><td>$0.40 / MTok</td><td>$20 / MTok</td></tr></table>`;
+  const html = `<table>${HEAD}<tr><td>Claude Fable 5</td><td>$4 / MTok2026</td><td>$5 / MTok</td><td>$8 / MTok</td><td>$0.40 / MTok</td><td>$20 / MTok</td></tr></table>`;
   const { rates, errors } = parsePricing(html, AUG);
   assert.equal(rates["claude-fable-5"], undefined);
   assert.ok(errors.some((e) => /required model "claude-fable-5" missing/.test(e)), JSON.stringify(errors));
@@ -234,7 +274,7 @@ test("checked-in rates.json agrees with the fixture parse for required models", 
 // "starting September 1, 2026" row read in August is not today's price.
 
 const soleRow = (name, input) =>
-  `<table><tr><td>${name}</td><td>$${input} / MTok</td><td>$${input * 1.25} / MTok</td>` +
+  `<table>${HEAD}<tr><td>${name}</td><td>$${input} / MTok</td><td>$${input * 1.25} / MTok</td>` +
   `<td>$${input * 2} / MTok</td><td>$${(input * 0.1).toFixed(2)} / MTok</td><td>$${input * 5} / MTok</td></tr></table>`;
 
 test("a sole not-yet-effective row is refused, not adopted", () => {
@@ -270,7 +310,7 @@ test("a qualifier in an unrecognized date format is refused, not ignored", () =>
 
 test("a model mixing a dated and an undated row is refused", () => {
   const two =
-    `<table><tr><td>Claude Fable 5 starting September 1, 2026</td><td>$20 / MTok</td><td>$25 / MTok</td><td>$40 / MTok</td><td>$2 / MTok</td><td>$100 / MTok</td></tr>` +
+    `<table>${HEAD}<tr><td>Claude Fable 5 starting September 1, 2026</td><td>$20 / MTok</td><td>$25 / MTok</td><td>$40 / MTok</td><td>$2 / MTok</td><td>$100 / MTok</td></tr>` +
     `<tr><td>Claude Fable 5</td><td>$10 / MTok</td><td>$12.50 / MTok</td><td>$20 / MTok</td><td>$1 / MTok</td><td>$50 / MTok</td></tr></table>`;
   const { rates, errors } = parsePricing(two, AUG);
   assert.equal(rates["claude-fable-5"], undefined, "cannot tell which row is authoritative");
