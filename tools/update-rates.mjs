@@ -179,21 +179,52 @@ function tableRows(html) {
 // not a second price — allow and ignore it.
 const PRICE_CELL = /^\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*MTok(?:\s\d{1,2})?$/;
 
-// A model-pricing row is exactly: name cell + the five price columns
-// (input | 5m write | 1h write | cache read | output). This shape requirement is
+// Keywords that name each price column in the pricing table's header row
+// ("Base Input Tokens", "Input", "5m Cache Writes", "Hits and refreshes", ...).
+const COLUMNS = { input: /input/i, output: /output/i, cache_write_5m: /5m/i, cache_write_1h: /1h/i, cache_read: /hits/i };
+
+// The price fields, in column order, when this row is the pricing table's header
+// row: name cell + five cells that each name exactly one price field, every field
+// named once. Anything else (the page's first, colSpan header row; another
+// table's header; a renamed column) is null, so a header this cannot map yields
+// no rows and the run fails closed instead of reading prices by position.
+function headerCols(cells) {
+  const fields = cells.slice(1).map((c) => Object.keys(COLUMNS).filter((f) => COLUMNS[f].test(c)));
+  return fields.length === 5 && fields.every((f) => f.length === 1) && new Set(fields.flat()).size === 5
+    ? fields.flat() : null;
+}
+
+// A model-pricing row is exactly: name cell + the five price columns, in the
+// order `cols` (from the header row) names them. This shape requirement is
 // what keeps the batch-pricing table (two price cells) and the tool-use table
 // (token counts, not prices) from being mistaken for pricing rows — the old
 // first-match-anywhere scan had no such guard.
-function priceRow(cells) {
-  if (cells.length !== 6) return null;
-  const vals = [];
+function priceRow(cells, cols) {
+  if (!cols || cells.length !== 6) return null;
+  const v = {};
   for (let i = 1; i < 6; i++) {
     const m = PRICE_CELL.exec(cells[i]);
     if (!m) return null;
-    vals.push(parseFloat(m[1].replace(/,/g, "")));
+    v[cols[i - 1]] = parseFloat(m[1].replace(/,/g, ""));
   }
-  const [input, w5m, w1h, read, output] = vals;
-  return { name: cells[0], input, output, cache_read: read, cache_write_5m: w5m, cache_write_1h: w1h };
+  // Fixed key order (not column order): an unchanged page must stay a byte-identical no-op.
+  const { input, output, cache_read, cache_write_5m, cache_write_1h } = v;
+  return { name: cells[0], input, output, cache_read, cache_write_5m, cache_write_1h };
+}
+
+// Price rows of every table, each read with the column order its OWN header
+// row names (the mapping never carries over into the next table).
+function priceRows(html) {
+  const rows = [];
+  for (const [table] of html.matchAll(/<table[\s\S]*?<\/table>/g)) {
+    let cols = null;
+    for (const cells of tableRows(table)) {
+      cols = headerCols(cells) ?? cols;
+      const r = priceRow(cells, cols);
+      if (r) rows.push(r);
+    }
+  }
+  return rows;
 }
 
 // Does this row's name cell name this model — as opposed to a longer model whose
@@ -229,7 +260,7 @@ function validateRates(wireId, r) {
 // Parse the model-pricing table. `atMs` is the effective date used to pick
 // between dated variants of the same model. Returns { rates, errors }.
 export function parsePricing(html, atMs = Date.now()) {
-  const rows = tableRows(html).map(priceRow).filter(Boolean);
+  const rows = priceRows(html);
   const rates = {};
   const errors = [];
 
