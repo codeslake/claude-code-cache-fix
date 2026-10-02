@@ -887,6 +887,15 @@ async function withEnv(env, fn) {
   try { return await fn(); } finally { put(prior); }
 }
 
+// What `fn` writes to `stream` (process.stdout or process.stderr), one entry per write.
+async function capture(stream, fn) {
+  const out = [];
+  const write = stream.write;
+  stream.write = (m) => { out.push(String(m)); return true; };
+  try { await fn(); } finally { stream.write = write; }
+  return out;
+}
+
 test("renderSystemdTemplate: stop leaves the holder's lineage, reload hands it over", async () => {
   const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
   const out = renderSystemdTemplate(tpl, sampleVars);
@@ -961,10 +970,7 @@ test("getDefaults: the hop follows the proxy's own precedence; NO_PROXY, fallbac
 test("getDefaults: a fallback proxy variable naming the service's own port is not captured as the hop", async () => {
   const none = Object.fromEntries(["CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"].map((k) => [k, undefined]));
   const self = "http://127.0.0.1:9801";
-  const warned = [];
-  const write = process.stderr.write;
-  process.stderr.write = (m) => { warned.push(String(m)); return true; };
-  try {
+  const warned = await capture(process.stderr, async () => {
     await withEnv({ ...none, CACHE_FIX_PROXY_PORT: "9801", https_proxy: self }, () => {
       assert.equal(getDefaults().upstreamProxy, "", "a loop the child would refuse at start must not be baked in");
     });
@@ -974,9 +980,7 @@ test("getDefaults: a fallback proxy variable naming the service's own port is no
     await withEnv({ ...none, CACHE_FIX_PROXY_PORT: "9801", HTTPS_PROXY: "http://127.0.0.1:8118" }, () => {
       assert.equal(getDefaults().upstreamProxy, "http://127.0.0.1:8118", "another port is a real hop");
     });
-  } finally {
-    process.stderr.write = write;
-  }
+  });
   assert.equal(warned.length, 1, `one warning, got ${JSON.stringify(warned)}`);
   assert.match(warned[0], /https_proxy/);
   assert.match(warned[0], /CACHE_FIX_UPSTREAM_PROXY/);
@@ -1041,12 +1045,31 @@ test("install-service: next steps reload, never restart; a missing lsof warns an
     delete env.CACHE_FIX_REQUIRE_HOP;
     const run = () => execFileP(process.execPath, [BIN, "install-service", "--force"], { env });
     const noLsof = await run();
-    assert.match(noLsof.stdout, /systemctl --user reload cache-fix-proxy/);
+    // After the first reload the serving holder is a successor the unit no longer
+    // tracks, so a reload alone works once; `start` then hands over to it.
+    assert.ok(noLsof.stdout.includes("\n  systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy\n"));
+    assert.doesNotMatch(noLsof.stdout, /systemctl --user restart/);
     assert.match(noLsof.stderr, /lsof/, "no lsof on PATH must warn");
     // Control: the same install with an lsof on PATH is silent, so the warning
     // above came from the missing binary and not from anything else on stderr.
     await writeFile(join(bin, "lsof"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     assert.doesNotMatch((await run()).stderr, /lsof/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("install(): the launchd next steps update by SIGUSR2, then kickstart without -k", async () => {
+  const dir = await newTmp();
+  try {
+    let code;
+    const out = (await capture(process.stdout, () => withEnv({ HOME: dir }, async () => {
+      code = await install({ force: true, plat: "darwin" });
+    }))).join("");
+    assert.equal(code, 0);
+    const id = "gui/$(id -u)/com.cnighswonger.cache-fix-proxy";
+    assert.ok(out.includes(`\n  launchctl kill SIGUSR2 ${id} || launchctl kickstart ${id}\n`), out);
+    assert.doesNotMatch(out, /kickstart -k/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

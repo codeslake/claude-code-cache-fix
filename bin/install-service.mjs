@@ -404,8 +404,8 @@ async function uninstallLaunchd({ paths } = {}) {
   return { ok: true, path: targetPath };
 }
 
-async function install({ force = false } = {}) {
-  const paths = getPaths();
+async function install({ force = false, plat } = {}) {
+  const paths = getPaths(plat);
   if (paths.kind === "unsupported") {
     process.stderr.write(
       `[install-service] Unsupported platform: ${paths.platform}\n` +
@@ -448,8 +448,9 @@ async function install({ force = false } = {}) {
         `  systemctl --user enable --now cache-fix-proxy\n` +
         `  systemctl --user enable --now cache-fix-proxy-healthcheck.timer  # auto-recovery if proxy is ever stopped\n` +
         `  loginctl enable-linger ${process.env.USER || "<your-user>"}      # optional: start on boot vs login\n\n` +
-        `After a package update, reload, never restart (a restart cuts in-flight requests):\n` +
-        `  systemctl --user reload cache-fix-proxy\n` +
+        `After a package update, hand over, never restart (a restart cuts in-flight requests):\n` +
+        `  systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy\n` +
+        `Why both: after the first reload the serving holder is a successor the unit no longer tracks, so reload alone works once; start hands over to it, or does nothing when the code is the same.\n` +
         `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
     return 0;
@@ -472,8 +473,9 @@ async function install({ force = false } = {}) {
         `  launchctl bootstrap gui/$(id -u) ${r.path}\n` +
         `  launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
         `  launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n\n` +
-        `After a package update, reload, never restart (a restart cuts in-flight requests):\n` +
-        `  launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
+        `After a package update, hand over, never restart (a restart cuts in-flight requests):\n` +
+        `  launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
+        `Why both: after the first handover the serving holder is a successor the job no longer tracks, so the signal works once; kickstart (no -k) hands over to it, or does nothing when the code is the same.\n` +
         `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
     return 0;
