@@ -1,8 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { spawn } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import net from "node:net";
+import { HOP_ENV, OURS } from "./proc-helpers.mjs";
+import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
@@ -24,12 +27,15 @@ import { cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
 // Selected by the standby's OWN declaration of its parent, never by name or age:
 // a relay whose ppid no longer matches CACHE_FIX_STANDBY_PARENT has been
 // orphaned, and matching that parent against the holders THIS FILE spawned is
-// what keeps the sweep off production and off other sessions.
+// what keeps the sweep off production and off other sessions. The PORT is matched
+// too, and the relay's own command must be one of ours (OURS): a pid this file
+// once spawned can be a live holder's by now, and its standby names it as parent
+// just as ours did.
 //
 // /proc, so linux only. CI runs linux and that is where the guard is exercised;
 // on a mac the orphan survives until the OS reclaims it, which is a smaller
 // wrong than sweeping by name on a shared box.
-const spawnedHolders = new Set();
+const spawnedHolders = new Map();   // pid -> the port the holder was given
 const reapStandbys = () => {
   let dir;
   try { dir = readdirSync("/proc"); } catch { return; }
@@ -40,15 +46,16 @@ const reapStandbys = () => {
       argv = readFileSync(`/proc/${e}/cmdline`, "utf8").split("\0");
       env = readFileSync(`/proc/${e}/environ`, "utf8").split("\0");
     } catch { continue; }
-    if (!argv.some((a) => a.endsWith("/gap-relay.mjs"))) continue;
+    if (!argv.some((a) => OURS.test(a) && a.endsWith("/gap-relay.mjs"))) continue;
     const parent = env.find((v) => v.startsWith("CACHE_FIX_STANDBY_PARENT="))?.slice(25);
-    if (!parent || !spawnedHolders.has(Number(parent))) continue;
+    const port = spawnedHolders.get(Number(parent));
+    if (!port || !env.includes(`CACHE_FIX_PROXY_PORT=${port}`)) continue;
     try { process.kill(Number(e), "SIGKILL"); } catch {}
   }
 };
 process.on("exit", reapStandbys);
-// Records the pid so the sweep above can scope itself to this file's holders.
-const spawnHolder = (...args) => { const h = spawn(...args); spawnedHolders.add(h.pid); return h; };
+// Records the pid and port so the sweep above can scope itself to this file's holders.
+const spawnHolder = (...args) => { const h = spawn(...args); spawnedHolders.set(h.pid, args[2].env.CACHE_FIX_PROXY_PORT); return h; };
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -64,6 +71,95 @@ const probe = (port) => new Promise((res) => {
   // request hanging and the sampler stalls on it forever.
   r.on("timeout", () => { r.destroy(); res("ERR:ETIMEDOUT"); });
 });
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The first truthy answer of `fn` within `ms`, polled; undefined when it never came.
+const until = async (fn, ms) => {
+  for (const by = Date.now() + ms; Date.now() < by; await sleep(100)) { const v = await fn(); if (v) return v; }
+};
+
+// A fake origin streaming `data: <n>` at 10 per second and ending after `last`.
+// BY THE CLOCK, not by tick: this process polls with lsof and ps, which block its
+// event loop, and a stream counted in ticks falls behind by exactly that, so how
+// long it lasts would depend on how loaded the box is.
+const numberedOrigin = async (last) => {
+  const upstream = http.createServer((q, r) => {
+    r.writeHead(200, { "content-type": "text/event-stream" });
+    const t0 = Date.now();
+    let n = 0;
+    const t2 = setInterval(() => {
+      for (const due = Math.min(last, Math.floor((Date.now() - t0) / 100)); n < due;) {
+        try { r.write(`data: ${++n}\n\n`); } catch {}
+      }
+      if (n === last) { clearInterval(t2); r.end(); }
+    }, 100);
+    r.on("close", () => clearInterval(t2));
+    q.resume();
+  });
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+  return upstream;
+};
+
+// One streamed request through <port>: `seq()` is every number received so far,
+// and `done` goes true when the reply ends OR is cut.
+const openReply = (port) => {
+  const got = { seen: "", done: false };
+  got.seq = () => [...got.seen.matchAll(/data: (\d+)\n\n/g)].map((m) => Number(m[1]));
+  got.req = http.request(
+    { host: "127.0.0.1", port, path: "/v1/messages", method: "POST",
+      headers: { "content-type": "application/json" } },
+    (res) => { res.on("data", (d) => { got.seen += d; }); res.on("close", () => { got.done = true; });
+               res.on("error", () => {}); });
+  got.req.on("error", () => {});
+  got.req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+  return got;
+};
+
+// A run-service holder in front of `upstream`, answering 200, on the port it was
+// handed (`.port`). Its stderr is kept on `.log`, for a failure message to quote.
+//
+// THE PORT IS NEVER FREE. One released before the holder binds can be taken by a
+// neighbouring file's listen(0); the holder's bind then fails EADDRINUSE,
+// takeOver() names that listener, and release() SIGHUPs it: a `node --test`
+// runner, dead before it writes TAP. So the holder is handed the listening socket
+// the way a handover hands one (fd 3) and adopts it, and never binds. Our copy is
+// closed at once, since a listening handle here accepts connections nobody answers.
+const bootHolder = async (upstream, launcher, extraEnv = {}) => {
+  const sock = net.createServer();
+  await new Promise((r) => sock.listen(0, "127.0.0.1", r));
+  const port = sock.address().port;
+  const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
+                CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}` };
+  for (const k of [...HOP_ENV, "LISTEN_PID", "CACHE_FIX_HOLD_PORT",
+                   "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
+  Object.assign(env, { CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1" }, extraEnv);
+  const holder = spawnHolder(process.execPath, [launcher, "run-service"],
+                             { env, stdio: ["ignore", "ignore", "pipe", sock._handle.fd] });
+  sock.close();
+  holder.port = port;
+  holder.log = "";
+  holder.stderr.on("data", (d) => { holder.log += d; });
+  if (await until(async () => (await probe(port)) === "ok" && "ok", 25_000) !== "ok") {
+    holder.kill("SIGKILL");   // the caller never receives it
+    await reapPort(port);
+    assert.fail("the holder never came up, so nothing was measured");
+  }
+  return holder;
+};
+
+// WHAT A HOLDER SIGKILL OR A RELOAD LEAVES BEHIND is nobody's child, so nothing
+// else reaps it. Holders FIRST, then the rest in the same pass: a proxy whose
+// holder just died spawns a replacement on its next tick, and this must outrun
+// it. Only what listens on OUR port, filtered by OURS (proc-helpers listeners()).
+const reapPort = async (port) => {
+  for (let i = 0; i < 5; i++) {
+    const owners = listeners(port).sort((a, b) =>
+      /run-service/.test(cmdOf(b)) - /run-service/.test(cmdOf(a)));
+    if (!owners.length) break;
+    for (const o of owners) { try { process.kill(Number(o), "SIGKILL"); } catch { } }
+    await sleep(300);
+  }
+};
 
 // THE PRODUCTION STOP, WITH SOMETHING IN FLIGHT. Every other holder case here
 // signals with nothing owed, so `close()` resolves at once and the case passes
@@ -199,6 +295,127 @@ describe("a holder stop with a reply in flight", () => {
       try { req?.destroy(); } catch { }
       upstream.close();
       try { holder.kill("SIGKILL"); } catch { }
+    }
+  });
+
+  // THE SAME REPLY, WITH THE HOLDER KILLED OUTRIGHT (OOM, kill -9): nothing gets
+  // to forward a signal, so the proxy is orphaned and self-heals into a new
+  // holder while it is still carrying the stream. Measured on integrated, 4 runs:
+  // the stream was cut every time, by the orphan's own `process.exit(0)` once the
+  // new holder's proxy was serving, 1.4-1.6 s after the kill. A LAST sequence
+  // number is asserted, not growth, because a cut stream also grows until it is cut.
+  it("finishes the reply when the holder is SIGKILLed under it", async () => {
+    const LAST = 50;
+    const upstream = await numberedOrigin(LAST);
+    let holder, reply;
+    try {
+      holder = await bootHolder(upstream, launcherPath);
+      const { port } = holder;
+      const orphan = Number(execFileSync("pgrep", ["-P", String(holder.pid)], { encoding: "utf8" })
+        .trim().split("\n").find((q) => /server\.mjs/.test(cmdOf(q))));
+      assert.ok(orphan > 1, "no proxy under the holder, so there is nothing to orphan");
+
+      reply = openReply(port);
+      assert.ok(await until(() => reply.seq().length >= 3, 15_000), "premise: the reply must be flowing at the kill");
+
+      holder.kill("SIGKILL");
+      // "A different server.mjs pid is serving": the event the old exit keyed on.
+      assert.ok(await until(() => listeners(port).some((q) => Number(q) !== orphan && /server\.mjs/.test(cmdOf(q))), 25_000),
+        "premise: the orphan never healed into a serving successor");
+      // The number, not `reply.done`: a proxy that still exits has cut the reply (done) by
+      // now, and the cut is the defect. Only a reply that already finished makes this vacuous.
+      assert.ok(reply.seq().at(-1) < LAST,
+        "premise: the whole reply had arrived before the successor was seen serving, so a proxy that still exits would pass");
+      await until(() => reply.done, 15_000);
+      assert.equal(reply.seq().at(-1), LAST,
+        `the reply stopped at ${reply.seq().at(-1)} of ${LAST} (done=${reply.done}) — the orphaned proxy ` +
+        `left while it still carried the stream, so a holder SIGKILL cuts every tunnel on it`);
+    } finally {
+      try { reply?.req.destroy(); } catch { }
+      upstream.close();
+      try { holder?.kill("SIGKILL"); } catch { }
+      if (holder) await reapPort(holder.port);   // the healed lineage is nobody's child
+    }
+  });
+
+  // THE SAME REPLY, WITH THE PROXY SWAPPED BY THE DEPLOY WATCHER AND THEN THE
+  // HOLDER RELOADED (SIGUSR2). The swap leaves the old proxy draining the stream,
+  // parented to the holder but no longer its `child`. The reload signals only the
+  // CURRENT child and exits, so the drainer is orphaned, self-heals into a holder,
+  // and used to exit the moment the successor holder's proxy served. Measured by
+  // the deploy sandbox, 2 of 2 runs: curl rc 18 under the stream.
+  //
+  // A SCRATCH COPY OF THE PACKAGE, never this tree's own proxy/: the watcher swaps
+  // on a changed byte under the proxy/ it runs from, and every holder in the run
+  // that runs from this tree would swap with it.
+  it("finishes the reply a watch swap left draining when the holder is reloaded", async () => {
+    const LAST = 60;
+    const upstream = await numberedOrigin(LAST);
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const pkg = mkdtempSync(join(tmpdir(), "ccf-swap-"));
+    for (const d of ["bin", "proxy"]) cpSync(join(root, d), join(pkg, d), { recursive: true });
+    symlinkSync(join(root, "node_modules"), join(pkg, "node_modules"));
+    let holder, reply;
+    try {
+      // CACHE_FIX_HANDOVER_ENV: a handover re-reads CACHE_FIX_* from a file in the
+      // operator's claude home, and whatever it holds would reach the successor.
+      holder = await bootHolder(upstream, join(pkg, "bin", "claude-via-proxy.mjs"),
+        { CACHE_FIX_WATCH_DEPLOY_MS: "200", CACHE_FIX_HANDOVER_ENV: join(pkg, "none.env") });
+      const { port } = holder;
+      const serving = (...not) => listeners(port).find((q) => /server\.mjs/.test(cmdOf(q)) && !not.includes(q));
+      const first = serving();
+      assert.ok(first, "no proxy is serving, so there is nothing to swap");
+      reply = openReply(port);
+      assert.ok(await until(() => reply.seq().length >= 3, 15_000), "premise: the reply must be flowing at the swap");
+
+      appendFileSync(join(pkg, "proxy", "helpers.mjs"), "\n// a deploy\n");
+      const second = await until(() => serving(first), 25_000);
+      assert.ok(second, `the watcher never swapped the proxy: ${holder.log.slice(-300)}`);
+      assert.ok(!reply.done, "premise: the old proxy is draining a live reply");
+
+      holder.kill("SIGUSR2");
+      assert.ok(await until(() => serving(first, second), 25_000),
+        "premise: the reload never put a successor proxy on the port");
+      await until(() => reply.done, 15_000);
+      assert.equal(reply.seq().join(" "), Array.from({ length: LAST }, (_, i) => i + 1).join(" "),
+        `the reply stopped at ${reply.seq().at(-1)} of ${LAST} (done=${reply.done}): the proxy the swap ` +
+        `left draining was orphaned by the reload and left while it still carried the stream. ` +
+        holder.log.split("\n").filter((l) => /died|surplus|changed|drained/.test(l)).join(" | "));
+    } finally {
+      try { reply?.req.destroy(); } catch { }
+      upstream.close();
+      try { holder?.kill("SIGKILL"); } catch { }
+      if (holder) await reapPort(holder.port);
+      rmSync(pkg, { recursive: true, force: true });
+    }
+  });
+});
+
+// A PID THIS FILE ONCE SPAWNED CAN BE A LIVE HOLDER'S BY THE TIME THE SWEEP RUNS,
+// and that holder's standby names it as its parent exactly as ours did. What tells
+// them apart is the port this file gave the holder, which the relay carries in its
+// own environment. Both relays here are this test's own spawns.
+describe("the exit sweep of standbys", () => {
+  it("leaves a relay on another port alone, whatever pid it names as its parent", { skip: !existsSync("/proc") }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ccf-sweep-"));
+    mkdirSync(join(dir, "bin"));
+    writeFileSync(join(dir, "bin", "gap-relay.mjs"), "setInterval(() => {}, 1e6);\n");
+    assert.ok(OURS.test(join(dir, "bin", "gap-relay.mjs")), "premise: the stand-in must look like one of our relays");
+    const [mine, theirs] = [await takePort(), await takePort()];
+    const holder = spawnHolder(process.execPath, ["-e", ""],
+      { env: { ...process.env, CACHE_FIX_PROXY_PORT: String(mine) }, stdio: "ignore" });
+    const relay = (port) => spawn(process.execPath, [join(dir, "bin", "gap-relay.mjs")], { stdio: "ignore",
+      env: { ...process.env, CACHE_FIX_STANDBY_PARENT: String(holder.pid), CACHE_FIX_PROXY_PORT: String(port) } });
+    const [ours, stranger] = [relay(mine), relay(theirs)];
+    try {
+      reapStandbys();
+      assert.ok(await until(() => ours.signalCode, 5_000), "the sweep left this file's own standby running");
+      await sleep(300);
+      assert.equal(stranger.signalCode ?? stranger.exitCode, null,
+        "the sweep killed a relay on a port this file never gave a holder");
+    } finally {
+      for (const p of [ours, stranger]) { try { p.kill("SIGKILL"); } catch { } }
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
