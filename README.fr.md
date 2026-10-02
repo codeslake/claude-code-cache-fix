@@ -378,7 +378,7 @@ v4.0.0 bascule `CACHE_FIX_THINKING_SANITIZE` de default-off à default-on. La v1
 
 ### Flux 1 — mise à jour npm code seul (recommandé par défaut)
 
-Votre unité systemd existante / plist launchd est inchangée ; seul le code proxy sur disque est mis à jour par npm. Passez le relais du processus en cours au nouveau code ; un redémarrage couperait les requêtes en vol.
+Votre unité systemd existante / plist launchd est inchangée ; seul le code proxy sur disque est mis à jour par npm. Passez le relais du processus en cours au nouveau code ; un passage de relais garde le port à l'écoute en permanence, alors qu'un redémarrage refuse les connexions un instant.
 
 **Linux (systemd user unit) :**
 

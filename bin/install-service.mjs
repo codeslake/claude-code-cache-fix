@@ -8,7 +8,7 @@
 //
 // Pure helpers exported for tests; orchestration lives in main().
 
-import { readFile, writeFile, mkdir, unlink, stat } from "node:fs/promises";
+import { readFile, writeFile, mkdir, unlink, stat, chmod } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
@@ -265,7 +265,10 @@ async function installSystemd({ paths, defaults, force = false } = {}) {
     ...defaults,
   });
   await mkdir(paths.configDir, { recursive: true });
-  await writeFile(targetPath, rendered);
+  // The unit carries the install-time HTTPS_PROXY, credentials included. writeFile's
+  // mode applies only when it creates the file, so --force over a 0644 one needs the chmod.
+  await writeFile(targetPath, rendered, { mode: 0o600 });
+  await chmod(targetPath, 0o600);
 
   // Healthcheck companion: oneshot service + timer. Auto-recovery from any
   // proxy stop, including clean stops where Restart=on-failure does NOT fire
@@ -361,7 +364,8 @@ async function installLaunchd({ paths, defaults, force = false } = {}) {
     ...defaults,
   });
   await mkdir(paths.configDir, { recursive: true });
-  await writeFile(targetPath, rendered);
+  await writeFile(targetPath, rendered, { mode: 0o600 }); // the plist carries the hop too
+  await chmod(targetPath, 0o600);
   return { ok: true, path: targetPath };
 }
 
@@ -417,7 +421,7 @@ async function install({ force = false, plat } = {}) {
   if (paths.kind === "unsupported") {
     process.stderr.write(
       `[install-service] Unsupported platform: ${paths.platform}\n` +
-        `Manual install: run \`node ${SERVER_PATH}\` under your platform's service manager.\n`,
+        `Manual install: run \`${process.execPath} ${LAUNCHER_PATH} run-service\` under your platform's service manager.\n`,
     );
     return 1;
   }
@@ -456,7 +460,7 @@ async function install({ force = false, plat } = {}) {
         `  systemctl --user enable --now cache-fix-proxy\n` +
         `  systemctl --user enable --now cache-fix-proxy-healthcheck.timer  # auto-recovery if proxy is ever stopped\n` +
         `  loginctl enable-linger ${process.env.USER || "<your-user>"}      # optional: start on boot vs login\n\n` +
-        `After a package update, hand over, never restart (a restart cuts in-flight requests):\n` +
+        `After a package update, hand over instead of restarting (a handover keeps the port accepting throughout; a restart refuses connections for a moment):\n` +
         `  systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy\n` +
         `Why both: after the first reload the serving holder is a successor the unit no longer tracks, so reload alone works once; start hands over to it, or does nothing when the proxy/ tree is the same.\n` +
         CHANGE_SETTINGS +
@@ -482,7 +486,7 @@ async function install({ force = false, plat } = {}) {
         `  launchctl bootstrap gui/$(id -u) ${r.path}\n` +
         `  launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
         `  launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n\n` +
-        `After a package update, hand over, never restart (a restart cuts in-flight requests):\n` +
+        `After a package update, hand over instead of restarting (a handover keeps the port accepting throughout; a restart refuses connections for a moment):\n` +
         `  launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
         `Why both: after the first handover the serving holder is a successor the job no longer tracks, so the signal works once; kickstart (no -k) hands over to it, or does nothing when the proxy/ tree is the same.\n` +
         CHANGE_SETTINGS +
@@ -522,12 +526,12 @@ const listeners = (port) => {
 async function endLineage(paths, drainMs) {
   const unitText = await readFile(join(paths.configDir, paths.configFile), "utf-8").catch(() => null);
   if (unitText === null) return; // nothing installed, nothing to signal
-  const port = /CACHE_FIX_PROXY_PORT(?:=|<\/key>\s*<string>)(\d+)/.exec(unitText)?.[1] ?? getDefaults().port;
+  const port = /CACHE_FIX_PROXY_PORT(?:=|<\/key>\s*<string>)(\d+)/.exec(unitText)?.[1] ?? "9801"; // the proxy's default, not getDefaults(): it throws on a bad env
   let { error, pids } = listeners(port);
   if (error) {
     const lead = `[uninstall-service] warning: lsof could not be run (is it on PATH?), so the proxy on port ${port} could not be found; `;
     if (paths.kind === "systemd") {
-      process.stderr.write(lead + "the unit's cgroup was sent SIGHUP instead, which misses a successor outside it, so the port may stay held.\n");
+      process.stderr.write(lead + "the unit's processes are asked to release by SIGHUP instead, and without lsof nothing waits for the port to free.\n");
       await runCmd("systemctl", ["--user", "kill", "-s", "HUP", "cache-fix-proxy"]);
     } else {
       process.stderr.write(lead + "the port may stay held.\n");
@@ -539,7 +543,8 @@ async function endLineage(paths, drainMs) {
   }
   for (const deadline = Date.now() + drainMs; pids.length && Date.now() < deadline;) {
     await sleep(100);
-    pids = listeners(port).pids;
+    const r = listeners(port);
+    if (!r.error) pids = r.pids; // a failed listing (its 5 s timeout) leaves the port counted as held
   }
   if (pids.length) {
     process.stderr.write(`[uninstall-service] warning: port ${port} is still held by pid ${pids.join(", ")} after ${drainMs / 1000} s; continuing.\n`);

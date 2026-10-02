@@ -2,7 +2,7 @@ import { createServer } from "node:net";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { appendFileSync } from "node:fs";
-import { mkdtemp, readFile, writeFile, rm, readdir, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm, readdir, mkdir, stat, chmod } from "node:fs/promises";
 import { tmpdir, platform } from "node:os";
 import { join, dirname } from "node:path";
 import { execFile } from "node:child_process";
@@ -493,6 +493,43 @@ test("installSystemd: --force overwrites existing", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// The unit and plist carry the install-time HTTPS_PROXY, credentials included, and
+// writeFile's mode applies only when it creates the file: --force over a 0644 one keeps 0644.
+test("installSystemd / installLaunchd: the file ends 0600, fresh or --force over an existing 0644 one", { skip: platform() === "win32" }, async () => {
+  const dir = await newTmp();
+  try {
+    const defaults = { port: "9801", upstream: "", debug: "", workingDir: "/tmp" };
+    const cases = [
+      [installSystemd, { kind: "systemd", configDir: dir, configFile: "cache-fix-proxy.service", healthcheckServiceFile: "cache-fix-proxy-healthcheck.service", healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer" }],
+      [installLaunchd, { kind: "launchd", configDir: dir, configFile: "com.cnighswonger.cache-fix-proxy.plist", logDir: dir }],
+    ];
+    for (const [fn, paths] of cases) {
+      const target = join(dir, paths.configFile);
+      assert.ok((await fn({ paths, defaults })).ok);
+      assert.equal((await stat(target)).mode & 0o777, 0o600, `${paths.kind}: fresh`);
+      await chmod(target, 0o644);
+      assert.ok((await fn({ paths, defaults, force: true })).ok);
+      assert.equal((await stat(target)).mode & 0o777, 0o600, `${paths.kind}: --force over 0644`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("install(): an unsupported platform's hint runs the launcher's run-service, not the bare proxy", async () => {
+  let code;
+  const err = (await capture(process.stderr, async () => { code = await install({ plat: "freebsd" }); })).join("");
+  assert.equal(code, 1);
+  assert.match(err, /claude-via-proxy\.mjs run-service/);
+  assert.doesNotMatch(err, /server\.mjs/);
+});
+
+test("help: `server` is not described as what systemd/launchd run; the units run run-service", async () => {
+  const { stdout } = await execFileP(process.execPath, [BIN, "help"]);
+  assert.doesNotMatch(stdout, /ExecStart/);
+  assert.match(stdout, /run-service {12}What install-service's unit does/);
 });
 
 test("uninstallSystemd: not-installed when file missing", async () => {
@@ -994,7 +1031,9 @@ test("getDefaults: a fallback proxy variable naming the service's own port is no
 // stays off the host's real one. The lsof lists two pids for its first `lists`
 // calls and none after (the holder draining); `noLsof` leaves it off PATH. A
 // null unitText installs no unit. The result carries uninstall()'s stderr as `.stderr`.
-async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, noLsof = false, drainMs = 300 } = {}) {
+// `failOn` makes that call of the lsof fail the way its 5 s timeout does: spawnSync's own `error`
+// (here ENOBUFS, more than maxBuffer of blank lines) beside an empty list.
+async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, noLsof = false, drainMs = 300, failOn = 0 } = {}) {
   const dir = await newTmp();
   const realKill = process.kill;
   try {
@@ -1006,6 +1045,7 @@ async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, n
     if (!noLsof) {
       await writeFile(join(bin, "lsof"),
         `#!/bin/sh\necho "lsof $*" >> "${log}"\nn=0; [ -f "${count}" ] && read n < "${count}"\nn=$((n+1)); echo $n > "${count}"\n` +
+        `[ $n -eq ${failOn} ] && { head -c 2000000 /dev/zero | tr '\\0' '\\n'; exit 0; }\n` +
         `[ $n -le ${lists} ] && echo 4242 && echo 4243\nexit 0\n`, { mode: 0o755 });
     }
     const unitDir = plat === "linux" ? join(dir, ".config", "systemd", "user") : join(dir, "Library", "LaunchAgents");
@@ -1050,9 +1090,12 @@ test("uninstall(): launchd SIGHUPs every holder of the plist's port before booto
   assert.ok(!calls.some((c) => c.startsWith("launchctl kill")), "the job has no PID once a successor serves");
 });
 
-test("uninstall(): a unit that names no port lists the default port", async () => {
-  const calls = await uninstallCalls("linux", "cache-fix-proxy.service", "", { CACHE_FIX_PROXY_PORT: "9878" });
-  idx(calls, "lsof -nP -t -iTCP:9878 -sTCP:LISTEN");
+test("uninstall(): a unit that names no port lists the proxy's default 9801, and never reads getDefaults()", async () => {
+  // getDefaults() throws on the first port, and would list 9878 for the second.
+  for (const env of [{ CACHE_FIX_PROXY_PORT: "not-a-port" }, { CACHE_FIX_PROXY_PORT: "9878" }]) {
+    const calls = await uninstallCalls("linux", "cache-fix-proxy.service", "", env);
+    idx(calls, "lsof -nP -t -iTCP:9801 -sTCP:LISTEN");
+  }
 });
 
 const SYSTEMD = ["linux", "cache-fix-proxy.service", "[Service]\nEnvironment=CACHE_FIX_PROXY_PORT=9877\n"];
@@ -1080,6 +1123,14 @@ test("uninstall(): returns only once the port is free: lsof is polled until it l
   }
 });
 
+test("uninstall(): an lsof that fails is not a free port: the poll goes on until a listing says so", async () => {
+  for (const [plat, name, text] of [SYSTEMD, LAUNCHD]) {
+    const calls = await uninstallCalls(plat, name, text, {}, { lists: 1, failOn: 2, drainMs: 5000 });
+    assert.equal(lsofCalls(calls).length, 3, `${plat}: the listing, the failed poll, then the empty one, got:\n${calls.join("\n")}`);
+    assert.ok(calls.lastIndexOf(lsofCalls(calls)[0]) < endIdx(calls), `${plat}: the stop waits for the port`);
+  }
+});
+
 test("uninstall(): a port still held at the bound warns with the port and the pids, and the uninstall continues", async () => {
   for (const [plat, name, text] of [SYSTEMD, LAUNCHD]) {
     const calls = await uninstallCalls(plat, name, text, {}, { lists: 99999 });
@@ -1098,6 +1149,10 @@ test("uninstall(): systemd with no lsof asks the unit's cgroup to SIGHUP and war
   assert.ok(timer < kill && kill < stop, `order wrong, got:\n${calls.join("\n")}`);
   assert.match(calls.stderr, /lsof/);
   assert.match(calls.stderr, /9877/);
+  // A reload's successor stays in the cgroup, and nothing has been sent when this is written.
+  assert.doesNotMatch(calls.stderr, /outside|was sent/);
+  assert.match(calls.stderr, /asked to release by SIGHUP/);
+  assert.match(calls.stderr, /nothing waits for the port to free/);
 });
 
 test("uninstall(): launchd with no lsof warns that the proxy was not found and the port may stay held, and boots out", async () => {
@@ -1108,6 +1163,10 @@ test("uninstall(): launchd with no lsof warns that the proxy was not found and t
   assert.match(calls.stderr, /9877/);
   assert.match(calls.stderr, /held/);
 });
+
+// True on any base: a handover keeps the port accepting, a restart refuses connections for a
+// moment. Nothing here may say a handover keeps an in-flight stream alive.
+const CONTRAST = "a handover keeps the port accepting throughout; a restart refuses connections for a moment";
 
 const SETTINGS_LINE = "\nTo change an installed service's settings, run `cache-fix-proxy uninstall-service`, then install-service with the new settings and the steps above; the uninstall ends the running proxy, so this one cuts.\n";
 
@@ -1125,6 +1184,8 @@ test("install-service: next steps reload, never restart; a missing lsof warns an
     // tracks, so a reload alone works once; `start` then hands over to it.
     assert.ok(noLsof.stdout.includes("\n  systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy\n"));
     assert.doesNotMatch(noLsof.stdout, /systemctl --user restart/);
+    assert.ok(noLsof.stdout.includes(CONTRAST), noLsof.stdout);
+    assert.doesNotMatch(noLsof.stdout, /in-flight/);
     // A changed unit never reaches the serving lineage: only an uninstall ends it.
     assert.ok(noLsof.stdout.includes(SETTINGS_LINE));
     assert.ok(noLsof.stdout.includes("or does nothing when the proxy/ tree is the same."));
@@ -1149,6 +1210,8 @@ test("install(): the launchd next steps update by SIGUSR2, then kickstart withou
     const id = "gui/$(id -u)/com.cnighswonger.cache-fix-proxy";
     assert.ok(out.includes(`\n  launchctl kill SIGUSR2 ${id} || launchctl kickstart ${id}\n`), out);
     assert.doesNotMatch(out, /kickstart -k/);
+    assert.ok(out.includes(CONTRAST), out);
+    assert.doesNotMatch(out, /in-flight/);
     assert.ok(out.includes(SETTINGS_LINE));
     assert.ok(out.includes("or does nothing when the proxy/ tree is the same."));
   } finally {

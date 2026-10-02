@@ -1961,7 +1961,7 @@ async function dispatch() {
         "Subcommands:\n" +
         "  (no subcommand)        Spawn the proxy + launch claude with ANTHROPIC_BASE_URL set.\n" +
         "                         Pass any claude args after optional --proxy-port / --proxy-upstream.\n" +
-        "  server                 Run just the proxy in the foreground (for systemd/launchd ExecStart).\n" +
+        "  server                 Run just the proxy in the foreground.\n" +
         "  run-service            What install-service's unit does, without a service manager:\n" +
         "                         holds the port, restarts the proxy under it, and exits 0\n" +
         "                         when one is already serving. For hosts with no systemd or\n" +

@@ -544,7 +544,7 @@ Picking up a new extension or a code change to an existing one in v4.0.0 require
 
 ### Flow 1 — code-only npm upgrade (recommended default)
 
-Your existing systemd unit / launchd plist is unchanged; only the proxy code on disk is updated by npm. Hand the running process over to the new code; a restart would cut in-flight requests.
+Your existing systemd unit / launchd plist is unchanged; only the proxy code on disk is updated by npm. Hand the running process over to the new code; a handover keeps the port accepting throughout, while a restart refuses connections for a moment.
 
 **Linux (systemd user unit):**
 
