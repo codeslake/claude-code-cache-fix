@@ -5,6 +5,7 @@ import net from "node:net";
 import { HOP_ENV, OURS } from "./proc-helpers.mjs";
 import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -354,7 +355,10 @@ describe("a holder stop with a reply in flight", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..");
     const pkg = mkdtempSync(join(tmpdir(), "ccf-swap-"));
     for (const d of ["bin", "proxy"]) cpSync(join(root, d), join(pkg, d), { recursive: true });
-    symlinkSync(join(root, "node_modules"), join(pkg, "node_modules"));
+    // The node_modules node itself resolves from here: a checkout under .claude/worktrees/ has none at
+    // its own root, only an ancestor's, and a link to the missing one leaves the copy unable to load.
+    symlinkSync(createRequire(import.meta.url).resolve.paths("hpagent").find((d) => existsSync(join(d, "hpagent"))),
+                join(pkg, "node_modules"));
     let holder, reply;
     try {
       // CACHE_FIX_HANDOVER_ENV: a handover re-reads CACHE_FIX_* from a file in the
