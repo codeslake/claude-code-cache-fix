@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir, platform } from "node:os";
 import { systemdEscape, xmlEscape } from "../proxy/helpers.mjs";
+import { upstreamPointsAtSelf } from "../proxy/server.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_DIR = resolve(__dirname, "..", "templates");
@@ -22,16 +23,28 @@ const SERVER_PATH = resolve(__dirname, "..", "proxy", "server.mjs");
 const LAUNCHER_PATH = resolve(__dirname, "claude-via-proxy.mjs");
 
 function getDefaults() {
+  const port = validatePort(process.env.CACHE_FIX_PROXY_PORT || "9801");
+  // run-service drops HTTPS_PROXY/HTTP_PROXY unless CACHE_FIX_UPSTREAM_PROXY is
+  // set, so the install-time hop is captured under that name (proxy/config.mjs
+  // precedence) or the service dials direct. A fallback that names the
+  // service's own port (a shell wired through this proxy) is no hop: the child
+  // refuses it at start and run-service respawns it for ever.
+  let upstreamProxy = process.env.CACHE_FIX_UPSTREAM_PROXY || "";
+  if (!upstreamProxy) {
+    const name = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"].find((k) => process.env[k]);
+    upstreamProxy = process.env[name] || "";
+    if (upstreamPointsAtSelf(upstreamProxy, port)) {
+      process.stderr.write(
+        `[install-service] warning: ${name} names this proxy's own port (${port}); not captured as the upstream hop. ` +
+          `Set CACHE_FIX_UPSTREAM_PROXY to the real hop and install again.\n`,
+      );
+      upstreamProxy = "";
+    }
+  }
   return {
-    port: validatePort(process.env.CACHE_FIX_PROXY_PORT || "9801"),
+    port,
     upstream: process.env.CACHE_FIX_PROXY_UPSTREAM || "",
-    // run-service drops HTTPS_PROXY/HTTP_PROXY unless CACHE_FIX_UPSTREAM_PROXY is
-    // set, so the install-time hop is captured under that name (proxy/config.mjs
-    // precedence) or the service dials direct. The proxy itself refuses, at
-    // start, a hop that names its own port.
-    upstreamProxy: process.env.CACHE_FIX_UPSTREAM_PROXY
-      || process.env.HTTPS_PROXY || process.env.https_proxy
-      || process.env.HTTP_PROXY || process.env.http_proxy || "",
+    upstreamProxy,
     noProxy: process.env.NO_PROXY || process.env.no_proxy || "",
     fallbackProxies: process.env.CACHE_FIX_FALLBACK_PROXIES || "",
     watchDeployMs: process.env.CACHE_FIX_WATCH_DEPLOY_MS || "5000",

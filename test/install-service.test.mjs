@@ -958,6 +958,30 @@ test("getDefaults: the hop follows the proxy's own precedence; NO_PROXY, fallbac
   });
 });
 
+test("getDefaults: a fallback proxy variable naming the service's own port is not captured as the hop", async () => {
+  const none = Object.fromEntries(["CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"].map((k) => [k, undefined]));
+  const self = "http://127.0.0.1:9801";
+  const warned = [];
+  const write = process.stderr.write;
+  process.stderr.write = (m) => { warned.push(String(m)); return true; };
+  try {
+    await withEnv({ ...none, CACHE_FIX_PROXY_PORT: "9801", https_proxy: self }, () => {
+      assert.equal(getDefaults().upstreamProxy, "", "a loop the child would refuse at start must not be baked in");
+    });
+    await withEnv({ ...none, CACHE_FIX_PROXY_PORT: "9801", CACHE_FIX_UPSTREAM_PROXY: self }, () => {
+      assert.equal(getDefaults().upstreamProxy, self, "an explicit hop stays as given");
+    });
+    await withEnv({ ...none, CACHE_FIX_PROXY_PORT: "9801", HTTPS_PROXY: "http://127.0.0.1:8118" }, () => {
+      assert.equal(getDefaults().upstreamProxy, "http://127.0.0.1:8118", "another port is a real hop");
+    });
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.equal(warned.length, 1, `one warning, got ${JSON.stringify(warned)}`);
+  assert.match(warned[0], /https_proxy/);
+  assert.match(warned[0], /CACHE_FIX_UPSTREAM_PROXY/);
+});
+
 // Stand-ins for BOTH service managers' CLIs that only log their argv, so a case
 // can read the ORDER uninstall() issued its commands in. Both, so a case whose
 // platform branch is wrong still never reaches the host's real service manager.
