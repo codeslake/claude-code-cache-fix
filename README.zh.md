@@ -259,7 +259,7 @@ launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-安装的配置会在安装时从环境变量中读取 `CACHE_FIX_PROXY_PORT`、`CACHE_FIX_PROXY_UPSTREAM`、`CACHE_FIX_DEBUG`、上游跳点（`CACHE_FIX_UPSTREAM_PROXY`，默认取安装时的 `HTTPS_PROXY`）、`NO_PROXY` 和 `CACHE_FIX_FALLBACK_PROXIES`。要更改其中之一，先运行 `cache-fix-proxy uninstall-service`，再用新的环境变量和上述步骤运行 `install-service`（更改后的单元不会到达正在服务的代理，而卸载会结束该代理，因此会中断一次）。单独运行 `uninstall-service` 可干净移除（停止、禁用、删除）。
+安装的配置会在安装时从环境变量中读取 `CACHE_FIX_PROXY_PORT`、`CACHE_FIX_PROXY_UPSTREAM`、`CACHE_FIX_DEBUG`、上游跳点（`CACHE_FIX_UPSTREAM_PROXY`，默认取安装时的 `HTTPS_PROXY`）、`NO_PROXY`、`CACHE_FIX_FALLBACK_PROXIES` 和 `CACHE_FIX_WATCH_DEPLOY_MS`（默认 `5000`；磁盘上的 `proxy/` 变化时会替换代理子进程）。要更改其中之一，先运行 `cache-fix-proxy uninstall-service`，再用新的环境变量和上述步骤运行 `install-service`（更改后的单元不会到达正在服务的代理，而卸载会结束该代理，因此会中断一次）。单独运行 `uninstall-service` 可干净移除（停止、禁用、删除）。
 
 该服务运行 `cache-fix-proxy run-service`，即端口持有者：它监督代理，并在崩溃或 reload 期间保持该地址。
 
@@ -453,7 +453,7 @@ launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchct
 
 原进程仍存活时，该信号完成代理交接；此后由 `kickstart`（不带表示重启的 `-k`）完成。
 
-由早期版本安装的单元或 plist 运行的是裸代理，没有 reload。请用 `cache-fix-proxy install-service --force`、`systemctl --user daemon-reload`、`systemctl --user restart cache-fix-proxy` 迁移一次（launchd：`bootout` + `bootstrap`）；这一次重启就是最后一次中断。
+由早期版本安装的单元或 plist 运行的是裸代理，没有 reload。请用 `cache-fix-proxy install-service --force`、`systemctl --user daemon-reload`、`systemctl --user restart cache-fix-proxy` 迁移一次（launchd：`bootout` + `bootstrap`）；这一次重启就是该端口最后一次拒绝连接。
 
 ### 流程 2 —— 在监督层恢复热重载
 

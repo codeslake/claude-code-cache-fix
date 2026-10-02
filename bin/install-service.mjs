@@ -242,6 +242,13 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
+// The unit / plist carries the install-time HTTPS_PROXY, credentials included. writeFile's mode
+// applies only when it creates the file, so a file --force overwrites is made 0600 BEFORE the write.
+const writePrivate = async (path, text) => {
+  await chmod(path, 0o600).catch((e) => { if (e.code !== "ENOENT") throw e; });
+  await writeFile(path, text, { mode: 0o600 });
+};
+
 async function installSystemd({ paths, defaults, force = false } = {}) {
   paths = paths || getPaths("linux");
   defaults = defaults || getDefaults();
@@ -265,10 +272,7 @@ async function installSystemd({ paths, defaults, force = false } = {}) {
     ...defaults,
   });
   await mkdir(paths.configDir, { recursive: true });
-  // The unit carries the install-time HTTPS_PROXY, credentials included. writeFile's
-  // mode applies only when it creates the file, so --force over a 0644 one needs the chmod.
-  await writeFile(targetPath, rendered, { mode: 0o600 });
-  await chmod(targetPath, 0o600);
+  await writePrivate(targetPath, rendered);
 
   // Healthcheck companion: oneshot service + timer. Auto-recovery from any
   // proxy stop, including clean stops where Restart=on-failure does NOT fire
@@ -364,8 +368,7 @@ async function installLaunchd({ paths, defaults, force = false } = {}) {
     ...defaults,
   });
   await mkdir(paths.configDir, { recursive: true });
-  await writeFile(targetPath, rendered, { mode: 0o600 }); // the plist carries the hop too
-  await chmod(targetPath, 0o600);
+  await writePrivate(targetPath, rendered);
   return { ok: true, path: targetPath };
 }
 
@@ -419,9 +422,16 @@ const CHANGE_SETTINGS =
 async function install({ force = false, plat } = {}) {
   const paths = getPaths(plat);
   if (paths.kind === "unsupported") {
+    let port;
+    try {
+      ({ port } = getDefaults());
+    } catch (err) {
+      return reportFsError("install-service", err);
+    }
+    // run-service exits 2 without a port, and drops an ambient HTTPS_PROXY unless the hop is named.
     process.stderr.write(
       `[install-service] Unsupported platform: ${paths.platform}\n` +
-        `Manual install: run \`${process.execPath} ${LAUNCHER_PATH} run-service\` under your platform's service manager.\n`,
+        `Manual install: run \`CACHE_FIX_PROXY_PORT=${port} [CACHE_FIX_UPSTREAM_PROXY=<hop>] ${process.execPath} ${LAUNCHER_PATH} run-service\` under your platform's service manager.\n`,
     );
     return 1;
   }

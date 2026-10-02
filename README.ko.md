@@ -259,7 +259,7 @@ launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-설치된 구성은 설치 시 환경 변수에서 `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`, 업스트림 홉(`CACHE_FIX_UPSTREAM_PROXY`, 기본값은 설치 시점의 `HTTPS_PROXY`), `NO_PROXY`, `CACHE_FIX_FALLBACK_PROXIES`를 읽습니다. 변경하려면 `cache-fix-proxy uninstall-service`를 실행한 뒤 새 환경 변수와 위 단계로 `install-service`를 다시 실행합니다(변경된 유닛은 서비스 중인 프록시에 도달하지 않으며, 제거가 그 프록시를 종료하므로 한 번 끊깁니다). `uninstall-service`만 실행하면 깨끗하게 제거(중지, 비활성화, 삭제)됩니다.
+설치된 구성은 설치 시 환경 변수에서 `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`, 업스트림 홉(`CACHE_FIX_UPSTREAM_PROXY`, 기본값은 설치 시점의 `HTTPS_PROXY`), `NO_PROXY`, `CACHE_FIX_FALLBACK_PROXIES`, `CACHE_FIX_WATCH_DEPLOY_MS`(기본값 `5000`, 디스크에서 `proxy/`가 바뀌면 프록시 자식 프로세스를 교체)를 읽습니다. 변경하려면 `cache-fix-proxy uninstall-service`를 실행한 뒤 새 환경 변수와 위 단계로 `install-service`를 다시 실행합니다(변경된 유닛은 서비스 중인 프록시에 도달하지 않으며, 제거가 그 프록시를 종료하므로 한 번 끊깁니다). `uninstall-service`만 실행하면 깨끗하게 제거(중지, 비활성화, 삭제)됩니다.
 
 서비스는 `cache-fix-proxy run-service`를 실행합니다. 이는 포트 홀더로, 프록시를 감독하며 크래시나 reload가 있어도 주소를 유지합니다.
 
@@ -453,7 +453,7 @@ launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchct
 
 신호는 원래 프로세스가 살아 있는 동안 에이전트를 인계하며, 그 이후에는 `kickstart`(재시작인 `-k` 없이)가 인계합니다.
 
-이전 버전이 설치한 유닛 또는 plist는 홀더 없이 프록시를 직접 실행하며 reload가 없습니다. `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy`(launchd: `bootout` + `bootstrap`)로 한 번 마이그레이션하세요. 이 재시작 한 번이 마지막 중단입니다.
+이전 버전이 설치한 유닛 또는 plist는 홀더 없이 프록시를 직접 실행하며 reload가 없습니다. `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy`(launchd: `bootout` + `bootstrap`)로 한 번 마이그레이션하세요. 이 재시작 한 번이 포트가 연결을 거부하는 마지막 순간입니다.
 
 ### 흐름 2 — 관리자 레벨에서 핫리로드 재활성화
 

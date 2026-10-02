@@ -398,7 +398,7 @@ launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchct
 
 Le signal passe le relais tant que le processus d'origine est vivant ; ensuite `kickstart` (sans `-k`, qui redémarre) s'en charge.
 
-Une unité ou un plist installé par une version antérieure exécute le proxy nu et n'a pas de reload. Migrez-le une fois avec `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd : `bootout` + `bootstrap`) ; ce redémarrage unique est la dernière coupure.
+Une unité ou un plist installé par une version antérieure exécute le proxy nu et n'a pas de reload. Migrez-le une fois avec `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd : `bootout` + `bootstrap`) ; ce redémarrage unique est la dernière fois que le port refuse les connexions.
 
 ### Flux 2 — réactivation du hot-reload au niveau superviseur
 

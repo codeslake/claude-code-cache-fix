@@ -512,17 +512,23 @@ test("installSystemd / installLaunchd: the file ends 0600, fresh or --force over
       await chmod(target, 0o644);
       assert.ok((await fn({ paths, defaults, force: true })).ok);
       assert.equal((await stat(target)).mode & 0o777, 0o600, `${paths.kind}: --force over 0644`);
+      // The chmod comes BEFORE the write: a write into a read-only file succeeds only once it is 0600
+      // (root writes anyway, so there the case proves nothing, and passes).
+      await chmod(target, 0o444);
+      assert.ok((await fn({ paths, defaults, force: true })).ok, `${paths.kind}: --force over 0444`);
+      assert.equal((await stat(target)).mode & 0o777, 0o600, `${paths.kind}: --force over 0444 ends 0600`);
     }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("install(): an unsupported platform's hint runs the launcher's run-service, not the bare proxy", async () => {
+test("install(): an unsupported platform's hint runs the launcher's run-service as it must be run: with the port, and the hop it would otherwise drop", async () => {
   let code;
-  const err = (await capture(process.stderr, async () => { code = await install({ plat: "freebsd" }); })).join("");
+  const err = (await withEnv({ CACHE_FIX_PROXY_PORT: "9811" }, () =>
+    capture(process.stderr, async () => { code = await install({ plat: "freebsd" }); }))).join("");
   assert.equal(code, 1);
-  assert.match(err, /claude-via-proxy\.mjs run-service/);
+  assert.match(err, /CACHE_FIX_PROXY_PORT=9811 \[CACHE_FIX_UPSTREAM_PROXY=<hop>\] \S+ \S*claude-via-proxy\.mjs run-service/);
   assert.doesNotMatch(err, /server\.mjs/);
 });
 

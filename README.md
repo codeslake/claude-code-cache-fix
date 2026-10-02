@@ -369,7 +369,7 @@ launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-The installed config picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`, the upstream hop (`CACHE_FIX_UPSTREAM_PROXY`, defaulting to the install-time `HTTPS_PROXY`), `NO_PROXY` and `CACHE_FIX_FALLBACK_PROXIES` from the env at install time. To change one, run `cache-fix-proxy uninstall-service`, then `install-service` with the new env and the steps above (a changed unit never reaches the serving proxy, and the uninstall ends it, so this cuts once). `uninstall-service` alone removes the service cleanly (stops, disables, deletes).
+The installed config picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`, the upstream hop (`CACHE_FIX_UPSTREAM_PROXY`, defaulting to the install-time `HTTPS_PROXY`), `NO_PROXY`, `CACHE_FIX_FALLBACK_PROXIES` and `CACHE_FIX_WATCH_DEPLOY_MS` (default `5000`; swaps the proxy child when `proxy/` changes on disk) from the env at install time. To change one, run `cache-fix-proxy uninstall-service`, then `install-service` with the new env and the steps above (a changed unit never reaches the serving proxy, and the uninstall ends it, so this cuts once). `uninstall-service` alone removes the service cleanly (stops, disables, deletes).
 
 The service runs `cache-fix-proxy run-service`, the port holder: it supervises the proxy and keeps the address across a crash or a reload.
 
@@ -564,7 +564,7 @@ launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchct
 
 The signal hands the agent over while its original process lives; afterwards `kickstart` (without `-k`, which restarts) does it.
 
-A unit or plist installed by an earlier version runs the bare proxy and has no reload. Migrate it once with `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd: `bootout` + `bootstrap`); that one restart is the last cut.
+A unit or plist installed by an earlier version runs the bare proxy and has no reload. Migrate it once with `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd: `bootout` + `bootstrap`); that one restart is the last time the port refuses connections.
 
 ### Flow 2 — opt back into hot-reload at the supervisor layer
 
