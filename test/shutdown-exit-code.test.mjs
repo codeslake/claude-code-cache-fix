@@ -1214,6 +1214,13 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       `a stop under a LIVE HOLDER got ${pick(false, false, true, {})}ms — back on the ` +
       `ceiling that cut 4, 3, 1 and 7 in-flight replies on one host, 15 in total, ` +
       `every one at 5s with no predicate installed`);
+    // THE ORPHAN: HELD_BY names a holder that is gone, so heldByLiveHolder is false
+    // and the 5s ceiling applied, yet nothing waits on its exit either. The `{}` row
+    // above is the other half: a standalone server and a handover successor (HELD_BY
+    // cleared) never have the marker.
+    assert.ok(pick(false, false, false, { CACHE_FIX_HELD_BY: "999999" }) >= 600_000,
+      "an orphaned proxy (HELD_BY set, holder gone) is on the 5s ceiling, which cut " +
+      "every stream it still carried after a holder SIGKILL");
     assert.ok(pick(true, false, false, {}) >= 600_000,
       `a HANDOVER got ${pick(true, false, false, {})}ms — nothing waits on that path and the ` +
       `short budget is what cut 16 mid-response replies on the last deploy`);

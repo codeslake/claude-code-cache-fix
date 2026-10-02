@@ -1024,7 +1024,9 @@ test("the self-heal successor keeps a way to report", () => {
   const close = src.indexOf(".unref()", at);
   assert.ok(close > at, "the self-heal spawn's call no longer ends in .unref() — re-anchor this guard");
   const opts = src.slice(at, close);
-  const stdio = /stdio:\s*("[^"]*"|\[[^\]]*\])/.exec(opts);
+  // THE WHOLE ARRAY, nested brackets included: a spread such as `...(x ? [3] : [])`
+  // ended a plain `[^\]]*` at its first `]` and left a truncated array that parsed.
+  const stdio = /stdio:\s*("[^"]*"|\[(?:[^\[\]]|\[[^\]]*\])*\])/.exec(opts);
   assert.ok(stdio, "the self-heal spawn no longer names its stdio at all");
   assert.notEqual(stdio[1], '"ignore"',
     'the self-heal successor is spawned with stdio "ignore", so the holder it ' +

@@ -309,10 +309,18 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // Measured on CI run 31137828018 (node 18 only): "cut 6 connection(s) ...
   // ERR:503" named neither, and the case reproduces on no local run — 9 of 9
   // green, 8 of them under saturating load.
+  //
+  // A FRESH SOCKET PER PROBE, AND A CUT REPLY IS AN ANSWER. node 19+ keeps the
+  // global agent's sockets alive: a probe after a stalled loop reuses one the
+  // server already closed and reads ECONNRESET (measured, a 19s case). And a
+  // reply cut after its headers emits 'close' but never 'end', so this promise
+  // never settled and the file hung with no child and no handle left (measured:
+  // inspector on the idle runner, one test started and never ended).
   const get = () => new Promise((res) => {
-    http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
+    http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 }, (r) => {
       let b = ""; r.on("data", (d) => (b += d));
       r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
+      r.on("close", () => res("ERR:ECONNRESET"));
     }).on("error", (e) => res(`ERR:${e.code}`));
   });
   // pgrep, never a pid arithmetic shortcut: `process.kill(0, ...)` signals the
@@ -1028,7 +1036,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           `ephemeral port nothing will reclaim`);
       } finally {
         try { holder.kill("SIGKILL"); } catch {}
-        if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
+        // Only while still ours: the case has asserted it dead, and a gone pid can be reused.
+        if (kid > 1 && OURS.test(cmdOf(kid))) { try { process.kill(kid, "SIGKILL"); } catch {} }
         // THE SUCCESSOR THIS CASE CAUSED. A child whose holder dies does not
         // simply exit — it spawns a DETACHED replacement on the advertised port,
         // which is the whole point of the self-heal. That successor is nobody's
@@ -1060,7 +1069,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             let parent = 0;
             try { parent = Number(execFileSync("ps", ["-p", pid, "-o", "ppid="],
                     { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch {}
-            if (parent > 1) { try { process.kill(parent, "SIGKILL"); } catch {} }
+            if (parent > 1 && OURS.test(cmdOf(parent))) { try { process.kill(parent, "SIGKILL"); } catch {} }
             try { process.kill(Number(pid), "SIGKILL"); } catch {}
           }
           await new Promise((r) => setTimeout(r, 200));
@@ -1085,11 +1094,13 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // /health with a 503 and a JSON body of its own. readyBody() is the test;
       // the body rides along on a failure for the reason withHeldPort's does.
       const get = () => new Promise((res) => {
-        http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
+        http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 3_000 }, (r) => {
           let b = ""; r.on("data", (d) => (b += d));
           r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
+          r.on("close", () => res("ERR:ECONNRESET"));
         }).on("error", (e) => res(`ERR:${e.code}`));
       });
+      let refused = 0, reset = 0, probing = false;
       const first = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       try {
         let lastBody;
@@ -1103,6 +1114,22 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
 
         // SIGKILL, the shape a supervisor cannot catch: OOM, container stop, kill -9.
         first.kill("SIGKILL");
+        // A 5 ms CONNECT PROBE ACROSS THE WHOLE HEAL. Measured, 4 runs: refused
+        // 27/27/106/107, because the new holder could not bind beside the orphan
+        // and asked it (and the dead holder's standby) to let go, so the listener
+        // was gone 121-541 ms. A connect, not a request: what is under test is
+        // whether the ADDRESS ever refuses, which a standby's 503 would hide.
+        probing = true;
+        const pump = (async () => {
+          while (probing) {
+            await new Promise((r) => {
+              const c = net.connect(port, "127.0.0.1");
+              c.on("connect", () => { c.destroy(); r(); });
+              c.on("error", (e) => { if (e.code === "ECONNREFUSED") refused++; else if (e.code === "ECONNRESET") reset++; r(); });
+            });
+            await new Promise((r) => setTimeout(r, 5));
+          }
+        })();
         const healed = Date.now() + 20_000;
         let back = false;
         while (!back && Date.now() < healed) {
@@ -1112,6 +1139,28 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         assert.ok(back,
           "the port stayed unowned after its holder was killed — every session wired " +
           "to that address is stranded, which is the outage this guards");
+
+        // ONE HOLDER, ONE PROXY AND ONE STANDBY once the orphan has left. The dead
+        // holder's standby is armed and holds this socket, and a second armed
+        // acceptor is the 60-of-125-reset shape, so the heal has to retire it.
+        const census = () => {
+          const cmds = onPort(port).map(cmdOf);
+          const n = (re) => cmds.filter((c) => re.test(c)).length;
+          return { holders: n(/run-service/), proxies: n(/server\.mjs/), relays: n(/gap-relay/) };
+        };
+        let now = census(), stable = 0;
+        for (const by = Date.now() + 20_000; stable < 2 && Date.now() < by;) {
+          await new Promise((r) => setTimeout(r, 250));
+          now = census();
+          stable = now.holders === 1 && now.proxies === 1 && now.relays === 1 ? stable + 1 : 0;
+        }
+        probing = false;
+        await pump;
+        assert.deepEqual({ refused, reset }, { refused: 0, reset: 0 },
+          "the port refused or reset connects while the new holder took it over — the heal " +
+          "released the socket and rebound it instead of adopting the orphan's");
+        assert.deepEqual(now, { holders: 1, proxies: 1, relays: 1 },
+          "the healed lineage did not settle on one holder, one proxy and one standby");
 
         // SERVED IS NOT SUPERVISED, and only the second one survives the NEXT
         // kill. The orphaned proxy keeps the port by itself, so a health probe
@@ -1144,6 +1193,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           "the port is served but no run-service supervises the listener — the heal " +
           "restored the ADDRESS and not the supervision, so the next crash is an outage");
       } finally {
+        probing = false;
         try { first.kill("SIGKILL"); } catch {}
         // Reap the HEALED holder, the one this test asked to be born.
         //
@@ -1168,10 +1218,14 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             if (!Number.isInteger(pid) || pid <= 1) continue;
             // The holder ABOVE the listener, so killing the listener cannot
             // trigger another heal; the listener itself when it has no holder.
+            // A detached successor is reparented to init or a subreaper (systemd
+            // --user, the agent process), so the parent is signalled only when
+            // its own command line is ours.
             let target = pid;
-            try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
-                                               { encoding: "utf8" }).trim()) || pid; } catch {}
-            if (target <= 1) target = pid;
+            try {
+              const up = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim());
+              if (up > 1 && OURS.test(cmdOf(up))) target = up;
+            } catch {}
             try { process.kill(target, "SIGTERM"); } catch {}
           }
           await new Promise((r) => setTimeout(r, 800));
@@ -1402,10 +1456,14 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             if (!Number.isInteger(pid) || pid <= 1) continue;
             // The holder ABOVE the listener, so killing the listener cannot
             // trigger another heal; the listener itself when it has no holder.
+            // A detached successor is reparented to init or a subreaper (systemd
+            // --user, the agent process), so the parent is signalled only when
+            // its own command line is ours.
             let target = pid;
-            try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
-                                               { encoding: "utf8" }).trim()) || pid; } catch {}
-            if (target <= 1) target = pid;
+            try {
+              const up = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim());
+              if (up > 1 && OURS.test(cmdOf(up))) target = up;
+            } catch {}
             try { process.kill(target, "SIGTERM"); } catch {}
           }
           await new Promise((r) => setTimeout(r, 800));
@@ -2209,6 +2267,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           "with duplicate detection disabled — it says so itself and comes up anyway");
       } finally {
         try { p.kill("SIGKILL"); } catch { }
+        // The SIGKILL arms the holder's standby, which then carries [::1]:port until
+        // this file exits. listeners() asks lsof for 127.0.0.1 and cannot see it;
+        // onPort() finds it by the port in its environment.
+        for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
       }
     });
 
