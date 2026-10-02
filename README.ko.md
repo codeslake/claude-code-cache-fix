@@ -247,7 +247,7 @@ systemctl --user enable --now cache-fix-proxy-healthcheck.timer   # 자동 복�
 sudo loginctl enable-linger $USER   # 선택: 로그인 시가 아닌 부팅 시 시작
 ```
 
-**자동 복구 (Linux):** `install-service`는 건강 검사 동반자(`cache-fix-proxy-healthcheck.service` + `.timer`)를 추가합니다. 타이머는 2분마다 작동하며, 단일 실행 서비스는 `curl -fs http://127.0.0.1:<port>/health`를 실행하고 프로브가 실패하면 `systemctl --user start cache-fix-proxy.service`를 실행합니다. 이는 2분 내에 모든 중단(정상 또는 비정상, 예상 또는 예상치 못한)에서 프록시를 복구합니다. 배경: `Restart=on-failure`는 정상 종료 시 작동하지 않으므로 이 동반자가 없었을 때 어떤 출처의 `systemctl stop` (2026-04-25 Anthropic 다운 중에도 불명확한 출처)은 프록시를 무기한 다운시켰습니다. macOS는 동반자가 필요하지 않습니다 — launchd의 `KeepAlive`가 모든 종료 시 자동 재시작합니다.
+**자동 복구 (Linux):** `install-service`는 건강 검사 동반자(`cache-fix-proxy-healthcheck.service` + `.timer`)를 추가합니다. 타이머는 2분마다 작동하며, 단일 실행 서비스는 `curl -fs http://127.0.0.1:<port>/health`를 실행하고 프로브가 실패하면 `systemctl --user start cache-fix-proxy.service`를 실행합니다. 이는 2분 내에 모든 중단(정상 또는 비정상, 예상 또는 예상치 못한)에서 프록시를 복구합니다. 배경: `Restart=on-failure`는 정상 종료 시 작동하지 않으므로 이 동반자가 없었을 때 어떤 출처의 `systemctl stop` (2026-04-25 Anthropic 다운 중에도 불명확한 출처)은 프록시를 무기한 다운시켰습니다. macOS는 동반자가 필요하지 않습니다 — launchd의 `KeepAlive`가 실패한 종료 후 에이전트를 재시작합니다(인계는 0으로 종료하므로 재시작하지 않습니다).
 
 macOS에서:
 
@@ -257,9 +257,9 @@ launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-설치된 구성은 설치 시 환경 변수에서 `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`를 읽습니다. 환경 변수 변경 후 `install-service --force`를 재실행하여 재생성하거나 직접 서비스 파일을 편집합니다. `cache-fix-proxy uninstall-service`와 함께 사용하여 깨끗하게 제거(중지, 비활성화, 삭제)할 수 있습니다.
+설치된 구성은 설치 시 환경 변수에서 `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`, 업스트림 홉(`CACHE_FIX_UPSTREAM_PROXY`, 기본값은 설치 시점의 `HTTPS_PROXY`), `NO_PROXY`, `CACHE_FIX_FALLBACK_PROXIES`를 읽습니다. 변경하려면 `cache-fix-proxy uninstall-service`를 실행한 뒤 새 환경 변수와 위 단계로 `install-service`를 다시 실행합니다(변경된 유닛은 서비스 중인 프록시에 도달하지 않으며, 제거가 그 프록시를 종료하므로 한 번 끊깁니다). `uninstall-service`만 실행하면 깨끗하게 제거(중지, 비활성화, 삭제)됩니다.
 
-서비스는 `cache-fix-proxy server`를 포그라운드에서 실행하며, 이는 래퍼 모드의 claude 래퍼가 아닌 프록시 자체입니다.
+서비스는 `cache-fix-proxy run-service`를 실행합니다. 이는 포트 홀더로, 프록시를 감독하며 크래시나 reload가 있어도 주소를 유지합니다.
 
 **수동 (모든 플랫폼):**
 

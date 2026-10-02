@@ -247,7 +247,7 @@ systemctl --user enable --now cache-fix-proxy-healthcheck.timer   # 自动恢复
 sudo loginctl enable-linger $USER   # 可选：在开机时启动，而非仅在登录时启动
 ```
 
-**自动恢复（Linux）：** `install-service` 还会放置一个健康检查伴生项（`cache-fix-proxy-healthcheck.service` + `.timer`）。定时器每 2 分钟触发一次；oneshot 服务运行 `curl -fs http://127.0.0.1:<port>/health`，如果探测失败则执行 `systemctl --user start cache-fix-proxy.service`。这可以在 2 分钟内从任何停止中恢复代理——无论是正常还是异常、预期还是意外的停止。背景说明：`Restart=on-failure` 不会在正常停止时触发，所以在有此伴生项之前，任何来源的 `systemctl stop`（包括 2026 年 4 月 25 日 Anthropic 宕机期间的不明来源停止）都会让代理无限期宕机。macOS 不需要伴生项——launchd 的 `KeepAlive` 已经会在任何退出时自动重启。
+**自动恢复（Linux）：** `install-service` 还会放置一个健康检查伴生项（`cache-fix-proxy-healthcheck.service` + `.timer`）。定时器每 2 分钟触发一次；oneshot 服务运行 `curl -fs http://127.0.0.1:<port>/health`，如果探测失败则执行 `systemctl --user start cache-fix-proxy.service`。这可以在 2 分钟内从任何停止中恢复代理——无论是正常还是异常、预期还是意外的停止。背景说明：`Restart=on-failure` 不会在正常停止时触发，所以在有此伴生项之前，任何来源的 `systemctl stop`（包括 2026 年 4 月 25 日 Anthropic 宕机期间的不明来源停止）都会让代理无限期宕机。macOS 不需要伴生项——launchd 的 `KeepAlive` 会在失败退出后重启代理（交接以 0 退出，不会被重启）。
 
 在 macOS 上：
 
@@ -257,9 +257,9 @@ launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-安装的配置会在安装时从环境变量中读取 `CACHE_FIX_PROXY_PORT`、`CACHE_FIX_PROXY_UPSTREAM` 和 `CACHE_FIX_DEBUG`。在环境变量变更后，重新运行 `install-service --force` 以重新生成，或直接编辑服务文件。配合 `cache-fix-proxy uninstall-service` 可干净移除（停止、禁用、删除）。
+安装的配置会在安装时从环境变量中读取 `CACHE_FIX_PROXY_PORT`、`CACHE_FIX_PROXY_UPSTREAM`、`CACHE_FIX_DEBUG`、上游跳点（`CACHE_FIX_UPSTREAM_PROXY`，默认取安装时的 `HTTPS_PROXY`）、`NO_PROXY` 和 `CACHE_FIX_FALLBACK_PROXIES`。要更改其中之一，先运行 `cache-fix-proxy uninstall-service`，再用新的环境变量和上述步骤运行 `install-service`（更改后的单元不会到达正在服务的代理，而卸载会结束该代理，因此会中断一次）。单独运行 `uninstall-service` 可干净移除（停止、禁用、删除）。
 
-该服务在前台运行 `cache-fix-proxy server`，这仅是代理本身，不含包装模式的 claude 启动器。
+该服务运行 `cache-fix-proxy run-service`，即端口持有者：它监督代理，并在崩溃或 reload 期间保持该地址。
 
 **手动方式（任意平台）：**
 

@@ -357,7 +357,7 @@ systemctl --user enable --now cache-fix-proxy-healthcheck.timer   # auto-recover
 sudo loginctl enable-linger $USER   # optional: start on boot, not just on login
 ```
 
-**Auto-recovery (Linux):** `install-service` also drops a healthcheck companion (`cache-fix-proxy-healthcheck.service` + `.timer`). The timer fires every 2 minutes; the oneshot service runs `curl -fs http://127.0.0.1:<port>/health` and `systemctl --user start cache-fix-proxy.service` if the probe fails. This recovers the proxy from any stop — clean or unclean, expected or unexpected — within 2 minutes. Background: `Restart=on-failure` doesn't fire on clean stops, so before this companion existed, a `systemctl stop` from any source (including unidentified ones during an Anthropic outage on 2026-04-25) would leave the proxy down indefinitely. macOS doesn't need the companion — launchd's `KeepAlive` already auto-restarts on any exit.
+**Auto-recovery (Linux):** `install-service` also drops a healthcheck companion (`cache-fix-proxy-healthcheck.service` + `.timer`). The timer fires every 2 minutes; the oneshot service runs `curl -fs http://127.0.0.1:<port>/health` and `systemctl --user start cache-fix-proxy.service` if the probe fails. This recovers the proxy from any stop — clean or unclean, expected or unexpected — within 2 minutes. Background: `Restart=on-failure` doesn't fire on clean stops, so before this companion existed, a `systemctl stop` from any source (including unidentified ones during an Anthropic outage on 2026-04-25) would leave the proxy down indefinitely. macOS doesn't need the companion — launchd's `KeepAlive` restarts the agent after a failed exit (a handover exits 0 and is not restarted).
 
 On macOS:
 
@@ -367,9 +367,9 @@ launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-The installed config picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, and `CACHE_FIX_DEBUG` from the env at install time. Re-run `install-service --force` to regenerate after env changes, or edit the service file directly. Pair with `cache-fix-proxy uninstall-service` to remove cleanly (stops, disables, deletes).
+The installed config picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`, the upstream hop (`CACHE_FIX_UPSTREAM_PROXY`, defaulting to the install-time `HTTPS_PROXY`), `NO_PROXY` and `CACHE_FIX_FALLBACK_PROXIES` from the env at install time. To change one, run `cache-fix-proxy uninstall-service`, then `install-service` with the new env and the steps above (a changed unit never reaches the serving proxy, and the uninstall ends it, so this cuts once). `uninstall-service` alone removes the service cleanly (stops, disables, deletes).
 
-The service runs `cache-fix-proxy server` in the foreground, which is just the proxy without the wrapper-mode claude launcher.
+The service runs `cache-fix-proxy run-service`, the port holder: it supervises the proxy and keeps the address across a crash or a reload.
 
 **Manual (any platform):**
 
