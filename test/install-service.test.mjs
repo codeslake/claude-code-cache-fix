@@ -1045,6 +1045,8 @@ test("uninstall(): a unit that names no port lists the default port", async () =
   idx(calls, "lsof -nP -t -iTCP:9878 -sTCP:LISTEN");
 });
 
+const SETTINGS_LINE = "\nTo change an installed service's settings, run `cache-fix-proxy uninstall-service`, then install-service with the new settings and the steps above; the uninstall ends the running proxy, so this one cuts.\n";
+
 test("install-service: next steps reload, never restart; a missing lsof warns and the install continues", { skip: platform() !== "linux" }, async () => {
   const dir = await newTmp();
   try {
@@ -1059,6 +1061,9 @@ test("install-service: next steps reload, never restart; a missing lsof warns an
     // tracks, so a reload alone works once; `start` then hands over to it.
     assert.ok(noLsof.stdout.includes("\n  systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy\n"));
     assert.doesNotMatch(noLsof.stdout, /systemctl --user restart/);
+    // A changed unit never reaches the serving lineage: only an uninstall ends it.
+    assert.ok(noLsof.stdout.includes(SETTINGS_LINE));
+    assert.ok(noLsof.stdout.includes("or does nothing when the proxy/ tree is the same."));
     assert.match(noLsof.stderr, /lsof/, "no lsof on PATH must warn");
     // Control: the same install with an lsof on PATH is silent, so the warning
     // above came from the missing binary and not from anything else on stderr.
@@ -1080,6 +1085,8 @@ test("install(): the launchd next steps update by SIGUSR2, then kickstart withou
     const id = "gui/$(id -u)/com.cnighswonger.cache-fix-proxy";
     assert.ok(out.includes(`\n  launchctl kill SIGUSR2 ${id} || launchctl kickstart ${id}\n`), out);
     assert.doesNotMatch(out, /kickstart -k/);
+    assert.ok(out.includes(SETTINGS_LINE));
+    assert.ok(out.includes("or does nothing when the proxy/ tree is the same."));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

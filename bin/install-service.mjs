@@ -118,8 +118,8 @@ function getPaths(plat = platform()) {
       configFile: "com.cnighswonger.cache-fix-proxy.plist",
       label: "com.cnighswonger.cache-fix-proxy",
       logDir: join(homedir(), "Library", "Logs"),
-      // launchd's KeepAlive already auto-restarts the agent on any exit
-      // (clean or unclean), so a separate healthcheck isn't needed on macOS.
+      // launchd's KeepAlive (SuccessfulExit=false) restarts the agent on any unclean
+      // exit (a handover exits 0), so a separate healthcheck isn't needed on macOS.
     };
   }
   return { kind: "unsupported", platform: plat };
@@ -404,6 +404,12 @@ async function uninstallLaunchd({ paths } = {}) {
   return { ok: true, path: targetPath };
 }
 
+// A changed unit never reaches the serving lineage: start finds a holder on the
+// same proxy/ tree and exits as surplus. Only an uninstall ends the lineage.
+const CHANGE_SETTINGS =
+  "To change an installed service's settings, run `cache-fix-proxy uninstall-service`, then install-service " +
+  "with the new settings and the steps above; the uninstall ends the running proxy, so this one cuts.\n";
+
 async function install({ force = false, plat } = {}) {
   const paths = getPaths(plat);
   if (paths.kind === "unsupported") {
@@ -450,7 +456,8 @@ async function install({ force = false, plat } = {}) {
         `  loginctl enable-linger ${process.env.USER || "<your-user>"}      # optional: start on boot vs login\n\n` +
         `After a package update, hand over, never restart (a restart cuts in-flight requests):\n` +
         `  systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy\n` +
-        `Why both: after the first reload the serving holder is a successor the unit no longer tracks, so reload alone works once; start hands over to it, or does nothing when the code is the same.\n` +
+        `Why both: after the first reload the serving holder is a successor the unit no longer tracks, so reload alone works once; start hands over to it, or does nothing when the proxy/ tree is the same.\n` +
+        CHANGE_SETTINGS +
         `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
     return 0;
@@ -475,7 +482,8 @@ async function install({ force = false, plat } = {}) {
         `  launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n\n` +
         `After a package update, hand over, never restart (a restart cuts in-flight requests):\n` +
         `  launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
-        `Why both: after the first handover the serving holder is a successor the job no longer tracks, so the signal works once; kickstart (no -k) hands over to it, or does nothing when the code is the same.\n` +
+        `Why both: after the first handover the serving holder is a successor the job no longer tracks, so the signal works once; kickstart (no -k) hands over to it, or does nothing when the proxy/ tree is the same.\n` +
+        CHANGE_SETTINGS +
         `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
     return 0;
