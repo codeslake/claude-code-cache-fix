@@ -497,6 +497,20 @@ function reportFsError(prefix, err) {
   return 1;
 }
 
+// SIGHUP every process listening on the installed unit's port. After the first
+// reload the serving lineage is a detached successor the supervisor no longer
+// tracks (launchd: the job has no PID), so only the port finds it. The holder,
+// the proxy child and a standby all hold that socket and all release on SIGHUP;
+// stop's SIGTERM would leave a standby carrying it.
+async function endLineage(unitPath) {
+  const port = /CACHE_FIX_PROXY_PORT(?:=|<\/key>\s*<string>)(\d+)/.exec(await readFile(unitPath, "utf-8").catch(() => ""))?.[1]
+    ?? getDefaults().port;
+  const r = spawnSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf-8", timeout: 5000 });
+  for (const pid of (r.stdout || "").split("\n").filter(Boolean)) {
+    try { process.kill(Number(pid), "SIGHUP"); } catch { /* already gone */ }
+  }
+}
+
 async function uninstall({ plat } = {}) {
   const paths = getPaths(plat);
   if (paths.kind === "unsupported") {
@@ -505,12 +519,10 @@ async function uninstall({ plat } = {}) {
   }
   if (paths.kind === "systemd") {
     // Best-effort stop + disable for the healthcheck companion FIRST so it
-    // doesn't immediately restart the proxy we're about to stop.
+    // doesn't immediately restart the proxy we're about to end.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy-healthcheck.timer"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy-healthcheck.timer"]);
-    // SIGHUP first: stop's SIGTERM leaves a standby carrying the port, and only
-    // SIGHUP ends it. `kill` reaches every process of the unit, not just MAINPID.
-    await runCmd("systemctl", ["--user", "kill", "-s", "HUP", "cache-fix-proxy"]);
+    await endLineage(join(paths.configDir, paths.configFile));
     // Then stop + disable the main service.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy"]);
@@ -534,8 +546,7 @@ async function uninstall({ plat } = {}) {
   }
   if (paths.kind === "launchd") {
     const targetPath = join(paths.configDir, paths.configFile);
-    // SIGHUP first, as for systemd: bootout's SIGTERM leaves a standby carrying.
-    await runCmd("launchctl", ["kill", "SIGHUP", `gui/${process.getuid()}/${paths.label}`]);
+    await endLineage(targetPath);
     await runCmd("launchctl", ["bootout", `gui/${process.getuid()}`, targetPath]);
     let r;
     try {

@@ -1,6 +1,7 @@
 import { createServer } from "node:net";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { appendFileSync } from "node:fs";
 import { mkdtemp, readFile, writeFile, rm, readdir, mkdir } from "node:fs/promises";
 import { tmpdir, platform } from "node:os";
 import { join, dirname } from "node:path";
@@ -986,53 +987,62 @@ test("getDefaults: a fallback proxy variable naming the service's own port is no
   assert.match(warned[0], /CACHE_FIX_UPSTREAM_PROXY/);
 });
 
-// Stand-ins for BOTH service managers' CLIs that only log their argv, so a case
-// can read the ORDER uninstall() issued its commands in. Both, so a case whose
-// platform branch is wrong still never reaches the host's real service manager.
-async function fakeBins(dir) {
-  const bin = join(dir, "bin");
-  const log = join(dir, "calls.log");
-  await mkdir(bin);
-  for (const n of ["systemctl", "launchctl"]) await writeFile(join(bin, n), `#!/bin/sh\necho "${n} $*" >> "${log}"\n`, { mode: 0o755 });
-  return { bin, log };
+// Stand-ins for BOTH service managers' CLIs and for lsof that only log their
+// argv, and a process.kill that only logs, so a case can read the ORDER uninstall()
+// issued its commands and signals in, and never reaches a real service manager
+// or a real pid. Both managers, so a case whose platform branch is wrong still
+// stays off the host's real one.
+async function uninstallCalls(plat, unitName, unitText, env = {}) {
+  const dir = await newTmp();
+  const realKill = process.kill;
+  try {
+    const bin = join(dir, "bin");
+    const log = join(dir, "calls.log");
+    await mkdir(bin);
+    for (const n of ["systemctl", "launchctl"]) await writeFile(join(bin, n), `#!/bin/sh\necho "${n} $*" >> "${log}"\n`, { mode: 0o755 });
+    await writeFile(join(bin, "lsof"), `#!/bin/sh\necho "lsof $*" >> "${log}"\necho 4242\necho 4243\n`, { mode: 0o755 });
+    const unitDir = plat === "linux" ? join(dir, ".config", "systemd", "user") : join(dir, "Library", "LaunchAgents");
+    await mkdir(unitDir, { recursive: true });
+    await writeFile(join(unitDir, unitName), unitText);
+    process.kill = (pid, sig) => (appendFileSync(log, `kill ${sig} ${pid}\n`), true);
+    await withEnv({ HOME: dir, PATH: `${bin}:${process.env.PATH}`, ...env }, async () => {
+      assert.equal(await uninstall({ plat }), 0);
+    });
+    return (await readFile(log, "utf-8")).split("\n");
+  } finally {
+    process.kill = realKill;
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
-test("uninstall(): systemd SIGHUPs the unit before it stops it", async () => {
-  const dir = await newTmp();
-  try {
-    const { bin, log } = await fakeBins(dir);
-    const unitDir = join(dir, ".config", "systemd", "user");
-    await mkdir(unitDir, { recursive: true });
-    await writeFile(join(unitDir, "cache-fix-proxy.service"), "");
-    await withEnv({ HOME: dir, PATH: `${bin}:${process.env.PATH}` }, async () => {
-      assert.equal(await uninstall({ plat: "linux" }), 0);
-    });
-    const calls = (await readFile(log, "utf-8")).split("\n");
-    const hup = calls.indexOf("systemctl --user kill -s HUP cache-fix-proxy");
-    assert.ok(hup >= 0 && hup < calls.indexOf("systemctl --user stop cache-fix-proxy"),
-      `SIGHUP must precede stop (the standby only ends on SIGHUP), got:\n${calls.join("\n")}`);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+const idx = (calls, c) => {
+  const i = calls.indexOf(c);
+  assert.ok(i >= 0, `${c} missing, got:\n${calls.join("\n")}`);
+  return i;
+};
+
+test("uninstall(): systemd SIGHUPs every holder of the unit's port, after the timer stops and before the unit stops", async () => {
+  const calls = await uninstallCalls("linux", "cache-fix-proxy.service", "[Service]\nEnvironment=CACHE_FIX_PROXY_PORT=9877\n");
+  const [timer, list, k1, k2, stop] = [
+    "systemctl --user stop cache-fix-proxy-healthcheck.timer", "lsof -nP -t -iTCP:9877 -sTCP:LISTEN",
+    "kill SIGHUP 4242", "kill SIGHUP 4243", "systemctl --user stop cache-fix-proxy",
+  ].map((c) => idx(calls, c));
+  assert.ok(timer < list && list < k1 && k1 < k2 && k2 < stop, `order wrong, got:\n${calls.join("\n")}`);
+  assert.ok(!calls.some((c) => c.startsWith("systemctl --user kill")), "the unit no longer tracks the serving holder");
 });
 
-test("uninstall(): launchd SIGHUPs the job before bootout", async () => {
-  const dir = await newTmp();
-  try {
-    const { bin, log } = await fakeBins(dir);
-    const agents = join(dir, "Library", "LaunchAgents");
-    await mkdir(agents, { recursive: true });
-    await writeFile(join(agents, "com.cnighswonger.cache-fix-proxy.plist"), "");
-    await withEnv({ HOME: dir, PATH: `${bin}:${process.env.PATH}` }, async () => {
-      assert.equal(await uninstall({ plat: "darwin" }), 0);
-    });
-    const calls = (await readFile(log, "utf-8")).split("\n");
-    const hup = calls.indexOf(`launchctl kill SIGHUP gui/${process.getuid()}/com.cnighswonger.cache-fix-proxy`);
-    assert.ok(hup >= 0 && hup < calls.findIndex((c) => c.startsWith("launchctl bootout")),
-      `SIGHUP must precede bootout, got:\n${calls.join("\n")}`);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+test("uninstall(): launchd SIGHUPs every holder of the plist's port before bootout", async () => {
+  const calls = await uninstallCalls("darwin", "com.cnighswonger.cache-fix-proxy.plist",
+    "<key>CACHE_FIX_PROXY_PORT</key>\n        <string>9877</string>\n");
+  const [list, k1, k2] = ["lsof -nP -t -iTCP:9877 -sTCP:LISTEN", "kill SIGHUP 4242", "kill SIGHUP 4243"].map((c) => idx(calls, c));
+  const boot = calls.findIndex((c) => c.startsWith("launchctl bootout"));
+  assert.ok(list < k1 && k1 < k2 && k2 < boot, `order wrong, got:\n${calls.join("\n")}`);
+  assert.ok(!calls.some((c) => c.startsWith("launchctl kill")), "the job has no PID once a successor serves");
+});
+
+test("uninstall(): a unit that names no port lists the default port", async () => {
+  const calls = await uninstallCalls("linux", "cache-fix-proxy.service", "", { CACHE_FIX_PROXY_PORT: "9878" });
+  idx(calls, "lsof -nP -t -iTCP:9878 -sTCP:LISTEN");
 });
 
 test("install-service: next steps reload, never restart; a missing lsof warns and the install continues", { skip: platform() !== "linux" }, async () => {
