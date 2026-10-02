@@ -181,6 +181,7 @@ test("every test file that spawns the launcher or relay carries a lineage marker
   // Files that mention the binaries' paths but never spawn them, with why:
   const EXEMPT = {
     "proxy-hop-fallback.test.mjs": "reads gap-relay.mjs's source as text (a portOf() regex extraction); never spawns the real binary",
+    "other-holder-etime.test.mjs": "reads claude-via-proxy.mjs's source as text (lifts otherHolderOn by regex); never spawns the real binary",
   };
   // A THIRD BINARY SPAWNS detached:true TOO: proxy/server.mjs. It is also an
   // importable module (startProxy, capOwnLog, ...), so a bare path-text match
