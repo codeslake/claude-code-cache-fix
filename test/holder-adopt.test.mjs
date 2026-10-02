@@ -7,7 +7,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, w
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { HOP_ENV, cmdOf, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, onPort } from "./proc-helpers.mjs";
 
 // A HOLDER THAT ADOPTS ITS PREDECESSOR'S SOCKET, started the way a handover
 // starts one: the listening socket on fd 3 and the two handover variables. It
@@ -19,6 +19,15 @@ const sleeper = join(scratch, "sleeper.mjs");
 writeFileSync(sleeper, "setInterval(() => {}, 1e6);\n");
 after(() => rmSync(scratch, { recursive: true, force: true }));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// reap() below runs in a case's `finally`, which an abort skips. This hook is the
+// backstop, and it signals only pids THIS file spawned, and only while their
+// command line is still one of ours: a pid that has exited can be reused.
+const spawned = new Set();
+const track = (p) => { spawned.add(p.pid); return p; };
+process.on("exit", () => {
+  for (const pid of spawned) if (OURS.test(cmdOf(pid))) { try { process.kill(pid, "SIGKILL"); } catch { } }
+});
 
 // `script` is a symlink to the launcher, so the command line the scan reads is
 // the one under test while the code that runs is the real one. `alongside` are
@@ -36,8 +45,8 @@ async function adopt(script, { env: extra = {}, alongside = [] } = {}) {
                        // tell", so on a box saturated by sibling files the 2s default
                        // leaves the stale relay alone and this reads as a defect.
                        CACHE_FIX_PROBE_TIMEOUT_MS: "20000" });
-  const others = alongside.map((p) => spawn(process.execPath, [link(sleeper, p)], { stdio: ["ignore", "ignore", "ignore", fd] }));
-  const holder = spawn(process.execPath, [link(launcher, script), "run-service"], { env, stdio: ["ignore", "ignore", "ignore", fd] });
+  const others = alongside.map((p) => track(spawn(process.execPath, [link(sleeper, p)], { stdio: ["ignore", "ignore", "ignore", fd] })));
+  const holder = track(spawn(process.execPath, [link(launcher, script), "run-service"], { env, stdio: ["ignore", "ignore", "ignore", fd] }));
   sock.close();   // the holder keeps the listening socket; this copy must not accept
   return { holder, port, others };
 }
