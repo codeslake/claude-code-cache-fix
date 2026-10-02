@@ -13,6 +13,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir, platform } from "node:os";
+import { setTimeout as sleep } from "node:timers/promises";
 import { systemdEscape, xmlEscape } from "../proxy/helpers.mjs";
 import { upstreamPointsAtSelf } from "../proxy/server.mjs";
 
@@ -28,10 +29,11 @@ function getDefaults() {
   // set, so the install-time hop is captured under that name (proxy/config.mjs
   // precedence) or the service dials direct. A fallback that names the
   // service's own port (a shell wired through this proxy) is no hop: the child
-  // refuses it at start and run-service respawns it for ever.
+  // refuses it at start and run-service respawns it for ever. HTTP_PROXY is
+  // not a fallback: config.mjs reads it for plain-http targets only.
   let upstreamProxy = process.env.CACHE_FIX_UPSTREAM_PROXY || "";
   if (!upstreamProxy) {
-    const name = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"].find((k) => process.env[k]);
+    const name = ["HTTPS_PROXY", "https_proxy"].find((k) => process.env[k]);
     upstreamProxy = process.env[name] || "";
     if (upstreamPointsAtSelf(upstreamProxy, port)) {
       process.stderr.write(
@@ -505,21 +507,46 @@ function reportFsError(prefix, err) {
   return 1;
 }
 
+const listeners = (port) => {
+  const r = spawnSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf-8", timeout: 5000 });
+  return { error: r.error, pids: (r.stdout || "").split("\n").filter(Boolean) };
+};
+
 // SIGHUP every process listening on the installed unit's port. After the first
 // reload the serving lineage is a detached successor the supervisor no longer
 // tracks (launchd: the job has no PID), so only the port finds it. The holder,
 // the proxy child and a standby all hold that socket and all release on SIGHUP;
-// stop's SIGTERM would leave a standby carrying it.
-async function endLineage(unitPath) {
-  const port = /CACHE_FIX_PROXY_PORT(?:=|<\/key>\s*<string>)(\d+)/.exec(await readFile(unitPath, "utf-8").catch(() => ""))?.[1]
-    ?? getDefaults().port;
-  const r = spawnSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf-8", timeout: 5000 });
-  for (const pid of (r.stdout || "").split("\n").filter(Boolean)) {
+// stop's SIGTERM would leave a standby carrying it. The holder keeps the socket
+// while its child drains, and a reinstall started inside that window exits as
+// surplus and leaves nothing serving, so wait (up to drainMs) until the port is free.
+async function endLineage(paths, drainMs) {
+  const unitText = await readFile(join(paths.configDir, paths.configFile), "utf-8").catch(() => null);
+  if (unitText === null) return; // nothing installed, nothing to signal
+  const port = /CACHE_FIX_PROXY_PORT(?:=|<\/key>\s*<string>)(\d+)/.exec(unitText)?.[1] ?? getDefaults().port;
+  let { error, pids } = listeners(port);
+  if (error) {
+    const lead = `[uninstall-service] warning: lsof could not be run (is it on PATH?), so the proxy on port ${port} could not be found; `;
+    if (paths.kind === "systemd") {
+      process.stderr.write(lead + "the unit's cgroup was sent SIGHUP instead, which misses a successor outside it, so the port may stay held.\n");
+      await runCmd("systemctl", ["--user", "kill", "-s", "HUP", "cache-fix-proxy"]);
+    } else {
+      process.stderr.write(lead + "the port may stay held.\n");
+    }
+    return;
+  }
+  for (const pid of pids) {
     try { process.kill(Number(pid), "SIGHUP"); } catch { /* already gone */ }
+  }
+  for (const deadline = Date.now() + drainMs; pids.length && Date.now() < deadline;) {
+    await sleep(100);
+    pids = listeners(port).pids;
+  }
+  if (pids.length) {
+    process.stderr.write(`[uninstall-service] warning: port ${port} is still held by pid ${pids.join(", ")} after ${drainMs / 1000} s; continuing.\n`);
   }
 }
 
-async function uninstall({ plat } = {}) {
+async function uninstall({ plat, drainMs = 10000 } = {}) {
   const paths = getPaths(plat);
   if (paths.kind === "unsupported") {
     process.stderr.write(`[uninstall-service] Unsupported platform: ${paths.platform}\n`);
@@ -530,7 +557,7 @@ async function uninstall({ plat } = {}) {
     // doesn't immediately restart the proxy we're about to stop.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy-healthcheck.timer"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy-healthcheck.timer"]);
-    await endLineage(join(paths.configDir, paths.configFile));
+    await endLineage(paths, drainMs);
     // Then stop + disable the main service.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy"]);
@@ -554,7 +581,7 @@ async function uninstall({ plat } = {}) {
   }
   if (paths.kind === "launchd") {
     const targetPath = join(paths.configDir, paths.configFile);
-    await endLineage(targetPath);
+    await endLineage(paths, drainMs);
     await runCmd("launchctl", ["bootout", `gui/${process.getuid()}`, targetPath]);
     let r;
     try {

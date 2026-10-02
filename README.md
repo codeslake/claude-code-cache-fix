@@ -348,6 +348,8 @@ Detects your platform and writes the appropriate config:
 - **Linux** → `~/.config/systemd/user/cache-fix-proxy.service` (systemd user unit)
 - **macOS** → `~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist` (launchd agent)
 
+The service needs `lsof` on `PATH`: `run-service` finds the process holding its port with it.
+
 The output prints the next-step commands to enable and start the service. On Linux:
 
 ```bash

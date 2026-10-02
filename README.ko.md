@@ -238,6 +238,8 @@ cache-fix-proxy install-service
 - **Linux** → `~/.config/systemd/user/cache-fix-proxy.service` (systemd 사용자 유닛)
 - **macOS** → `~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist` (launchd 에이전트)
 
+서비스에는 `PATH`에 `lsof`가 필요합니다: `run-service`가 이것으로 자신의 포트를 점유한 프로세스를 찾습니다.
+
 출력은 서비스를 활성화하고 시작하는 다음 단계 명령어를 출력합니다. Linux에서:
 
 ```bash

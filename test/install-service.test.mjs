@@ -964,7 +964,7 @@ test("getDefaults: the hop follows the proxy's own precedence; NO_PROXY, fallbac
     assert.equal(getDefaults().watchDeployMs, "1000");
   });
   await withEnv({ ...none, HTTP_PROXY: "http://127.0.0.1:8118" }, () => {
-    assert.equal(getDefaults().upstreamProxy, "http://127.0.0.1:8118", "HTTP_PROXY alone is the hop, as config.mjs reads it");
+    assert.equal(getDefaults().upstreamProxy, "", "HTTP_PROXY alone is no hop: config.mjs reads it for plain-http targets only, not the https upstream");
   });
 });
 
@@ -991,24 +991,34 @@ test("getDefaults: a fallback proxy variable naming the service's own port is no
 // argv, and a process.kill that only logs, so a case can read the ORDER uninstall()
 // issued its commands and signals in, and never reaches a real service manager
 // or a real pid. Both managers, so a case whose platform branch is wrong still
-// stays off the host's real one.
-async function uninstallCalls(plat, unitName, unitText, env = {}) {
+// stays off the host's real one. The lsof lists two pids for its first `lists`
+// calls and none after (the holder draining); `noLsof` leaves it off PATH. A
+// null unitText installs no unit. The result carries uninstall()'s stderr as `.stderr`.
+async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, noLsof = false, drainMs = 300 } = {}) {
   const dir = await newTmp();
   const realKill = process.kill;
   try {
     const bin = join(dir, "bin");
     const log = join(dir, "calls.log");
+    const count = join(dir, "lsof.count");
     await mkdir(bin);
     for (const n of ["systemctl", "launchctl"]) await writeFile(join(bin, n), `#!/bin/sh\necho "${n} $*" >> "${log}"\n`, { mode: 0o755 });
-    await writeFile(join(bin, "lsof"), `#!/bin/sh\necho "lsof $*" >> "${log}"\necho 4242\necho 4243\n`, { mode: 0o755 });
+    if (!noLsof) {
+      await writeFile(join(bin, "lsof"),
+        `#!/bin/sh\necho "lsof $*" >> "${log}"\nn=0; [ -f "${count}" ] && read n < "${count}"\nn=$((n+1)); echo $n > "${count}"\n` +
+        `[ $n -le ${lists} ] && echo 4242 && echo 4243\nexit 0\n`, { mode: 0o755 });
+    }
     const unitDir = plat === "linux" ? join(dir, ".config", "systemd", "user") : join(dir, "Library", "LaunchAgents");
     await mkdir(unitDir, { recursive: true });
-    await writeFile(join(unitDir, unitName), unitText);
+    if (unitText !== null) await writeFile(join(unitDir, unitName), unitText);
     process.kill = (pid, sig) => (appendFileSync(log, `kill ${sig} ${pid}\n`), true);
-    await withEnv({ HOME: dir, PATH: `${bin}:${process.env.PATH}`, ...env }, async () => {
-      assert.equal(await uninstall({ plat }), 0);
+    let stderr;
+    await withEnv({ HOME: dir, PATH: noLsof ? bin : `${bin}:${process.env.PATH}`, ...env }, async () => {
+      stderr = await capture(process.stderr, async () => {
+        assert.equal(await uninstall({ plat, drainMs }), unitText === null ? 1 : 0);
+      });
     });
-    return (await readFile(log, "utf-8")).split("\n");
+    return Object.assign((await readFile(log, "utf-8")).split("\n"), { stderr: stderr.join("") });
   } finally {
     process.kill = realKill;
     await rm(dir, { recursive: true, force: true });
@@ -1028,7 +1038,7 @@ test("uninstall(): systemd SIGHUPs every holder of the unit's port, after the ti
     "kill SIGHUP 4242", "kill SIGHUP 4243", "systemctl --user stop cache-fix-proxy",
   ].map((c) => idx(calls, c));
   assert.ok(timer < list && list < k1 && k1 < k2 && k2 < stop, `order wrong, got:\n${calls.join("\n")}`);
-  assert.ok(!calls.some((c) => c.startsWith("systemctl --user kill")), "the unit no longer tracks the serving holder");
+  assert.ok(!calls.some((c) => c.startsWith("systemctl --user kill")), "with lsof working the supervisor is not asked to kill");
 });
 
 test("uninstall(): launchd SIGHUPs every holder of the plist's port before bootout", async () => {
@@ -1043,6 +1053,60 @@ test("uninstall(): launchd SIGHUPs every holder of the plist's port before booto
 test("uninstall(): a unit that names no port lists the default port", async () => {
   const calls = await uninstallCalls("linux", "cache-fix-proxy.service", "", { CACHE_FIX_PROXY_PORT: "9878" });
   idx(calls, "lsof -nP -t -iTCP:9878 -sTCP:LISTEN");
+});
+
+const SYSTEMD = ["linux", "cache-fix-proxy.service", "[Service]\nEnvironment=CACHE_FIX_PROXY_PORT=9877\n"];
+const LAUNCHD = ["darwin", "com.cnighswonger.cache-fix-proxy.plist", "<key>CACHE_FIX_PROXY_PORT</key>\n        <string>9877</string>\n"];
+const lsofCalls = (calls) => calls.filter((c) => c.startsWith("lsof "));
+const endIdx = (calls) => calls.findIndex((c) => c === "systemctl --user stop cache-fix-proxy" || c.startsWith("launchctl bootout"));
+
+test("uninstall(): no unit file means nothing installed, so no lsof, no signal and no default port read", async () => {
+  // A port getDefaults() throws on, and a hop that names the port it would warn on.
+  for (const env of [{ CACHE_FIX_PROXY_PORT: "not-a-port" }, { CACHE_FIX_PROXY_PORT: "9879", HTTPS_PROXY: "http://127.0.0.1:9879" }]) {
+    for (const [plat, name] of [SYSTEMD, LAUNCHD]) {
+      const calls = await uninstallCalls(plat, name, null, env);
+      assert.deepEqual(calls.filter((c) => /^(lsof|kill) /.test(c)), [], `${plat}: nothing may be listed or signalled`);
+      assert.doesNotMatch(calls.stderr, /own port/);
+    }
+  }
+});
+
+test("uninstall(): returns only once the port is free: lsof is polled until it lists no pid, before stop/bootout", async () => {
+  for (const [plat, name, text] of [SYSTEMD, LAUNCHD]) {
+    const calls = await uninstallCalls(plat, name, text, {}, { lists: 2, drainMs: 5000 });
+    assert.equal(lsofCalls(calls).length, 3, `${plat}: the listing, then two polls, the last empty, got:\n${calls.join("\n")}`);
+    assert.equal(calls.filter((c) => c.startsWith("kill ")).length, 2, "only the first listing is signalled");
+    assert.ok(calls.lastIndexOf(lsofCalls(calls)[0]) < endIdx(calls), `${plat}: the stop waits for the port`);
+  }
+});
+
+test("uninstall(): a port still held at the bound warns with the port and the pids, and the uninstall continues", async () => {
+  for (const [plat, name, text] of [SYSTEMD, LAUNCHD]) {
+    const calls = await uninstallCalls(plat, name, text, {}, { lists: 99999 });
+    assert.ok(lsofCalls(calls).length > 2, `${plat}: polled until the bound`);
+    assert.match(calls.stderr, /9877/);
+    assert.match(calls.stderr, /4242/);
+    assert.match(calls.stderr, /4243/);
+    assert.ok(endIdx(calls) > 0, `${plat}: the uninstall continues`);
+  }
+});
+
+test("uninstall(): systemd with no lsof asks the unit's cgroup to SIGHUP and warns with the port", async () => {
+  const calls = await uninstallCalls(...SYSTEMD, {}, { noLsof: true });
+  const [timer, kill, stop] = ["systemctl --user stop cache-fix-proxy-healthcheck.timer", "systemctl --user kill -s HUP cache-fix-proxy",
+    "systemctl --user stop cache-fix-proxy"].map((c) => idx(calls, c));
+  assert.ok(timer < kill && kill < stop, `order wrong, got:\n${calls.join("\n")}`);
+  assert.match(calls.stderr, /lsof/);
+  assert.match(calls.stderr, /9877/);
+});
+
+test("uninstall(): launchd with no lsof warns that the proxy was not found and the port may stay held, and boots out", async () => {
+  const calls = await uninstallCalls(...LAUNCHD, {}, { noLsof: true });
+  assert.ok(calls.some((c) => c.startsWith("launchctl bootout")), "the uninstall continues");
+  assert.ok(!calls.some((c) => c.startsWith("launchctl kill")), "no supervisor call reaches an untracked successor");
+  assert.match(calls.stderr, /lsof/);
+  assert.match(calls.stderr, /9877/);
+  assert.match(calls.stderr, /held/);
 });
 
 const SETTINGS_LINE = "\nTo change an installed service's settings, run `cache-fix-proxy uninstall-service`, then install-service with the new settings and the steps above; the uninstall ends the running proxy, so this one cuts.\n";

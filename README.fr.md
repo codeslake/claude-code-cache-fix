@@ -218,6 +218,8 @@ Détecte votre plateforme et écrit la configuration appropriée :
 - **Linux** → `~/.config/systemd/user/cache-fix-proxy.service` (unité utilisateur systemd)
 - **macOS** → `~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist` (agent launchd)
 
+Le service a besoin de `lsof` dans le `PATH` : `run-service` s'en sert pour trouver le processus qui tient son port.
+
 Sur Linux :
 
 ```bash

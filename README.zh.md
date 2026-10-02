@@ -238,6 +238,8 @@ cache-fix-proxy install-service
 - **Linux** → `~/.config/systemd/user/cache-fix-proxy.service`（systemd 用户单元）
 - **macOS** → `~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist`（launchd 代理）
 
+服务需要 `PATH` 中有 `lsof`：`run-service` 用它查找占用其端口的进程。
+
 输出会打印启用和启动服务的后续命令。在 Linux 上：
 
 ```bash
