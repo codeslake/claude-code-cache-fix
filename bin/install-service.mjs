@@ -402,10 +402,10 @@ async function install({ force = false } = {}) {
   }
   // run-service finds the process holding its port with lsof; without it a
   // takeover exits 0 and `start` silently does nothing.
-  if (spawnSync("lsof", ["-v"], { stdio: "ignore" }).error) {
+  if (spawnSync("lsof", ["-v"], { stdio: "ignore", timeout: 5000 }).error) {
     process.stderr.write(
-      "[install-service] warning: lsof is not on PATH; run-service needs it to find the process " +
-        "holding its port, so install lsof or a takeover will do nothing.\n",
+      "[install-service] warning: lsof could not be run (is it on PATH?); run-service needs it to " +
+        "find the process holding its port, so install lsof or a takeover will do nothing.\n",
     );
   }
   if (paths.kind === "systemd") {

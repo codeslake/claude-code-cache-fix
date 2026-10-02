@@ -1012,9 +1012,10 @@ test("install-service: next steps reload, never restart; a missing lsof warns an
   try {
     const bin = join(dir, "bin");
     await mkdir(bin);
-    const run = () => execFileP(process.execPath, [BIN, "install-service", "--force"], {
-      env: { ...process.env, HOME: dir, PATH: bin },
-    });
+    // The launcher honours CACHE_FIX_REQUIRE_HOP, so an exported one is dropped.
+    const env = { ...process.env, HOME: dir, PATH: bin };
+    delete env.CACHE_FIX_REQUIRE_HOP;
+    const run = () => execFileP(process.execPath, [BIN, "install-service", "--force"], { env });
     const noLsof = await run();
     assert.match(noLsof.stdout, /systemctl --user reload cache-fix-proxy/);
     assert.match(noLsof.stderr, /lsof/, "no lsof on PATH must warn");
