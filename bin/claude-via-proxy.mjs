@@ -161,7 +161,18 @@ class HolderSocket extends EventEmitter {
         // started: every deploy hands the port on, and a successor that skipped
         // it left the address with nothing behind the proxy again.
         this.openStandby();
+        // THE DEAD HOLDER'S STANDBY, retired without a cut. Nothing releases it
+        // on this path, and a second armed acceptor on one socket is the 60-of-125
+        // reset shape. SIGHUP closes its server and lets what it carries finish;
+        // we hold the socket, so closing it opens no window. A proxy is never
+        // signalled here, only a gap-relay that is not ours. AFTER `listening`:
+        // the scan shells out, and connections that arrive meanwhile queue with
+        // nobody accepting, on every deploy, including the ones that find nothing.
+        const own = this._standby?.pid;
         queueMicrotask(() => this.emit("listening"));
+        setImmediate(() => {
+          for (const p of relaysOn(this._port, own)) { try { process.kill(p, "SIGHUP"); } catch { } }
+        });
         return this;
       }
       try { adopted.close(); } catch { }
@@ -628,6 +639,21 @@ function holderPidOn(port) {
     if (/\brun-service\b/.test(psOf(ppid))) return holderVerdict(port, ppid);
   }
   return pid;
+}
+
+// Every gap-relay LISTENing on <port> but `except` and ourselves: every process
+// holding an adopted socket is in lsof's answer, this one included. The relay is
+// matched as its SCRIPT path, not the word: "gap-relay" anywhere in a command
+// line is also an install path that merely contains it.
+function relaysOn(port, except) {
+  let out = "";
+  try {
+    out = probe("lsof", ["-nP", "-t", `-iTCP@${lsofAddr()}:${port}`, "-sTCP:LISTEN"]);
+  } catch { return []; }
+  return out.trim().split("\n").map(Number).filter((p) => {
+    if (!Number.isInteger(p) || p <= 1 || p === except || p === process.pid) return false;
+    try { return /\/bin\/gap-relay\.mjs(?:\s|$)/.test(probe("ps", ["-p", String(p), "-o", "command="])); } catch { return false; }
+  });
 }
 
 // Another `run-service` that already holds this address, older than us.

@@ -1569,7 +1569,7 @@ function say(stream, text) {
   try { stream.write(text); } catch { /* supervisor's pipe is gone; keep serving */ }
 }
 
-function exitWithParent() {
+function exitWithParent(getActive) {
   // TWO BEHAVIOURS, AND ONLY ONE IS OPTIONAL. Noticing the parent is gone and
   // EXITING must always happen; putting a new holder back on the port is what
   // an operator may want off.
@@ -1623,14 +1623,30 @@ function exitWithParent() {
   // that legitimately changes on every handover.
   const heldBy = process.env.CACHE_FIX_HELD_BY;
   const advertised = process.env.CACHE_FIX_HELD_PORT;
-  setInterval(() => {
+  // THE HANDLE, so a successor already spawned can stop this tick from firing
+  // again. Unassigned before, this ran unclearable forever: a fast-dying
+  // successor (or one that just takes longer than the tick to come up) left
+  // us re-entering every tick while we were already spawning or waiting for
+  // it, and a KILLED holder produced a whole ladder of successors — measured,
+  // 2 "holder died; started a new one" lines from ONE orphan in 20s, and
+  // dozens more of the same orphan's children on a box left running for days.
+  const healTick = setInterval(() => {
     // Two facts, both free, and no probe: the marker outlives the holder
     // because it is our own environment, while our ppid moves to 1 the instant
     // the holder dies. The two disagreeing IS the orphaning. `born` is no
     // longer consulted — it could not tell a dead holder from a predecessor
     // that exited on purpose.
-    if (releasingPort) return;          // asked to let go: do not resurrect the lineage
+    if (releasingPort) { clearInterval(healTick); return; }  // asked to let go: do not resurrect the lineage
     if (!heldBy || heldBy === String(process.ppid)) return;
+    // A DEPLOY'S ORPHAN LOOKS THE SAME. A reload signals us and exits at once, not
+    // waiting for the release, and timers run before the poll phase that reads that
+    // signal: a tick due while we were busy sees `releasingPort` false. Judged one
+    // loop later (the check phase, after the poll), the signal has always been read.
+    // A holder that was killed has none pending, so it proceeds as before. What
+    // follows, down to the `process.exit` below, is that later judgement, left
+    // at its old indentation so the lines it wraps stay as they were.
+    setImmediate(() => {
+    if (releasingPort) return;
     // The holder is gone and every session on this box has HTTPS_PROXY baked at
     // exec — they cannot be re-pointed, so the address must get an owner back.
     // Measured on <linux-host>: the holder died, nothing revived it, and every session
@@ -1643,6 +1659,11 @@ function exitWithParent() {
     // The respawn is the part `off` turns off. We still exit below.
     if (advertised && process.env.CACHE_FIX_SELF_HEAL !== "off") {
       try {
+        // Only a socket the holder handed us and we still listen on: one we bound
+        // ourselves cannot be adopted, and a stop under a live holder has already
+        // closed fd 3 (it may now be another descriptor altogether).
+        const a = getActive();
+        const adopt = a?.inheritedSocket && a.server.listening;
         spawn(process.execPath, [join(__dirname, "..", "bin", "claude-via-proxy.mjs"), "run-service"], {
           // fd2 INHERITED, NOT DISCARDED. `stdio: "ignore"` sent all three to
           // /dev/null, which silences the holder this becomes, every proxy it
@@ -1665,7 +1686,11 @@ function exitWithParent() {
           // Inheriting a pipe that later breaks is safe: the EPIPE /
           // ERR_STREAM_DESTROYED swallower above keeps a write to a dead
           // stderr out of uncaughtException.
-          detached: true, stdio: ["ignore", "ignore", "inherit"],
+          // ADOPT, DO NOT REBIND: our listening socket goes down as fd 3, so the
+          // holder takes its adoption branch and never has to release us and bind.
+          // Measured, kill -9 of the holder: refused 27/27/106/107 on a 5 ms
+          // connect probe, the listener gone 121-541 ms, while it rebound.
+          detached: true, stdio: ["ignore", "ignore", "inherit", ...(adopt ? [3] : [])],
           // HELD_BY is cleared with HELD_PORT. It named OUR holder, which is the
           // one that just died; carrying it into the replacement makes a live
           // holder look "held" by a pid that is not its parent. Nothing acts on
@@ -1674,8 +1699,14 @@ function exitWithParent() {
           // successor's inherited EXIT_WITH_PARENT and the rival holder before
           // it. Clear it where it stops being true.
           env: { ...process.env, CACHE_FIX_PROXY_PORT: advertised,
-                 CACHE_FIX_HELD_PORT: undefined, CACHE_FIX_HELD_BY: undefined },
+                 CACHE_FIX_HELD_PORT: undefined, CACHE_FIX_HELD_BY: undefined,
+                 ...(adopt && { CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1" }) },
         }).unref();
+        // ONE SUCCESSOR AT A TIME. Cleared here, not after the wait below: the
+        // wait can run past the next 1s tick, and a tick that fires while we
+        // are already waiting for THIS successor would spawn a second one
+        // before the first has even bound the port.
+        clearInterval(healTick);
         process.stderr.write(`[cache-fix] holder died; started a new one on ${advertised}\n`);
         // KEEP SERVING UNTIL THE SUCCESSOR IS UP. Exiting the instant we have
         // spawned a holder leaves the port with no owner for that holder's
@@ -1693,7 +1724,10 @@ function exitWithParent() {
         const wait = setInterval(() => {
           if (Date.now() < until && !successorServing(advertised)) return;
           clearInterval(wait);
-          process.exit(0);
+          // THROUGH shutdown(), NOT process.exit: exit cut every stream this proxy
+          // still carried the moment the successor served (measured, 4 SIGKILLs of
+          // the holder: cut every run, 1.4-1.6 s after). SIGHUP drains them uncapped.
+          process.kill(process.pid, "SIGHUP");
         }, 100);
         wait.unref();
         return;
@@ -1702,6 +1736,7 @@ function exitWithParent() {
       }
     }
     process.exit(0);
+    });
     // Test seam: the poll interval. The guard above is only reachable when a
     // release is still in flight AT a tick, and at one second a fast release
     // finishes between ticks — so the case that pins it passed with the guard
@@ -1713,7 +1748,7 @@ function exitWithParent() {
 
 if (invokedAsScript) {
   let active;
-  exitWithParent();
+  exitWithParent(() => active);
   // Signals FIRST, before the await. `startProxy()` is async — it loads
   // extensions, merges the CA bundle and binds — and until it settles there is
   // no handler, so a SIGTERM in that window gets node's DEFAULT action and the
@@ -1905,7 +1940,9 @@ if (invokedAsScript) {
     // The third holds ONLY while claude-via-proxy.mjs settles in the `stopping`
     // arm of onLine. Separate them and a stop blocks for this whole budget
     // instead of for 5s, which is the downtime the ceiling was bought with.
-    const unwaited = handedOff || handoverRelease || heldByLiveHolder;
+    // `|| HELD_BY` is the ORPHAN: its holder is gone, so nobody waits on its exit
+    // either. A standalone server never has the marker; a handover successor has it cleared.
+    const unwaited = handedOff || handoverRelease || heldByLiveHolder || process.env.CACHE_FIX_HELD_BY;
     const budgetMs = unwaited
       ? drainBudgetMs(process.env.CACHE_FIX_DRAIN_MS, 1_800_000)
       : 5_000;
