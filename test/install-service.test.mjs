@@ -523,13 +523,23 @@ test("installSystemd / installLaunchd: the file ends 0600, fresh or --force over
   }
 });
 
-test("install(): an unsupported platform's hint runs the launcher's run-service as it must be run: with the port, and the hop it would otherwise drop", async () => {
-  let code;
-  const err = (await withEnv({ CACHE_FIX_PROXY_PORT: "9811" }, () =>
-    capture(process.stderr, async () => { code = await install({ plat: "freebsd" }); }))).join("");
-  assert.equal(code, 1);
-  assert.match(err, /CACHE_FIX_PROXY_PORT=9811 \[CACHE_FIX_UPSTREAM_PROXY=<hop>\] \S+ \S*claude-via-proxy\.mjs run-service/);
-  assert.doesNotMatch(err, /server\.mjs/);
+test("install(): an unsupported platform's hint is a command a POSIX shell runs as printed: no hop, no clause; a captured hop, single-quoted", async () => {
+  const none = { CACHE_FIX_UPSTREAM_PROXY: undefined, HTTPS_PROXY: undefined, https_proxy: undefined, CACHE_FIX_PROXY_PORT: "9811" };
+  const hint = async (env) => {
+    let code;
+    const err = (await withEnv({ ...none, ...env }, () =>
+      capture(process.stderr, async () => { code = await install({ plat: "freebsd" }); }))).join("");
+    assert.equal(code, 1);
+    assert.doesNotMatch(err, /server\.mjs/);
+    const cmd = /`([^`]+)`/.exec(err)[1];
+    assert.doesNotMatch(cmd, /[\[\]<>]/);
+    return cmd;
+  };
+  assert.match(await hint({}), /^CACHE_FIX_PROXY_PORT=9811 \S+ \S*claude-via-proxy\.mjs run-service$/);
+  assert.match(await hint({ HTTPS_PROXY: "http://127.0.0.1:8118" }),
+    /^CACHE_FIX_PROXY_PORT=9811 CACHE_FIX_UPSTREAM_PROXY='http:\/\/127\.0\.0\.1:8118' \S+ \S*claude-via-proxy\.mjs run-service$/);
+  assert.match(await hint({ CACHE_FIX_UPSTREAM_PROXY: "http://u:p'x@h:3128" }),
+    /CACHE_FIX_UPSTREAM_PROXY='http:\/\/u:p'\\''x@h:3128' /);
 });
 
 test("help: `server` is not described as what systemd/launchd run; the units run run-service", async () => {

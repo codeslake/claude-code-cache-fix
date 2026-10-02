@@ -422,16 +422,18 @@ const CHANGE_SETTINGS =
 async function install({ force = false, plat } = {}) {
   const paths = getPaths(plat);
   if (paths.kind === "unsupported") {
-    let port;
+    let port, upstreamProxy;
     try {
-      ({ port } = getDefaults());
+      ({ port, upstreamProxy } = getDefaults());
     } catch (err) {
       return reportFsError("install-service", err);
     }
     // run-service exits 2 without a port, and drops an ambient HTTPS_PROXY unless the hop is named.
+    // The line must run as printed: the hop only when captured, single-quoted for POSIX sh.
+    const hop = upstreamProxy ? ` CACHE_FIX_UPSTREAM_PROXY='${upstreamProxy.replaceAll("'", "'\\''")}'` : "";
     process.stderr.write(
       `[install-service] Unsupported platform: ${paths.platform}\n` +
-        `Manual install: run \`CACHE_FIX_PROXY_PORT=${port} [CACHE_FIX_UPSTREAM_PROXY=<hop>] ${process.execPath} ${LAUNCHER_PATH} run-service\` under your platform's service manager.\n`,
+        `Manual install: run \`CACHE_FIX_PROXY_PORT=${port}${hop} ${process.execPath} ${LAUNCHER_PATH} run-service\` under your platform's service manager.\n`,
     );
     return 1;
   }
