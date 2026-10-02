@@ -527,7 +527,7 @@ async function uninstall({ plat } = {}) {
   }
   if (paths.kind === "systemd") {
     // Best-effort stop + disable for the healthcheck companion FIRST so it
-    // doesn't immediately restart the proxy we're about to end.
+    // doesn't immediately restart the proxy we're about to stop.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy-healthcheck.timer"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy-healthcheck.timer"]);
     await endLineage(join(paths.configDir, paths.configFile));
