@@ -9,7 +9,7 @@
 // Pure helpers exported for tests; orchestration lives in main().
 
 import { readFile, writeFile, mkdir, unlink, stat } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir, platform } from "node:os";
@@ -18,11 +18,23 @@ import { systemdEscape, xmlEscape } from "../proxy/helpers.mjs";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_DIR = resolve(__dirname, "..", "templates");
 const SERVER_PATH = resolve(__dirname, "..", "proxy", "server.mjs");
+// The unit runs `run-service` (holds the port, supervises the proxy), not the bare proxy.
+const LAUNCHER_PATH = resolve(__dirname, "claude-via-proxy.mjs");
 
 function getDefaults() {
   return {
     port: validatePort(process.env.CACHE_FIX_PROXY_PORT || "9801"),
     upstream: process.env.CACHE_FIX_PROXY_UPSTREAM || "",
+    // run-service drops HTTPS_PROXY/HTTP_PROXY unless CACHE_FIX_UPSTREAM_PROXY is
+    // set, so the install-time hop is captured under that name (proxy/config.mjs
+    // precedence) or the service dials direct. The proxy itself refuses, at
+    // start, a hop that names its own port.
+    upstreamProxy: process.env.CACHE_FIX_UPSTREAM_PROXY
+      || process.env.HTTPS_PROXY || process.env.https_proxy
+      || process.env.HTTP_PROXY || process.env.http_proxy || "",
+    noProxy: process.env.NO_PROXY || process.env.no_proxy || "",
+    fallbackProxies: process.env.CACHE_FIX_FALLBACK_PROXIES || "",
+    watchDeployMs: process.env.CACHE_FIX_WATCH_DEPLOY_MS || "5000",
     caFile: process.env.CACHE_FIX_PROXY_CA_FILE || "",
     rejectUnauthorized: process.env.CACHE_FIX_PROXY_REJECT_UNAUTHORIZED || "",
     debug: process.env.CACHE_FIX_DEBUG || "",
@@ -100,6 +112,14 @@ function getPaths(plat = platform()) {
   return { kind: "unsupported", platform: plat };
 }
 
+// The captured proxy wiring, set values only (an unset one renders no line).
+const proxyEnv = (vars) => [
+  ["CACHE_FIX_UPSTREAM_PROXY", vars.upstreamProxy],
+  ["NO_PROXY", vars.noProxy],
+  ["CACHE_FIX_FALLBACK_PROXIES", vars.fallbackProxies],
+  ["CACHE_FIX_WATCH_DEPLOY_MS", vars.watchDeployMs],
+].filter(([, v]) => v);
+
 function renderSystemdTemplate(template, vars) {
   const upstreamLine = vars.upstream
     ? `Environment=CACHE_FIX_PROXY_UPSTREAM=${systemdEscape(vars.upstream)}`
@@ -124,10 +144,14 @@ function renderSystemdTemplate(template, vars) {
   const requiresLine = vars.requires
     ? `Requires=${vars.requires}\nAfter=${vars.requires}`
     : "";
+  const proxyEnvLines = proxyEnv(vars)
+    .map(([k, v]) => `Environment=${k}=${systemdEscape(v)}`).join("\n");
   return template
     .replaceAll("{{NODE}}", vars.node)
-    .replaceAll("{{SERVER_PATH}}", vars.serverPath)
+    .replaceAll("{{LAUNCHER_PATH}}", vars.launcherPath)
     .replaceAll("{{PORT}}", vars.port)
+    // A function replacement: a proxy URL's credentials may hold `$&`, `$$`.
+    .replaceAll("{{PROXY_ENV_LINES}}", () => proxyEnvLines)
     .replaceAll("{{UPSTREAM_LINE}}", upstreamLine)
     .replaceAll("{{CA_FILE_LINE}}", caFileLine)
     .replaceAll("{{REJECT_UNAUTHORIZED_LINE}}", rejectUnauthorizedLine)
@@ -159,10 +183,13 @@ function renderLaunchdTemplate(template, vars) {
   const forwardProxyPlist = vars.forwardProxy
     ? `        <key>CACHE_FIX_FORWARD_PROXY</key>\n        <string>${vars.forwardProxy}</string>`
     : "";
+  const proxyEnvPlist = proxyEnv(vars)
+    .map(([k, v]) => `        <key>${k}</key>\n        <string>${xmlEscape(v)}</string>`).join("\n");
   return template
     .replaceAll("{{NODE}}", vars.node)
-    .replaceAll("{{SERVER_PATH}}", vars.serverPath)
+    .replaceAll("{{LAUNCHER_PATH}}", vars.launcherPath)
     .replaceAll("{{PORT}}", vars.port)
+    .replaceAll("{{PROXY_ENV_PLIST}}", () => proxyEnvPlist)
     .replaceAll("{{UPSTREAM_PLIST}}", upstreamPlist)
     .replaceAll("{{CA_FILE_PLIST}}", caFilePlist)
     .replaceAll("{{REJECT_UNAUTHORIZED_PLIST}}", rejectUnauthorizedPlist)
@@ -218,7 +245,7 @@ async function installSystemd({ paths, defaults, force = false } = {}) {
   );
   const rendered = renderSystemdTemplate(template, {
     node: process.execPath,
-    serverPath: SERVER_PATH,
+    launcherPath: LAUNCHER_PATH,
     requires: "",
     ...defaults,
   });
@@ -314,7 +341,7 @@ async function installLaunchd({ paths, defaults, force = false } = {}) {
   );
   const rendered = renderLaunchdTemplate(template, {
     node: process.execPath,
-    serverPath: SERVER_PATH,
+    launcherPath: LAUNCHER_PATH,
     logDir: paths.logDir,
     ...defaults,
   });
@@ -373,6 +400,14 @@ async function install({ force = false } = {}) {
     );
     return 1;
   }
+  // run-service finds the process holding its port with lsof; without it a
+  // takeover exits 0 and `start` silently does nothing.
+  if (spawnSync("lsof", ["-v"], { stdio: "ignore" }).error) {
+    process.stderr.write(
+      "[install-service] warning: lsof is not on PATH; run-service needs it to find the process " +
+        "holding its port, so install lsof or a takeover will do nothing.\n",
+    );
+  }
   if (paths.kind === "systemd") {
     let r;
     try {
@@ -399,7 +434,10 @@ async function install({ force = false } = {}) {
         `  systemctl --user daemon-reload\n` +
         `  systemctl --user enable --now cache-fix-proxy\n` +
         `  systemctl --user enable --now cache-fix-proxy-healthcheck.timer  # auto-recovery if proxy is ever stopped\n` +
-        `  loginctl enable-linger ${process.env.USER || "<your-user>"}      # optional: start on boot vs login\n`,
+        `  loginctl enable-linger ${process.env.USER || "<your-user>"}      # optional: start on boot vs login\n\n` +
+        `After a package update, reload, never restart (a restart cuts in-flight requests):\n` +
+        `  systemctl --user reload cache-fix-proxy\n` +
+        `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
     return 0;
   }
@@ -420,7 +458,10 @@ async function install({ force = false } = {}) {
         `Next steps:\n` +
         `  launchctl bootstrap gui/$(id -u) ${r.path}\n` +
         `  launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
-        `  launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n`,
+        `  launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n\n` +
+        `After a package update, reload, never restart (a restart cuts in-flight requests):\n` +
+        `  launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
+        `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
     return 0;
   }
@@ -441,8 +482,8 @@ function reportFsError(prefix, err) {
   return 1;
 }
 
-async function uninstall() {
-  const paths = getPaths();
+async function uninstall({ plat } = {}) {
+  const paths = getPaths(plat);
   if (paths.kind === "unsupported") {
     process.stderr.write(`[uninstall-service] Unsupported platform: ${paths.platform}\n`);
     return 1;
@@ -452,6 +493,9 @@ async function uninstall() {
     // doesn't immediately restart the proxy we're about to stop.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy-healthcheck.timer"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy-healthcheck.timer"]);
+    // SIGHUP first: stop's SIGTERM leaves a standby carrying the port, and only
+    // SIGHUP ends it. `kill` reaches every process of the unit, not just MAINPID.
+    await runCmd("systemctl", ["--user", "kill", "-s", "HUP", "cache-fix-proxy"]);
     // Then stop + disable the main service.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy"]);
@@ -475,6 +519,8 @@ async function uninstall() {
   }
   if (paths.kind === "launchd") {
     const targetPath = join(paths.configDir, paths.configFile);
+    // SIGHUP first, as for systemd: bootout's SIGTERM leaves a standby carrying.
+    await runCmd("launchctl", ["kill", "SIGHUP", `gui/${process.getuid()}/${paths.label}`]);
     await runCmd("launchctl", ["bootout", `gui/${process.getuid()}`, targetPath]);
     let r;
     try {

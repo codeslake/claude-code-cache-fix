@@ -14,6 +14,7 @@ import {
   renderHealthcheckServiceTemplate,
   renderHealthcheckTimerTemplate,
   getPaths,
+  getDefaults,
   validatePort,
   InvalidPortError,
   installSystemd,
@@ -23,6 +24,7 @@ import {
   uninstallSystemdHealthcheck,
   uninstallLaunchd,
   install,
+  uninstall,
   TEMPLATE_DIR,
 } from "../bin/install-service.mjs";
 
@@ -36,7 +38,7 @@ async function newTmp() {
 
 const sampleVars = {
   node: "/usr/local/bin/node",
-  serverPath: "/opt/cache-fix/proxy/server.mjs",
+  launcherPath: "/opt/cache-fix/bin/claude-via-proxy.mjs",
   port: "9801",
   upstream: "",
   caFile: "",
@@ -51,7 +53,7 @@ const sampleVars = {
 test("renderSystemdTemplate: substitutes core fields", async () => {
   const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
   const out = renderSystemdTemplate(tpl, sampleVars);
-  assert.ok(out.includes("ExecStart=/usr/local/bin/node /opt/cache-fix/proxy/server.mjs"));
+  assert.ok(out.includes("ExecStart=/usr/local/bin/node /opt/cache-fix/bin/claude-via-proxy.mjs run-service"));
   assert.ok(out.includes("Environment=CACHE_FIX_PROXY_PORT=9801"));
   assert.ok(out.includes("WorkingDirectory=/opt/cache-fix"));
   assert.ok(out.includes("WantedBy=default.target"));
@@ -136,7 +138,7 @@ test("renderLaunchdTemplate: substitutes core fields and renders valid plist", a
   });
   assert.ok(out.includes("<string>com.cnighswonger.cache-fix-proxy</string>"));
   assert.ok(out.includes("<string>/usr/local/bin/node</string>"));
-  assert.ok(out.includes("<string>/opt/cache-fix/proxy/server.mjs</string>"));
+  assert.ok(out.includes("<string>/opt/cache-fix/bin/claude-via-proxy.mjs</string>\n        <string>run-service</string>"));
   assert.ok(out.includes("<string>9801</string>"));
   assert.ok(out.includes("<string>/Users/test/Library/Logs/cache-fix-proxy.log</string>"));
   assert.ok(!out.includes("{{"));
@@ -157,7 +159,7 @@ test("renderLaunchdTemplate: includes UPSTREAM, CA_FILE, REJECT_UNAUTHORIZED and
   });
   assert.ok(out.includes("<string>com.cnighswonger.cache-fix-proxy</string>"));
   assert.ok(out.includes("<string>/usr/local/bin/node</string>"));
-  assert.ok(out.includes("<string>/opt/cache-fix/proxy/server.mjs</string>"));
+  assert.ok(out.includes("<string>/opt/cache-fix/bin/claude-via-proxy.mjs</string>"));
   assert.ok(out.includes("<string>9801</string>"));
   assert.ok(out.includes("<string>http://127.0.0.1:8080</string>"));
   assert.ok(out.includes("<string>/etc/ssl/ca &amp; &lt; &gt; &apos; &quot; file.pem</string>"));
@@ -868,6 +870,158 @@ test("installLaunchd: writes plist to configDir; uninstall removes it", async ()
 
     const r2 = await uninstallLaunchd({ paths });
     assert.ok(r2.ok);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// --- The unit starts `run-service` (the port holder), not the bare proxy ---
+
+// Every case that reads HTTPS_PROXY / NO_PROXY sets or deletes it here: the
+// project's test command exports both, so a case that trusted the ambient
+// value would differ between `npm test` and a bare `node --test`.
+async function withEnv(env, fn) {
+  const put = (e) => { for (const [k, v] of Object.entries(e)) v === undefined ? delete process.env[k] : (process.env[k] = v); };
+  const prior = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+  put(env);
+  try { return await fn(); } finally { put(prior); }
+}
+
+test("renderSystemdTemplate: stop leaves the holder's lineage, reload hands it over", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, sampleVars);
+  for (const line of [
+    "KillMode=process",
+    "KillSignal=SIGTERM",
+    "ExecReload=/bin/kill -USR2 $MAINPID",
+    "Restart=on-failure",
+    "RestartSec=0",
+  ]) assert.ok(out.includes(`\n${line}\n`), `unit lacks ${line}`);
+});
+
+test("renderSystemdTemplate: renders the captured hop, NO_PROXY, fallbacks and watch interval; omits them when unset", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, {
+    ...sampleVars,
+    upstreamProxy: "http://127.0.0.1:8118",
+    noProxy: "localhost,127.0.0.1",
+    fallbackProxies: "http://127.0.0.1:8119",
+    watchDeployMs: "5000",
+  });
+  assert.ok(out.includes("Environment=CACHE_FIX_UPSTREAM_PROXY=http://127.0.0.1:8118"));
+  assert.ok(out.includes("Environment=NO_PROXY=localhost,127.0.0.1"));
+  assert.ok(out.includes("Environment=CACHE_FIX_FALLBACK_PROXIES=http://127.0.0.1:8119"));
+  assert.ok(out.includes("Environment=CACHE_FIX_WATCH_DEPLOY_MS=5000"));
+  // A hop's credentials may hold `$&` or `$$`, which String.replaceAll reads as patterns.
+  const dollars = "http://u:p$&$$@127.0.0.1:8118";
+  assert.ok(renderSystemdTemplate(tpl, { ...sampleVars, upstreamProxy: dollars })
+    .includes(`Environment=CACHE_FIX_UPSTREAM_PROXY=${dollars}\n`));
+  const bare =renderSystemdTemplate(tpl, sampleVars);
+  for (const k of ["CACHE_FIX_UPSTREAM_PROXY", "NO_PROXY", "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_WATCH_DEPLOY_MS"])
+    assert.ok(!bare.includes(k), `${k} rendered with no value`);
+});
+
+test("renderLaunchdTemplate: the agent outlives its holder's launch, and carries the captured env", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"), "utf-8");
+  const out = renderLaunchdTemplate(tpl, {
+    ...sampleVars,
+    upstreamProxy: "http://127.0.0.1:8118",
+    noProxy: "localhost",
+    fallbackProxies: "http://127.0.0.1:8119",
+    watchDeployMs: "5000",
+    logDir: "/Users/test/Library/Logs",
+  });
+  assert.ok(out.includes("<key>AbandonProcessGroup</key>\n    <true/>"));
+  assert.ok(out.includes("<key>CACHE_FIX_UPSTREAM_PROXY</key>\n        <string>http://127.0.0.1:8118</string>"));
+  assert.ok(out.includes("<key>NO_PROXY</key>\n        <string>localhost</string>"));
+  assert.ok(out.includes("<key>CACHE_FIX_FALLBACK_PROXIES</key>\n        <string>http://127.0.0.1:8119</string>"));
+  assert.ok(out.includes("<key>CACHE_FIX_WATCH_DEPLOY_MS</key>\n        <string>5000</string>"));
+  assert.ok(!out.includes("{{"));
+});
+
+test("getDefaults: the hop follows the proxy's own precedence; NO_PROXY, fallbacks and a 5000 ms watch are captured", async () => {
+  const none = Object.fromEntries(["CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+    "NO_PROXY", "no_proxy", "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_WATCH_DEPLOY_MS"].map((k) => [k, undefined]));
+  await withEnv({ ...none, HTTPS_PROXY: "http://127.0.0.1:8118", NO_PROXY: "localhost", CACHE_FIX_FALLBACK_PROXIES: "http://127.0.0.1:8119" }, () => {
+    const d = getDefaults();
+    assert.equal(d.upstreamProxy, "http://127.0.0.1:8118");
+    assert.equal(d.noProxy, "localhost");
+    assert.equal(d.fallbackProxies, "http://127.0.0.1:8119");
+    assert.equal(d.watchDeployMs, "5000");
+  });
+  await withEnv({ ...none, CACHE_FIX_UPSTREAM_PROXY: "http://hop.example:3128", HTTPS_PROXY: "http://127.0.0.1:8118", CACHE_FIX_WATCH_DEPLOY_MS: "1000" }, () => {
+    assert.equal(getDefaults().upstreamProxy, "http://hop.example:3128", "an explicit hop outranks HTTPS_PROXY");
+    assert.equal(getDefaults().watchDeployMs, "1000");
+  });
+  await withEnv({ ...none, HTTP_PROXY: "http://127.0.0.1:8118" }, () => {
+    assert.equal(getDefaults().upstreamProxy, "http://127.0.0.1:8118", "HTTP_PROXY alone is the hop, as config.mjs reads it");
+  });
+});
+
+// Stand-ins for BOTH service managers' CLIs that only log their argv, so a case
+// can read the ORDER uninstall() issued its commands in. Both, so a case whose
+// platform branch is wrong still never reaches the host's real service manager.
+async function fakeBins(dir) {
+  const bin = join(dir, "bin");
+  const log = join(dir, "calls.log");
+  await mkdir(bin);
+  for (const n of ["systemctl", "launchctl"]) await writeFile(join(bin, n), `#!/bin/sh\necho "${n} $*" >> "${log}"\n`, { mode: 0o755 });
+  return { bin, log };
+}
+
+test("uninstall(): systemd SIGHUPs the unit before it stops it", async () => {
+  const dir = await newTmp();
+  try {
+    const { bin, log } = await fakeBins(dir);
+    const unitDir = join(dir, ".config", "systemd", "user");
+    await mkdir(unitDir, { recursive: true });
+    await writeFile(join(unitDir, "cache-fix-proxy.service"), "");
+    await withEnv({ HOME: dir, PATH: `${bin}:${process.env.PATH}` }, async () => {
+      assert.equal(await uninstall({ plat: "linux" }), 0);
+    });
+    const calls = (await readFile(log, "utf-8")).split("\n");
+    const hup = calls.indexOf("systemctl --user kill -s HUP cache-fix-proxy");
+    assert.ok(hup >= 0 && hup < calls.indexOf("systemctl --user stop cache-fix-proxy"),
+      `SIGHUP must precede stop (the standby only ends on SIGHUP), got:\n${calls.join("\n")}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("uninstall(): launchd SIGHUPs the job before bootout", async () => {
+  const dir = await newTmp();
+  try {
+    const { bin, log } = await fakeBins(dir);
+    const agents = join(dir, "Library", "LaunchAgents");
+    await mkdir(agents, { recursive: true });
+    await writeFile(join(agents, "com.cnighswonger.cache-fix-proxy.plist"), "");
+    await withEnv({ HOME: dir, PATH: `${bin}:${process.env.PATH}` }, async () => {
+      assert.equal(await uninstall({ plat: "darwin" }), 0);
+    });
+    const calls = (await readFile(log, "utf-8")).split("\n");
+    const hup = calls.indexOf(`launchctl kill SIGHUP gui/${process.getuid()}/com.cnighswonger.cache-fix-proxy`);
+    assert.ok(hup >= 0 && hup < calls.findIndex((c) => c.startsWith("launchctl bootout")),
+      `SIGHUP must precede bootout, got:\n${calls.join("\n")}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("install-service: next steps reload, never restart; a missing lsof warns and the install continues", { skip: platform() !== "linux" }, async () => {
+  const dir = await newTmp();
+  try {
+    const bin = join(dir, "bin");
+    await mkdir(bin);
+    const run = () => execFileP(process.execPath, [BIN, "install-service", "--force"], {
+      env: { ...process.env, HOME: dir, PATH: bin },
+    });
+    const noLsof = await run();
+    assert.match(noLsof.stdout, /systemctl --user reload cache-fix-proxy/);
+    assert.match(noLsof.stderr, /lsof/, "no lsof on PATH must warn");
+    // Control: the same install with an lsof on PATH is silent, so the warning
+    // above came from the missing binary and not from anything else on stderr.
+    await writeFile(join(bin, "lsof"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    assert.doesNotMatch((await run()).stderr, /lsof/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

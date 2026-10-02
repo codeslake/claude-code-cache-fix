@@ -672,13 +672,18 @@ function otherHolderOn(port) {
   for (const p of pids) {
     let line = "";
     try {
-      line = probe("ps", ["-p", String(p), "-o", "etimes=,command="]).trim();
+      // etime, not etimes: BSD ps (macOS) has no etimes, so this probe failed
+      // there and every candidate was skipped. etime is on both.
+      line = probe("ps", ["-p", String(p), "-o", "etime=,command="]).trim();
     } catch { continue; }
     if (!/\brun-service\b/.test(line)) continue;
-    // etimes is SECONDS ALIVE, so larger means older. Ours is whatever this
-    // process has been up; a tie goes to the incumbent, which is the safe way
-    // round — the surplus one leaving is free, two holders is not.
-    const theirs = Number(line.split(/\s+/)[0]);
+    // SECONDS ALIVE, so larger means older. Ours is whatever this process has
+    // been up; a tie goes to the incumbent, which is the safe way round — the
+    // surplus one leaving is free, two holders is not. The field is
+    // `[[dd-]hh:]mm:ss` or a bare second count. Inline: the test that lifts
+    // this function by source injects no name for a helper.
+    const theirs = line.split(/\s+/)[0].split(/[-:]/).reverse()
+      .reduce((s, n, i) => s + Number(n) * [1, 60, 3600, 86400][i], 0);
     if (!Number.isFinite(theirs) || theirs < Math.floor(process.uptime())) continue;
     // AGE IS NOT ENOUGH. Every incumbent outlives a process that just started,
     // so age alone fired on every deploy: the NEW code called itself surplus and
