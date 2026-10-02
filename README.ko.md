@@ -427,7 +427,7 @@ v4.0.0은 `CACHE_FIX_THINKING_SANITIZE`를 기본적으로 꺼진 상태에서 �
 
 이 변경은 7일간의 프로덕션 강아지 테스트(37개 세션, 0개 `cannot be modified` 400, 캐시 히트율 평균 94.66% vs 92.44% 베이스라인)를 기반으로 합니다. [PR #201](https://github.com/cnighswonger/claude-code-cache-fix/pull/201)에서 유효성 데이터와 [#63147](https://github.com/anthropics/claude-code/issues/63147)의 상류 컨텍스트를 참조하세요.
 
-v4.0.0에서 새 확장을 추가하거나 기존 확장에 코드 변경을 적용하려면 실행 중인 프록시를 새 코드로 인계하거나(흐름 1, 재시작 불필요) 관리자 수준의 재시작(흐름 2)이 필요합니다. 핫리로드를 다시 활성화하려는 경우에 따라 두 가지 업그레이드 흐름이 있습니다.
+v4.0.0에서 새 확장을 추가하거나 기존 확장에 코드 변경을 적용하려면 실행 중인 프록시를 새 코드로 인계하거나(흐름 1, 재시작 불필요) 서비스 설정을 바꾸기 위한 제거 후 재설치(흐름 2, 한 번 끊김)가 필요합니다. 핫리로드를 다시 활성화하려는 경우에 따라 두 가지 업그레이드 흐름이 있습니다.
 
 ### 흐름 1 — 코드 전용 npm 업그레이드 (권장 기본값)
 
@@ -440,7 +440,7 @@ npm install -g claude-code-cache-fix@4
 systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-`daemon-reload`는 필요하지 않으며, 유닛 파일 내용은 변경되지 않았습니다. 첫 번째 reload 이후에는 서비스 중인 프로세스가 유닛이 더 이상 추적하지 않는 후속 프로세스이므로 `reload`만으로는 한 번만 동작하며, 이후에는 `start`가 그 프로세스에 인계합니다(코드가 같으면 아무 일도 하지 않습니다).
+`daemon-reload`는 필요하지 않으며, 유닛 파일 내용은 변경되지 않았습니다. 첫 번째 reload 이후에는 서비스 중인 프로세스가 유닛이 더 이상 추적하지 않는 후속 프로세스이므로 `reload`만으로는 한 번만 동작하며, 이후에는 `start`가 그 프로세스에 인계합니다(`proxy/` 트리가 같으면 아무 일도 하지 않습니다).
 
 **macOS (launchd 사용자 에이전트):**
 
@@ -451,32 +451,31 @@ launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchct
 
 신호는 원래 프로세스가 살아 있는 동안 에이전트를 인계하며, 그 이후에는 `kickstart`(재시작인 `-k` 없이)가 인계합니다.
 
-이전 버전이 설치한 유닛 또는 plist는 기본 프록시를 그대로 실행하며 reload가 없습니다. `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy`(launchd: 흐름 2와 같이 `bootout` + `bootstrap`)로 한 번 마이그레이션하세요. 이 재시작 한 번이 마지막 중단입니다.
+이전 버전이 설치한 유닛 또는 plist는 홀더 없이 프록시를 직접 실행하며 reload가 없습니다. `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy`(launchd: `bootout` + `bootstrap`)로 한 번 마이그레이션하세요. 이 재시작 한 번이 마지막 중단입니다.
 
 ### 흐름 2 — 관리자 레벨에서 핫리로드 재활성화
 
-핫리로드를 활성화하는 경우(예: 사용 중인 프록시에 사용자 확장을 확장 디렉토리에 배치하고 재시작 없이 선택하려는 경우), 다음 작업을 실행하세요. 이 작업은 유닛 / plist를 재작성하여 관리자가 프록시를 시작할 때마다 `CACHE_FIX_HOT_RELOAD=on`이 설정되도록 합니다.
+핫리로드를 활성화하는 경우(예: 사용 중인 프록시에 사용자 확장을 확장 디렉토리에 배치하고 재시작 없이 선택하려는 경우), 다음 작업을 실행하세요. 이 작업은 유닛 / plist를 재작성하여 관리자가 프록시를 시작할 때마다 `CACHE_FIX_HOT_RELOAD=on`이 설정되도록 합니다. 변경된 유닛은 서비스 중인 프록시에 전달되지 않으므로(`reload`와 `start`는 `proxy/` 트리가 바뀐 경우에만 인계합니다) 서비스를 먼저 제거합니다. `uninstall-service`가 실행 중인 프록시를 종료하므로 한 번 끊깁니다.
 
 **Linux (systemd 사용자 유닛):**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
 systemctl --user daemon-reload
-systemctl --user restart cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy-healthcheck.timer
 ```
-
-유닛 파일 내용이 변경되었으므로 `daemon-reload`가 필요합니다.
 
 **macOS (launchd 사용자 에이전트):**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
-launchctl bootout gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
-
-plist 내용이 변경되었으므로 `bootout` + `bootstrap`이 필요합니다 — `kickstart`만으로는 plist 변경사항을 인식하지 못합니다.
 
 **핫리로드 트레이드오프에 대한 참고:** 선택 경로에서도 장시간 실행 프로세스에서는 ESM 스테일 임포트 경쟁이 발생할 수 있습니다. `/health`가 저하된 경우(503 + `{status:"degraded",...}` 반환) 유일한 복구 방법은 프로세스 재시작이며, 프록시는 이때 `[CRITICAL]` 힌트를 기록합니다. 관측성 계층은 [#197](https://github.com/cnighswonger/claude-code-cache-fix/pull/197)에서 확인하세요.
 

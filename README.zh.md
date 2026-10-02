@@ -427,7 +427,7 @@ v4.0.0 将 `CACHE_FIX_THINKING_SANITIZE` 从默认关闭翻转为默认开启。
 
 翻转由 7 天的生产狗粮测试支持（37 个会话，零 `cannot be modified` 400，缓存命中率平均 94.66% vs 92.44% 基线）。参见 [PR #201](https://github.com/cnighswonger/claude-code-cache-fix/pull/201) 获取验证数据和 [#63147](https://github.com/anthropics/claude-code/issues/63147) 的上游上下文。
 
-在 v4.0.0 中，添加新扩展或对现有扩展进行代码更改，需要将运行中的代理交接给新代码（流程 1，无需重启）或进行监督级重启（流程 2）。根据您是否也想要恢复热重载，有两种升级流程。
+在 v4.0.0 中，添加新扩展或对现有扩展进行代码更改，需要将运行中的代理交接给新代码（流程 1，无需重启）或为更改服务设置而卸载后重新安装（流程 2，中断一次）。根据您是否也想要恢复热重载，有两种升级流程。
 
 ### 流程 1 —— 仅代码 npm 升级（推荐默认）
 
@@ -440,7 +440,7 @@ npm install -g claude-code-cache-fix@4
 systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-无需 `daemon-reload` —— 单元文件内容不变。首次 reload 之后，提供服务的进程是单元不再跟踪的后继进程，因此单独 `reload` 只能生效一次；之后由 `start` 向它交接（代码相同时什么也不做）。
+无需 `daemon-reload` —— 单元文件内容不变。首次 reload 之后，提供服务的进程是单元不再跟踪的后继进程，因此单独 `reload` 只能生效一次；之后由 `start` 向它交接（`proxy/` 树相同时什么也不做）。
 
 **macOS (launchd 用户代理)：**
 
@@ -451,32 +451,31 @@ launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchct
 
 原进程仍存活时，该信号完成代理交接；此后由 `kickstart`（不带表示重启的 `-k`）完成。
 
-由早期版本安装的单元或 plist 运行的是裸代理，没有 reload。请用 `cache-fix-proxy install-service --force`、`systemctl --user daemon-reload`、`systemctl --user restart cache-fix-proxy` 迁移一次（launchd：如流程 2 所示，`bootout` + `bootstrap`）；这一次重启就是最后一次中断。
+由早期版本安装的单元或 plist 运行的是裸代理，没有 reload。请用 `cache-fix-proxy install-service --force`、`systemctl --user daemon-reload`、`systemctl --user restart cache-fix-proxy` 迁移一次（launchd：`bootout` + `bootstrap`）；这一次重启就是最后一次中断。
 
 ### 流程 2 —— 在监督层恢复热重载
 
-如果您积极使用热重载（例如，您在运行的代理中将自定义扩展放入扩展目录并希望它们在不重启的情况下被拾取），请运行此操作。这会重写单元 / plist，使每次监督者启动代理时都设置 `CACHE_FIX_HOT_RELOAD=on`。
+如果您积极使用热重载（例如，您在运行的代理中将自定义扩展放入扩展目录并希望它们在不重启的情况下被拾取），请运行此操作。这会重写单元 / plist，使每次监督者启动代理时都设置 `CACHE_FIX_HOT_RELOAD=on`。更改后的单元不会到达正在服务的代理（`reload` 和 `start` 仅在 `proxy/` 树变化时才交接），因此先卸载服务：`uninstall-service` 会结束正在运行的代理，这会中断一次。
 
 **Linux (systemd 用户单元)：**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
 systemctl --user daemon-reload
-systemctl --user restart cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy-healthcheck.timer
 ```
-
-需要 `daemon-reload`，因为单元文件内容已更改。
 
 **macOS (launchd 用户代理)：**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
-launchctl bootout gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
-
-需要 `bootout` + `bootstrap`，因为 plist 内容已更改 —— 仅 `kickstart` 不会拾取 plist 更改。
 
 **关于热重载权衡的注意：** 即使在选择路径上，长时间运行的进程仍可能遇到 ESM 停滞导入竞争。如果遇到降级的 `/health`（返回 503 + `{status:"degraded",...}`），唯一恢复方法是进程重启；代理会在发生时记录 `[CRITICAL]` 提示。参见 [#197](https://github.com/cnighswonger/claude-code-cache-fix/pull/197) 获取可观测性层。
 

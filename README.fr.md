@@ -385,7 +385,7 @@ npm install -g claude-code-cache-fix@4
 systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-Après le premier reload, le processus qui sert est un successeur que l'unité ne suit plus : `reload` seul ne marche donc qu'une fois, puis `start` lui passe le relais (et ne fait rien si le code est identique).
+Après le premier reload, le processus qui sert est un successeur que l'unité ne suit plus : `reload` seul ne marche donc qu'une fois, puis `start` lui passe le relais (et ne fait rien si l'arbre `proxy/` est identique).
 
 **macOS (launchd user agent) :**
 
@@ -396,24 +396,29 @@ launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchct
 
 Le signal passe le relais tant que le processus d'origine est vivant ; ensuite `kickstart` (sans `-k`, qui redémarre) s'en charge.
 
-Une unité ou un plist installé par une version antérieure exécute le proxy nu et n'a pas de reload. Migrez-le une fois avec `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd : `bootout` + `bootstrap`, comme au Flux 2) ; ce redémarrage unique est la dernière coupure.
+Une unité ou un plist installé par une version antérieure exécute le proxy nu et n'a pas de reload. Migrez-le une fois avec `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd : `bootout` + `bootstrap`) ; ce redémarrage unique est la dernière coupure.
 
 ### Flux 2 — réactivation du hot-reload au niveau superviseur
+
+Une unité modifiée n'atteint jamais le proxy en service (`reload` et `start` ne passent le relais que si l'arbre `proxy/` a changé) : on désinstalle donc d'abord le service. `uninstall-service` termine le proxy en cours, et cela coupe une fois.
 
 **Linux :**
 
 ```bash
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
 systemctl --user daemon-reload
-systemctl --user restart cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy-healthcheck.timer
 ```
 
 **macOS :**
 
 ```bash
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
-launchctl bootout gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
