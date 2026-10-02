@@ -538,29 +538,31 @@ v4.0.0 flips `CACHE_FIX_THINKING_SANITIZE` from default-off to default-on. The v
 
 The flip is backed by 7 days of prod dogfood (37 sessions, zero `cannot be modified` 400s, cache hit-rate aggregate 94.66% vs 92.44% baseline). See [PR #201](https://github.com/cnighswonger/claude-code-cache-fix/pull/201) for the validation data and [#63147](https://github.com/anthropics/claude-code/issues/63147) for upstream context.
 
-Picking up a new extension or a code change to an existing one in v4.0.0 requires a supervisor-level proxy restart. There are two upgrade flows depending on whether you also want to opt back into hot-reload.
+Picking up a new extension or a code change to an existing one in v4.0.0 requires handing the running proxy over to the new code (Flow 1; no restart needed) or a supervisor-level restart (Flow 2). There are two upgrade flows depending on whether you also want to opt back into hot-reload.
 
 ### Flow 1 — code-only npm upgrade (recommended default)
 
-Your existing systemd unit / launchd plist is unchanged; only the proxy code on disk is updated by npm. Restart the running process to pick up the new code.
+Your existing systemd unit / launchd plist is unchanged; only the proxy code on disk is updated by npm. Hand the running process over to the new code; a restart would cut in-flight requests.
 
 **Linux (systemd user unit):**
 
 ```
 npm install -g claude-code-cache-fix@4
-systemctl --user restart cache-fix-proxy
+systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-No `daemon-reload` required — the unit file content is unchanged.
+No `daemon-reload` required — the unit file content is unchanged. After the first reload the serving process is a successor the unit no longer tracks, so `reload` alone works once; `start` then hands over to it (and does nothing when the code is the same).
 
 **macOS (launchd user agent):**
 
 ```
 npm install -g claude-code-cache-fix@4
-launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-`kickstart` re-execs the agent under the existing plist.
+The signal hands the agent over while its original process lives; afterwards `kickstart` (without `-k`, which restarts) does it.
+
+A unit or plist installed by an earlier version runs the bare proxy and has no reload. Migrate it once with `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd: `bootout` + `bootstrap`, as in Flow 2); that one restart is the last cut.
 
 ### Flow 2 — opt back into hot-reload at the supervisor layer
 

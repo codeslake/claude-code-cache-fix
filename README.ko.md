@@ -427,29 +427,31 @@ v4.0.0은 `CACHE_FIX_THINKING_SANITIZE`를 기본적으로 꺼진 상태에서 �
 
 이 변경은 7일간의 프로덕션 강아지 테스트(37개 세션, 0개 `cannot be modified` 400, 캐시 히트율 평균 94.66% vs 92.44% 베이스라인)를 기반으로 합니다. [PR #201](https://github.com/cnighswonger/claude-code-cache-fix/pull/201)에서 유효성 데이터와 [#63147](https://github.com/anthropics/claude-code/issues/63147)의 상류 컨텍스트를 참조하세요.
 
-v4.0.0에서 새 확장을 추가하거나 기존 확장에 코드 변경을 적용하려면 관리자 수준의 프록시 재시작이 필요합니다. 핫리로드를 다시 활성화하려는 경우에 따라 두 가지 업그레이드 흐름이 있습니다.
+v4.0.0에서 새 확장을 추가하거나 기존 확장에 코드 변경을 적용하려면 실행 중인 프록시를 새 코드로 인계하거나(흐름 1, 재시작 불필요) 관리자 수준의 재시작(흐름 2)이 필요합니다. 핫리로드를 다시 활성화하려는 경우에 따라 두 가지 업그레이드 흐름이 있습니다.
 
 ### 흐름 1 — 코드 전용 npm 업그레이드 (권장 기본값)
 
-기존 systemd 유닛 / launchd plist는 변경되지 않으며, 디스크의 프록시 코드만 npm으로 업데이트됩니다. 새 코드를 가져오려면 실행 중인 프로세스를 재시작하세요.
+기존 systemd 유닛 / launchd plist는 변경되지 않으며, 디스크의 프록시 코드만 npm으로 업데이트됩니다. 새 코드를 가져오려면 실행 중인 프로세스를 새 코드로 인계하세요. 재시작하면 처리 중인 요청이 끊깁니다.
 
 **Linux (systemd 사용자 유닛):**
 
 ```
 npm install -g claude-code-cache-fix@4
-systemctl --user restart cache-fix-proxy
+systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-`daemon-reload`는 필요하지 않으며, 유닛 파일 내용은 변경되지 않았습니다.
+`daemon-reload`는 필요하지 않으며, 유닛 파일 내용은 변경되지 않았습니다. 첫 번째 reload 이후에는 서비스 중인 프로세스가 유닛이 더 이상 추적하지 않는 후속 프로세스이므로 `reload`만으로는 한 번만 동작하며, 이후에는 `start`가 그 프로세스에 인계합니다(코드가 같으면 아무 일도 하지 않습니다).
 
 **macOS (launchd 사용자 에이전트):**
 
 ```
 npm install -g claude-code-cache-fix@4
-launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-`kickstart`는 기존 plist 하위에서 에이전트를 다시 실행합니다.
+신호는 원래 프로세스가 살아 있는 동안 에이전트를 인계하며, 그 이후에는 `kickstart`(재시작인 `-k` 없이)가 인계합니다.
+
+이전 버전이 설치한 유닛 또는 plist는 기본 프록시를 그대로 실행하며 reload가 없습니다. `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy`(launchd: 흐름 2와 같이 `bootout` + `bootstrap`)로 한 번 마이그레이션하세요. 이 재시작 한 번이 마지막 중단입니다.
 
 ### 흐름 2 — 관리자 레벨에서 핫리로드 재활성화
 

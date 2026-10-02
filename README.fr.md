@@ -376,21 +376,27 @@ v4.0.0 bascule `CACHE_FIX_THINKING_SANITIZE` de default-off à default-on. La v1
 
 ### Flux 1 — mise à jour npm code seul (recommandé par défaut)
 
-Votre unité systemd existante / plist launchd est inchangée ; seul le code proxy sur disque est mis à jour par npm. Redémarrez le processus en cours pour prendre le nouveau code.
+Votre unité systemd existante / plist launchd est inchangée ; seul le code proxy sur disque est mis à jour par npm. Passez le relais du processus en cours au nouveau code ; un redémarrage couperait les requêtes en vol.
 
 **Linux (systemd user unit) :**
 
 ```bash
 npm install -g claude-code-cache-fix@4
-systemctl --user restart cache-fix-proxy
+systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
+
+Après le premier reload, le processus qui sert est un successeur que l'unité ne suit plus : `reload` seul ne marche donc qu'une fois, puis `start` lui passe le relais (et ne fait rien si le code est identique).
 
 **macOS (launchd user agent) :**
 
 ```bash
 npm install -g claude-code-cache-fix@4
-launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
+
+Le signal passe le relais tant que le processus d'origine est vivant ; ensuite `kickstart` (sans `-k`, qui redémarre) s'en charge.
+
+Une unité ou un plist installé par une version antérieure exécute le proxy nu et n'a pas de reload. Migrez-le une fois avec `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd : `bootout` + `bootstrap`, comme au Flux 2) ; ce redémarrage unique est la dernière coupure.
 
 ### Flux 2 — réactivation du hot-reload au niveau superviseur
 

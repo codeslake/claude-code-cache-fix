@@ -427,29 +427,31 @@ v4.0.0 将 `CACHE_FIX_THINKING_SANITIZE` 从默认关闭翻转为默认开启。
 
 翻转由 7 天的生产狗粮测试支持（37 个会话，零 `cannot be modified` 400，缓存命中率平均 94.66% vs 92.44% 基线）。参见 [PR #201](https://github.com/cnighswonger/claude-code-cache-fix/pull/201) 获取验证数据和 [#63147](https://github.com/anthropics/claude-code/issues/63147) 的上游上下文。
 
-在 v4.0.0 中，添加新扩展或对现有扩展进行代码更改需要监督级代理重启。根据您是否也想要恢复热重载，有两种升级流程。
+在 v4.0.0 中，添加新扩展或对现有扩展进行代码更改，需要将运行中的代理交接给新代码（流程 1，无需重启）或进行监督级重启（流程 2）。根据您是否也想要恢复热重载，有两种升级流程。
 
 ### 流程 1 —— 仅代码 npm 升级（推荐默认）
 
-您现有的 systemd 单元 / launchd plist 不变；只有磁盘上的代理代码通过 npm 更新。重启运行的进程以获取新代码。
+您现有的 systemd 单元 / launchd plist 不变；只有磁盘上的代理代码通过 npm 更新。将运行的进程交接给新代码以获取它；重启会中断进行中的请求。
 
 **Linux (systemd 用户单元)：**
 
 ```
 npm install -g claude-code-cache-fix@4
-systemctl --user restart cache-fix-proxy
+systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-无需 `daemon-reload` —— 单元文件内容不变。
+无需 `daemon-reload` —— 单元文件内容不变。首次 reload 之后，提供服务的进程是单元不再跟踪的后继进程，因此单独 `reload` 只能生效一次；之后由 `start` 向它交接（代码相同时什么也不做）。
 
 **macOS (launchd 用户代理)：**
 
 ```
 npm install -g claude-code-cache-fix@4
-launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-`kickstart` 在现有 plist 下重新执行代理。
+原进程仍存活时，该信号完成代理交接；此后由 `kickstart`（不带表示重启的 `-k`）完成。
+
+由早期版本安装的单元或 plist 运行的是裸代理，没有 reload。请用 `cache-fix-proxy install-service --force`、`systemctl --user daemon-reload`、`systemctl --user restart cache-fix-proxy` 迁移一次（launchd：如流程 2 所示，`bootout` + `bootstrap`）；这一次重启就是最后一次中断。
 
 ### 流程 2 —— 在监督层恢复热重载
 
