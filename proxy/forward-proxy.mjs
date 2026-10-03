@@ -206,8 +206,8 @@ export function ensureCA() {
     if (!haveLock) {
       if (pairReady()) return serveAsIs(`CA lock ${lock} not acquired`);
       throw new Error(
-        `cache-fix forward-proxy: CA generation lock ${lock} still held after ` +
-        `${config.caLockWaitMs}ms; refusing to generate without owning the lock`,
+        `cache-fix forward-proxy: CA generation lock ${lock} not acquired ` +
+        `(waited up to ${config.caLockWaitMs}ms); refusing to generate without owning the lock`,
       );
     }
   }
@@ -288,10 +288,12 @@ export function ensureCA() {
     run(["req", "-new", "-key", tmp("leaf.key"), "-out", csr, "-subj", `/CN=${host}`]);
     const ext = tmp("leaf.ext");
     const sanLine = hosts.map((h) => `DNS:${h}`).join(",");
-    // keyid, NOT keyid:always: a CA with no SKI (an operator's, which we leave
-    // alone) would make `always` fail the mint outright.
+    // keyid,issuer: for a CA with no SKI (an operator's, left alone) OpenSSL 3.0
+    // fails plain `keyid` and `keyid:always` ("unable to get issuer keyid") unless
+    // `issuer` is named. With an SKI the AKI stays keyid alone, so leaves survive
+    // a same-key re-certification of our own CA.
     writeFileSync(ext, `subjectAltName=${sanLine}\nextendedKeyUsage=serverAuth\n` +
-                       "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n");
+                       "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n");
     // -set_serial (random positive 128-bit) instead of -CAcreateserial: the
     // latter derives the serial filename from the -CA path, and macOS LibreSSL
     // truncates an absolute path at the first '.' (…/j.lee8/…/ca.pem → /Users/j

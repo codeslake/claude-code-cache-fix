@@ -263,8 +263,9 @@ for (const { name, opts, after } of [
 }
 
 // ...and a CA we leave alone may lack an SKI: the leaf is still minted under it.
-// `authorityKeyIdentifier=keyid:always` makes that a hard failure ("unable to
-// get issuer keyid"), which would fall the proxy back to reverse mode.
+// `authorityKeyIdentifier=keyid:always` (and, on OpenSSL 3.0, plain `keyid`) makes
+// that a hard failure ("unable to get issuer keyid"), which would fall the proxy
+// back to reverse mode.
 test("ensureCA: a foreign CA with no SKI still gets a leaf", (t) => {
   withCA({}, (dir) => {
     const sh = plantLegacyCA(dir, { subject: "other", leaf: false,
@@ -294,9 +295,13 @@ for (const { name, skip, inject } of [
       return () => chmodSync(dir, 0o700);
     } },
 ]) {
-  test(`ensureCA: serves the existing pair when ${name}`, { skip }, () => {
+  test(`ensureCA: serves the existing pair when ${name}`, { skip }, (t) => {
     withCA({ CACHE_FIX_CA_LOCK_WAIT_MS: "5000" }, (dir) => {
-      plantLegacyCA(dir);
+      const sh = plantLegacyCA(dir);
+      // A fixture CA that already carries keyUsage needs no re-certification, so there is nothing to fail.
+      if (sh(["x509", "-in", "ca.pem", "-noout", "-text"]).stdout.includes("X509v3 Key Usage")) {
+        return t.skip("openssl cannot mint a CA with no keyUsage");
+      }
       const before = snapshot(dir);
       const restore = inject(dir);
       const write = process.stderr.write;
