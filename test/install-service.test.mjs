@@ -1064,16 +1064,22 @@ test("getDefaults: a fallback proxy variable naming the service's own port is no
   assert.match(warned[0], /CACHE_FIX_UPSTREAM_PROXY/);
 });
 
-// Stand-ins for BOTH service managers' CLIs and for lsof that only log their
-// argv, and a process.kill that only logs, so a case can read the ORDER uninstall()
+// Stand-ins for BOTH service managers' CLIs, for lsof and for ps, and a process.kill
+// that only logs, so a case can read the ORDER uninstall()
 // issued its commands and signals in, and never reaches a real service manager
 // or a real pid. Both managers, so a case whose platform branch is wrong still
-// stays off the host's real one. The lsof lists two pids for its first `lists`
-// calls and none after (the holder draining); `noLsof` leaves it off PATH. A
+// stays off the host's real one. The lsof lists the `holders` (a pid, the address it
+// listens on, and the command line the ps answers with, null for a ps that fails) that the
+// request's -iTCP spec reaches, for its first `lists` calls and none after (the holder
+// draining; one marked `stays` is listed for ever); `noLsof` leaves it off PATH. A
 // null unitText installs no unit. The result carries uninstall()'s stderr as `.stderr`.
 // `failOn` makes that call of the lsof fail the way its 5 s timeout does: spawnSync's own `error`
 // (here ENOBUFS, more than maxBuffer of blank lines) beside an empty list.
-async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, noLsof = false, drainMs = 300, failOn = 0 } = {}) {
+const LINEAGE = [
+  { pid: 4242, addr: "127.0.0.1", cmd: "node /opt/pkg/bin/claude-via-proxy.mjs run-service" },
+  { pid: 4243, addr: "127.0.0.1", cmd: "node /opt/pkg/proxy/server.mjs" },
+];
+async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, noLsof = false, drainMs = 300, failOn = 0, holders = LINEAGE } = {}) {
   const dir = await newTmp();
   const realKill = process.kill;
   try {
@@ -1086,8 +1092,12 @@ async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, n
       await writeFile(join(bin, "lsof"),
         `#!/bin/sh\necho "lsof $*" >> "${log}"\nn=0; [ -f "${count}" ] && read n < "${count}"\nn=$((n+1)); echo $n > "${count}"\n` +
         `[ $n -eq ${failOn} ] && { head -c 2000000 /dev/zero | tr '\\0' '\\n'; exit 0; }\n` +
-        `[ $n -le ${lists} ] && echo 4242 && echo 4243\nexit 0\n`, { mode: 0o755 });
+        `spec=; for a in "$@"; do case "$a" in -iTCP*) spec="\${a#-iTCP}";; esac; done\n` +
+        holders.map((h) => `${h.stays ? "" : `[ $n -le ${lists} ] && `}case "$spec" in :*|"@${h.addr}":*) echo ${h.pid};; esac\n`).join("") +
+        `exit 0\n`, { mode: 0o755 });
     }
+    await writeFile(join(bin, "ps"), `#!/bin/sh\nfor a; do p=$a; done\n` +
+      holders.filter((h) => h.cmd).map((h) => `[ "$p" = ${h.pid} ] && { echo '${h.cmd}'; exit 0; }\n`).join("") + `exit 1\n`, { mode: 0o755 });
     const unitDir = plat === "linux" ? join(dir, ".config", "systemd", "user") : join(dir, "Library", "LaunchAgents");
     await mkdir(unitDir, { recursive: true });
     if (unitText !== null) await writeFile(join(unitDir, unitName), unitText);
@@ -1114,7 +1124,7 @@ const idx = (calls, c) => {
 test("uninstall(): systemd SIGHUPs every holder of the unit's port, after the timer stops and before the unit stops", async () => {
   const calls = await uninstallCalls("linux", "cache-fix-proxy.service", "[Service]\nEnvironment=CACHE_FIX_PROXY_PORT=9877\n");
   const [timer, list, k1, k2, stop] = [
-    "systemctl --user stop cache-fix-proxy-healthcheck.timer", "lsof -nP -t -iTCP@127.0.0.1:9877 -sTCP:LISTEN",
+    "systemctl --user stop cache-fix-proxy-healthcheck.timer", "lsof -nP -t -iTCP:9877 -sTCP:LISTEN",
     "kill SIGHUP 4242", "kill SIGHUP 4243", "systemctl --user stop cache-fix-proxy",
   ].map((c) => idx(calls, c));
   assert.ok(timer < list && list < k1 && k1 < k2 && k2 < stop, `order wrong, got:\n${calls.join("\n")}`);
@@ -1124,7 +1134,7 @@ test("uninstall(): systemd SIGHUPs every holder of the unit's port, after the ti
 test("uninstall(): launchd SIGHUPs every holder of the plist's port before bootout", async () => {
   const calls = await uninstallCalls("darwin", "com.cnighswonger.cache-fix-proxy.plist",
     "<key>CACHE_FIX_PROXY_PORT</key>\n        <string>9877</string>\n");
-  const [list, k1, k2] = ["lsof -nP -t -iTCP@127.0.0.1:9877 -sTCP:LISTEN", "kill SIGHUP 4242", "kill SIGHUP 4243"].map((c) => idx(calls, c));
+  const [list, k1, k2] = ["lsof -nP -t -iTCP:9877 -sTCP:LISTEN", "kill SIGHUP 4242", "kill SIGHUP 4243"].map((c) => idx(calls, c));
   const boot = calls.findIndex((c) => c.startsWith("launchctl bootout"));
   assert.ok(list < k1 && k1 < k2 && k2 < boot, `order wrong, got:\n${calls.join("\n")}`);
   assert.ok(!calls.some((c) => c.startsWith("launchctl kill")), "the job has no PID once a successor serves");
@@ -1134,21 +1144,7 @@ test("uninstall(): a unit that names no port lists the proxy's default 9801, and
   // getDefaults() throws on the first port, and would list 9878 for the second.
   for (const env of [{ CACHE_FIX_PROXY_PORT: "not-a-port" }, { CACHE_FIX_PROXY_PORT: "9878" }]) {
     const calls = await uninstallCalls("linux", "cache-fix-proxy.service", "", env);
-    idx(calls, "lsof -nP -t -iTCP@127.0.0.1:9801 -sTCP:LISTEN");
-  }
-});
-
-test("uninstall(): the listing is scoped to the unit's bind address, as holderPidOn's is, so another address on the same port is not SIGHUP'd", async () => {
-  // Any unit that does not name one binds 127.0.0.1; an IPv6 literal is bracketed the way lsof demands.
-  const cases = [
-    ["linux", "cache-fix-proxy.service", "[Service]\nEnvironment=CACHE_FIX_PROXY_PORT=9877\nEnvironment=CACHE_FIX_PROXY_BIND=::1\n", "[::1]"],
-    ["darwin", "com.cnighswonger.cache-fix-proxy.plist",
-      "<key>CACHE_FIX_PROXY_PORT</key>\n<string>9877</string>\n<key>CACHE_FIX_PROXY_BIND</key>\n<string>10.0.0.5</string>\n", "10.0.0.5"],
-  ];
-  for (const [plat, name, text, addr] of cases) {
-    // The shell's own CACHE_FIX_PROXY_BIND is not the unit's, as the shell's port is not.
-    const calls = await uninstallCalls(plat, name, text, { CACHE_FIX_PROXY_BIND: "0.0.0.0" });
-    idx(calls, `lsof -nP -t -iTCP@${addr}:9877 -sTCP:LISTEN`);
+    idx(calls, "lsof -nP -t -iTCP:9801 -sTCP:LISTEN");
   }
 });
 
@@ -1156,6 +1152,33 @@ const SYSTEMD = ["linux", "cache-fix-proxy.service", "[Service]\nEnvironment=CAC
 const LAUNCHD = ["darwin", "com.cnighswonger.cache-fix-proxy.plist", "<key>CACHE_FIX_PROXY_PORT</key>\n        <string>9877</string>\n"];
 const lsofCalls = (calls) => calls.filter((c) => c.startsWith("lsof "));
 const endIdx = (calls) => calls.findIndex((c) => c === "systemctl --user stop cache-fix-proxy" || c.startsWith("launchctl bootout"));
+const sighups = (calls) => calls.filter((c) => c.startsWith("kill SIGHUP "));
+
+test("uninstall(): a process of ours is SIGHUP'd on whatever address it listens on, one per way of naming our lineage", async () => {
+  // The unit names no bind, yet a bind set by a drop-in or the manager's environment reaches the proxy.
+  const holders = [
+    { pid: 4242, addr: "0.0.0.0", cmd: "node /opt/pkg/bin/claude-via-proxy.mjs run-service" },
+    { pid: 4243, addr: "10.0.0.5", cmd: "node /opt/pkg/proxy/server.mjs" },
+    { pid: 4244, addr: "::1", cmd: "node /opt/pkg/bin/gap-relay.mjs" },
+  ];
+  for (const [plat, name, text] of [SYSTEMD, LAUNCHD]) {
+    const calls = await uninstallCalls(plat, name, text, {}, { holders });
+    assert.deepEqual(sighups(calls), ["kill SIGHUP 4242", "kill SIGHUP 4243", "kill SIGHUP 4244"], `${plat}:\n${calls.join("\n")}`);
+  }
+});
+
+test("uninstall(): a foreign process on the unit's port is neither SIGHUP'd nor waited for, and a pid whose ps cannot be read is skipped", async () => {
+  const holders = [
+    ...LINEAGE,
+    { pid: 4244, addr: "10.0.0.5", cmd: "python3 -m http.server 9877", stays: true },
+    { pid: 4245, addr: "127.0.0.1", cmd: null, stays: true },
+  ];
+  for (const [plat, name, text] of [SYSTEMD, LAUNCHD]) {
+    const calls = await uninstallCalls(plat, name, text, {}, { holders });
+    assert.deepEqual(sighups(calls), ["kill SIGHUP 4242", "kill SIGHUP 4243"], `${plat}:\n${calls.join("\n")}`);
+    assert.doesNotMatch(calls.stderr, /still held/, `${plat}: only our own processes keep the drain waiting`);
+  }
+});
 
 test("uninstall(): no unit file means nothing installed, so no lsof, no signal and no default port read", async () => {
   // A port getDefaults() throws on, and a hop that names the port it would warn on.

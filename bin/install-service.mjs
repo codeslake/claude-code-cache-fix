@@ -524,26 +524,27 @@ function reportFsError(prefix, err) {
   return 1;
 }
 
-// On the unit's bind address, spelled as the launcher's own probes spell it (an IPv6 literal bracketed):
-// any other address on the same port is not ours to signal.
-const listeners = (addr, port) => {
-  const r = spawnSync("lsof", ["-nP", "-t", `-iTCP@${addr.includes(":") ? `[${addr}]` : addr}:${port}`, "-sTCP:LISTEN"], { encoding: "utf-8", timeout: 5000 });
-  return { error: r.error, pids: (r.stdout || "").split("\n").filter(Boolean) };
+// Any address: the bind is set by the unit, a drop-in or the manager's environment, and only the
+// command line says whose a listener is. One whose ps cannot be read is skipped.
+const OURS = /\brun-service\b|proxy\/server\.mjs|gap-relay\.mjs/;
+const listeners = (port) => {
+  const r = spawnSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf-8", timeout: 5000 });
+  const ours = (pid) => OURS.test(spawnSync("ps", ["-o", "command=", "-p", pid], { encoding: "utf-8", timeout: 5000 }).stdout || "");
+  return { error: r.error, pids: (r.stdout || "").split("\n").filter(Boolean).filter(ours) };
 };
 
-// SIGHUP every process listening on the installed unit's port. After the first
+// SIGHUP every process of ours listening on the installed unit's port. After the first
 // reload the serving lineage is a detached successor the supervisor no longer
 // tracks (launchd: the job has no PID), so only the port finds it. The holder,
 // the proxy child and a standby all hold that socket and all release on SIGHUP;
 // stop's SIGTERM would leave a standby carrying it. The holder keeps the socket
 // while its child drains, and a reinstall started inside that window exits as
-// surplus and leaves nothing serving, so wait (up to drainMs) until the port is free.
+// surplus and leaves nothing serving, so wait (up to drainMs) until none of ours holds the port.
 async function endLineage(paths, drainMs) {
   const unitText = await readFile(join(paths.configDir, paths.configFile), "utf-8").catch(() => null);
   if (unitText === null) return; // nothing installed, nothing to signal
   const port = /CACHE_FIX_PROXY_PORT(?:=|<\/key>\s*<string>)(\d+)/.exec(unitText)?.[1] ?? "9801"; // the proxy's default, not getDefaults(): it throws on a bad env
-  const bind = /CACHE_FIX_PROXY_BIND(?:=|<\/key>\s*<string>)([^\s<"]+)/.exec(unitText)?.[1] ?? "127.0.0.1"; // the proxy's default
-  let { error, pids } = listeners(bind, port);
+  let { error, pids } = listeners(port);
   if (error) {
     const lead = `[uninstall-service] warning: lsof could not be run (is it on PATH?), so the proxy on port ${port} could not be found; `;
     if (paths.kind === "systemd") {
@@ -559,7 +560,7 @@ async function endLineage(paths, drainMs) {
   }
   for (const deadline = Date.now() + drainMs; pids.length && Date.now() < deadline;) {
     await sleep(100);
-    const r = listeners(bind, port);
+    const r = listeners(port);
     if (!r.error) pids = r.pids; // a failed listing (its 5 s timeout) leaves the port counted as held
   }
   if (pids.length) {
