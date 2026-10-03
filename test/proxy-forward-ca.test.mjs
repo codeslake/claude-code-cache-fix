@@ -265,10 +265,13 @@ for (const { name, opts, after } of [
 // ...and a CA we leave alone may lack an SKI: the leaf is still minted under it.
 // `authorityKeyIdentifier=keyid:always` makes that a hard failure ("unable to
 // get issuer keyid"), which would fall the proxy back to reverse mode.
-test("ensureCA: a foreign CA with no SKI still gets a leaf", () => {
+test("ensureCA: a foreign CA with no SKI still gets a leaf", (t) => {
   withCA({}, (dir) => {
-    plantLegacyCA(dir, { subject: "other", leaf: false,
-                         extras: [[...KU, "-addext", "subjectKeyIdentifier=none"], KU] });
+    const sh = plantLegacyCA(dir, { subject: "other", leaf: false,
+                                    extras: [[...KU, "-addext", "subjectKeyIdentifier=none"], KU] });
+    if (sh(["x509", "-in", "ca.pem", "-noout", "-text"]).stdout.includes("Subject Key Identifier")) {
+      return t.skip("openssl cannot mint a CA with no subjectKeyIdentifier");
+    }
     const before = snapshot(dir);
     const r = ensureCA();
     assertValidPair(r);

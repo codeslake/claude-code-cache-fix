@@ -105,7 +105,6 @@ export function ensureCA() {
       return Buffer.compare(keyPub, certPub) === 0;
     } catch { return false; }
   };
-  const leafKeyMatchesCert = () => keyMatchesCert(leafPem, leafKey);
   // A CA of ours must carry keyUsage and SKI or a strict verifier refuses every
   // leaf. Checked in-process, no spawn inside ready()'s 100 ms loop: node has no
   // keyUsage accessor (its `keyUsage` is the EKU) and LibreSSL lacks `x509 -ext`,
@@ -129,7 +128,7 @@ export function ensureCA() {
   const needsRecert = () => !caIsStrict() && ourCA();
   const pairReady = () =>
     existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey) &&
-    leafCoversAllHosts() && leafKeyMatchesCert();
+    leafCoversAllHosts() && keyMatchesCert(leafPem, leafKey);
   const ready = () => pairReady() && !needsRecert();
   // Every successful return goes through here: normalize private-key modes to
   // 0600 even on reuse — openssl defaults are not guaranteed, and a preexisting
