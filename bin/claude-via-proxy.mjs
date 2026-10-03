@@ -762,18 +762,18 @@ function fingerprintPath(port) {
   return join(tmpdir(), `cache-fix-proxy-${port}.sha256`);
 }
 
-// THE RECORD IS proxy/'s HASH AND THIS HOLDER'S OWN bin/ HASH. The watcher swaps
-// proxy/ and republishes the record, so a record of proxy/ alone read "same" to
-// a start on a newer bin/: the newcomer exited as surplus and the holder's own
-// code never reached the lineage. With both, that start finds "not same", the
-// bind fails EADDRINUSE and takeOver() SIGUSR2s the incumbent, as a reload does.
-// Not folded into codeFingerprint(): the watcher's "unreadable" warning reads it.
+// THE RECORD IS proxy/'s HASH AND THIS HOLDER'S OWN bin/ HASH. The watcher
+// republishes proxy/'s on every swap, so proxy/ alone read "same" to a start on a
+// newer bin/: it exited as surplus and the holder's code never reached the
+// lineage. Now that start finds "not same", the bind fails EADDRINUSE and
+// takeOver() SIGUSR2s the incumbent, as a reload does. Not folded into
+// codeFingerprint(): the watcher's "unreadable" warning reads it.
 //
 // Temp + rename: a reader that opens this mid-write would compare against a
 // truncated hash and retire a healthy proxy.
 function publishFingerprint(port) {
   const fp = codeFingerprint(PROXY_DIR);
-  if (!fp || !HOLDER_TREE) return;
+  if (!fp) return;
   const path = fingerprintPath(port);
   try {
     writeFileSync(`${path}.${process.pid}`, `${fp} ${HOLDER_TREE}`);
