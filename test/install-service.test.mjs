@@ -2,11 +2,11 @@ import { createServer } from "node:net";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { appendFileSync } from "node:fs";
-import { mkdtemp, readFile, writeFile, rm, readdir, mkdir, stat, chmod } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm, readdir, mkdir, stat, chmod, copyFile, symlink } from "node:fs/promises";
 import { tmpdir, platform } from "node:os";
 import { join, dirname } from "node:path";
 import { execFile } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import {
@@ -535,11 +535,35 @@ test("install(): an unsupported platform's hint is a command a POSIX shell runs 
     assert.doesNotMatch(cmd, /[\[\]<>]/);
     return cmd;
   };
-  assert.match(await hint({}), /^CACHE_FIX_PROXY_PORT=9811 \S+ \S*claude-via-proxy\.mjs run-service$/);
+  assert.match(await hint({}), /^CACHE_FIX_PROXY_PORT=9811 '[^']+' '[^']*claude-via-proxy\.mjs' run-service$/);
   assert.match(await hint({ HTTPS_PROXY: "http://127.0.0.1:8118" }),
-    /^CACHE_FIX_PROXY_PORT=9811 CACHE_FIX_UPSTREAM_PROXY='http:\/\/127\.0\.0\.1:8118' \S+ \S*claude-via-proxy\.mjs run-service$/);
+    /^CACHE_FIX_PROXY_PORT=9811 CACHE_FIX_UPSTREAM_PROXY='http:\/\/127\.0\.0\.1:8118' '[^']+' '[^']*claude-via-proxy\.mjs' run-service$/);
   assert.match(await hint({ CACHE_FIX_UPSTREAM_PROXY: "http://u:p'x@h:3128" }),
     /CACHE_FIX_UPSTREAM_PROXY='http:\/\/u:p'\\''x@h:3128' /);
+});
+
+test("install(): the unsupported-platform hint runs as printed when node and the package sit under a path with a space", { skip: platform() === "win32" }, async () => {
+  const dir = await newTmp();
+  const realExec = process.execPath;
+  try {
+    const home = join(dir, "a b");
+    await mkdir(join(home, "bin"), { recursive: true });
+    // install-service.mjs finds the launcher beside itself and its imports one level up: a copy of it
+    // under the spaced path, with the real proxy/ linked in, puts the launcher there too.
+    await copyFile(join(__dirname, "..", "bin", "install-service.mjs"), join(home, "bin", "install-service.mjs"));
+    await symlink(join(__dirname, "..", "proxy"), join(home, "proxy"));
+    const node = join(home, "node");
+    await writeFile(node, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o755 });
+    process.execPath = node;
+    const { install: spaced } = await import(pathToFileURL(join(home, "bin", "install-service.mjs")).href);
+    const none = { CACHE_FIX_UPSTREAM_PROXY: undefined, HTTPS_PROXY: undefined, https_proxy: undefined, CACHE_FIX_PROXY_PORT: "9811" };
+    const err = (await withEnv(none, () => capture(process.stderr, () => spaced({ plat: "freebsd" })))).join("");
+    const { stdout } = await execFileP("sh", ["-c", /`([^`]+)`/.exec(err)[1]]);
+    assert.deepEqual(stdout.trim().split("\n"), [join(home, "bin", "claude-via-proxy.mjs"), "run-service"]);
+  } finally {
+    process.execPath = realExec;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("help: `server` is not described as what systemd/launchd run; the units run run-service", async () => {
@@ -1090,7 +1114,7 @@ const idx = (calls, c) => {
 test("uninstall(): systemd SIGHUPs every holder of the unit's port, after the timer stops and before the unit stops", async () => {
   const calls = await uninstallCalls("linux", "cache-fix-proxy.service", "[Service]\nEnvironment=CACHE_FIX_PROXY_PORT=9877\n");
   const [timer, list, k1, k2, stop] = [
-    "systemctl --user stop cache-fix-proxy-healthcheck.timer", "lsof -nP -t -iTCP:9877 -sTCP:LISTEN",
+    "systemctl --user stop cache-fix-proxy-healthcheck.timer", "lsof -nP -t -iTCP@127.0.0.1:9877 -sTCP:LISTEN",
     "kill SIGHUP 4242", "kill SIGHUP 4243", "systemctl --user stop cache-fix-proxy",
   ].map((c) => idx(calls, c));
   assert.ok(timer < list && list < k1 && k1 < k2 && k2 < stop, `order wrong, got:\n${calls.join("\n")}`);
@@ -1100,7 +1124,7 @@ test("uninstall(): systemd SIGHUPs every holder of the unit's port, after the ti
 test("uninstall(): launchd SIGHUPs every holder of the plist's port before bootout", async () => {
   const calls = await uninstallCalls("darwin", "com.cnighswonger.cache-fix-proxy.plist",
     "<key>CACHE_FIX_PROXY_PORT</key>\n        <string>9877</string>\n");
-  const [list, k1, k2] = ["lsof -nP -t -iTCP:9877 -sTCP:LISTEN", "kill SIGHUP 4242", "kill SIGHUP 4243"].map((c) => idx(calls, c));
+  const [list, k1, k2] = ["lsof -nP -t -iTCP@127.0.0.1:9877 -sTCP:LISTEN", "kill SIGHUP 4242", "kill SIGHUP 4243"].map((c) => idx(calls, c));
   const boot = calls.findIndex((c) => c.startsWith("launchctl bootout"));
   assert.ok(list < k1 && k1 < k2 && k2 < boot, `order wrong, got:\n${calls.join("\n")}`);
   assert.ok(!calls.some((c) => c.startsWith("launchctl kill")), "the job has no PID once a successor serves");
@@ -1110,7 +1134,21 @@ test("uninstall(): a unit that names no port lists the proxy's default 9801, and
   // getDefaults() throws on the first port, and would list 9878 for the second.
   for (const env of [{ CACHE_FIX_PROXY_PORT: "not-a-port" }, { CACHE_FIX_PROXY_PORT: "9878" }]) {
     const calls = await uninstallCalls("linux", "cache-fix-proxy.service", "", env);
-    idx(calls, "lsof -nP -t -iTCP:9801 -sTCP:LISTEN");
+    idx(calls, "lsof -nP -t -iTCP@127.0.0.1:9801 -sTCP:LISTEN");
+  }
+});
+
+test("uninstall(): the listing is scoped to the unit's bind address, as holderPidOn's is, so another address on the same port is not SIGHUP'd", async () => {
+  // Any unit that does not name one binds 127.0.0.1; an IPv6 literal is bracketed the way lsof demands.
+  const cases = [
+    ["linux", "cache-fix-proxy.service", "[Service]\nEnvironment=CACHE_FIX_PROXY_PORT=9877\nEnvironment=CACHE_FIX_PROXY_BIND=::1\n", "[::1]"],
+    ["darwin", "com.cnighswonger.cache-fix-proxy.plist",
+      "<key>CACHE_FIX_PROXY_PORT</key>\n<string>9877</string>\n<key>CACHE_FIX_PROXY_BIND</key>\n<string>10.0.0.5</string>\n", "10.0.0.5"],
+  ];
+  for (const [plat, name, text, addr] of cases) {
+    // The shell's own CACHE_FIX_PROXY_BIND is not the unit's, as the shell's port is not.
+    const calls = await uninstallCalls(plat, name, text, { CACHE_FIX_PROXY_BIND: "0.0.0.0" });
+    idx(calls, `lsof -nP -t -iTCP@${addr}:9877 -sTCP:LISTEN`);
   }
 });
 

@@ -429,11 +429,12 @@ async function install({ force = false, plat } = {}) {
       return reportFsError("install-service", err);
     }
     // run-service exits 2 without a port, and drops an ambient HTTPS_PROXY unless the hop is named.
-    // The line must run as printed: the hop only when captured, single-quoted for POSIX sh.
-    const hop = upstreamProxy ? ` CACHE_FIX_UPSTREAM_PROXY='${upstreamProxy.replaceAll("'", "'\\''")}'` : "";
+    // The line must run as printed: the hop only when captured, every value single-quoted for POSIX sh.
+    const shq = (s) => `'${s.replaceAll("'", "'\\''")}'`;
+    const hop = upstreamProxy ? ` CACHE_FIX_UPSTREAM_PROXY=${shq(upstreamProxy)}` : "";
     process.stderr.write(
       `[install-service] Unsupported platform: ${paths.platform}\n` +
-        `Manual install: run \`CACHE_FIX_PROXY_PORT=${port}${hop} ${process.execPath} ${LAUNCHER_PATH} run-service\` under your platform's service manager.\n`,
+        `Manual install: run \`CACHE_FIX_PROXY_PORT=${port}${hop} ${shq(process.execPath)} ${shq(LAUNCHER_PATH)} run-service\` under your platform's service manager.\n`,
     );
     return 1;
   }
@@ -523,8 +524,10 @@ function reportFsError(prefix, err) {
   return 1;
 }
 
-const listeners = (port) => {
-  const r = spawnSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf-8", timeout: 5000 });
+// On the unit's bind address, spelled as the launcher's own probes spell it (an IPv6 literal bracketed):
+// any other address on the same port is not ours to signal.
+const listeners = (addr, port) => {
+  const r = spawnSync("lsof", ["-nP", "-t", `-iTCP@${addr.includes(":") ? `[${addr}]` : addr}:${port}`, "-sTCP:LISTEN"], { encoding: "utf-8", timeout: 5000 });
   return { error: r.error, pids: (r.stdout || "").split("\n").filter(Boolean) };
 };
 
@@ -539,7 +542,8 @@ async function endLineage(paths, drainMs) {
   const unitText = await readFile(join(paths.configDir, paths.configFile), "utf-8").catch(() => null);
   if (unitText === null) return; // nothing installed, nothing to signal
   const port = /CACHE_FIX_PROXY_PORT(?:=|<\/key>\s*<string>)(\d+)/.exec(unitText)?.[1] ?? "9801"; // the proxy's default, not getDefaults(): it throws on a bad env
-  let { error, pids } = listeners(port);
+  const bind = /CACHE_FIX_PROXY_BIND(?:=|<\/key>\s*<string>)([^\s<"]+)/.exec(unitText)?.[1] ?? "127.0.0.1"; // the proxy's default
+  let { error, pids } = listeners(bind, port);
   if (error) {
     const lead = `[uninstall-service] warning: lsof could not be run (is it on PATH?), so the proxy on port ${port} could not be found; `;
     if (paths.kind === "systemd") {
@@ -555,7 +559,7 @@ async function endLineage(paths, drainMs) {
   }
   for (const deadline = Date.now() + drainMs; pids.length && Date.now() < deadline;) {
     await sleep(100);
-    const r = listeners(port);
+    const r = listeners(bind, port);
     if (!r.error) pids = r.pids; // a failed listing (its 5 s timeout) leaves the port counted as held
   }
   if (pids.length) {
