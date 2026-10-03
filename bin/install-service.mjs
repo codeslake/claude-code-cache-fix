@@ -414,7 +414,7 @@ async function uninstallLaunchd({ paths } = {}) {
 }
 
 // A changed unit never reaches the serving lineage: start finds a holder on the
-// same proxy/ tree and exits as surplus. Only an uninstall ends the lineage.
+// same proxy/ and bin/ trees and exits as surplus. Only an uninstall ends the lineage.
 const CHANGE_SETTINGS =
   "To change an installed service's settings, run `cache-fix-proxy uninstall-service`, then install-service " +
   "with the new settings and the steps above; the uninstall ends the running proxy, so this one cuts.\n";
@@ -429,11 +429,12 @@ async function install({ force = false, plat } = {}) {
       return reportFsError("install-service", err);
     }
     // run-service exits 2 without a port, and drops an ambient HTTPS_PROXY unless the hop is named.
-    // The line must run as printed: the hop only when captured, single-quoted for POSIX sh.
-    const hop = upstreamProxy ? ` CACHE_FIX_UPSTREAM_PROXY='${upstreamProxy.replaceAll("'", "'\\''")}'` : "";
+    // The line must run as printed: the hop only when captured, every value single-quoted for POSIX sh.
+    const shq = (s) => `'${s.replaceAll("'", "'\\''")}'`;
+    const hop = upstreamProxy ? ` CACHE_FIX_UPSTREAM_PROXY=${shq(upstreamProxy)}` : "";
     process.stderr.write(
       `[install-service] Unsupported platform: ${paths.platform}\n` +
-        `Manual install: run \`CACHE_FIX_PROXY_PORT=${port}${hop} ${process.execPath} ${LAUNCHER_PATH} run-service\` under your platform's service manager.\n`,
+        `Manual install: run \`CACHE_FIX_PROXY_PORT=${port}${hop} ${shq(process.execPath)} ${shq(LAUNCHER_PATH)} run-service\` under your platform's service manager.\n`,
     );
     return 1;
   }
@@ -474,7 +475,7 @@ async function install({ force = false, plat } = {}) {
         `  loginctl enable-linger ${process.env.USER || "<your-user>"}      # optional: start on boot vs login\n\n` +
         `After a package update, hand over instead of restarting (a handover keeps the port accepting throughout; a restart refuses connections for a moment):\n` +
         `  systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy\n` +
-        `Why both: after the first reload the serving holder is a successor the unit no longer tracks, so reload alone works once; start hands over to it, or does nothing when the proxy/ tree is the same.\n` +
+        `Why both: after the first reload the serving holder is a successor the unit no longer tracks, so reload alone works once; start hands over to it, or does nothing when the proxy/ and bin/ trees are the same.\n` +
         CHANGE_SETTINGS +
         `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
@@ -500,7 +501,7 @@ async function install({ force = false, plat } = {}) {
         `  launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n\n` +
         `After a package update, hand over instead of restarting (a handover keeps the port accepting throughout; a restart refuses connections for a moment):\n` +
         `  launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
-        `Why both: after the first handover the serving holder is a successor the job no longer tracks, so the signal works once; kickstart (no -k) hands over to it, or does nothing when the proxy/ tree is the same.\n` +
+        `Why both: after the first handover the serving holder is a successor the job no longer tracks, so the signal works once; kickstart (no -k) hands over to it, or does nothing when the proxy/ and bin/ trees are the same.\n` +
         CHANGE_SETTINGS +
         `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
@@ -523,18 +524,22 @@ function reportFsError(prefix, err) {
   return 1;
 }
 
+// Any address: the bind is set by the unit, a drop-in or the manager's environment, and only the
+// command line says whose a listener is. One whose ps cannot be read is skipped.
+const OURS = /\brun-service\b|proxy\/server\.mjs|gap-relay\.mjs/;
 const listeners = (port) => {
   const r = spawnSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf-8", timeout: 5000 });
-  return { error: r.error, pids: (r.stdout || "").split("\n").filter(Boolean) };
+  const ours = (pid) => OURS.test(spawnSync("ps", ["-o", "command=", "-p", pid], { encoding: "utf-8", timeout: 5000 }).stdout || "");
+  return { error: r.error, pids: (r.stdout || "").split("\n").filter(Boolean).filter(ours) };
 };
 
-// SIGHUP every process listening on the installed unit's port. After the first
+// SIGHUP every process of ours listening on the installed unit's port. After the first
 // reload the serving lineage is a detached successor the supervisor no longer
 // tracks (launchd: the job has no PID), so only the port finds it. The holder,
 // the proxy child and a standby all hold that socket and all release on SIGHUP;
 // stop's SIGTERM would leave a standby carrying it. The holder keeps the socket
 // while its child drains, and a reinstall started inside that window exits as
-// surplus and leaves nothing serving, so wait (up to drainMs) until the port is free.
+// surplus and leaves nothing serving, so wait (up to drainMs) until none of ours holds the port.
 async function endLineage(paths, drainMs) {
   const unitText = await readFile(join(paths.configDir, paths.configFile), "utf-8").catch(() => null);
   if (unitText === null) return; // nothing installed, nothing to signal

@@ -443,7 +443,7 @@ npm install -g claude-code-cache-fix@4
 systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-无需 `daemon-reload` —— 单元文件内容不变。首次 reload 之后，提供服务的进程是单元不再跟踪的后继进程，因此单独 `reload` 只能生效一次；之后由 `start` 向它交接（`proxy/` 树相同时什么也不做）。
+无需 `daemon-reload` —— 单元文件内容不变。首次 reload 之后，提供服务的进程是单元不再跟踪的后继进程，因此单独 `reload` 只能生效一次；之后由 `start` 向它交接（`proxy/` 和 `bin/` 树都相同时什么也不做）。
 
 **macOS (launchd 用户代理)：**
 
@@ -458,7 +458,7 @@ launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchct
 
 ### 流程 2 —— 在监督层恢复热重载
 
-如果您积极使用热重载（例如，您在运行的代理中将自定义扩展放入扩展目录并希望它们在不重启的情况下被拾取），请运行此操作。这会重写单元 / plist，使每次监督者启动代理时都设置 `CACHE_FIX_HOT_RELOAD=on`。更改后的单元不会到达正在服务的代理（`reload` 和 `start` 仅在 `proxy/` 树变化时才交接），因此先卸载服务：`uninstall-service` 会结束正在运行的代理，这会中断一次。
+如果您积极使用热重载（例如，您在运行的代理中将自定义扩展放入扩展目录并希望它们在不重启的情况下被拾取），请运行此操作。这会重写单元 / plist，使每次监督者启动代理时都设置 `CACHE_FIX_HOT_RELOAD=on`。更改后的单元不会到达正在服务的代理（`reload` 和 `start` 仅在 `proxy/` 或 `bin/` 树变化时才交接），因此先卸载服务：`uninstall-service` 会结束正在运行的代理，这会中断一次。
 
 **Linux (systemd 用户单元)：**
 

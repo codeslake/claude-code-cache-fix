@@ -799,6 +799,13 @@ function fingerprintPath(port) {
   return join(tmpdir(), `${RECORD_PREFIX}${port}${RECORD_SUFFIX}`);
 }
 
+// THE RECORD IS proxy/'s HASH AND THIS HOLDER'S OWN bin/ HASH. The watcher
+// republishes proxy/'s on every swap, so proxy/ alone read "same" to a start on a
+// newer bin/: it exited as surplus and the holder's code never reached the
+// lineage. Now that start finds "not same", the bind fails EADDRINUSE and
+// takeOver() SIGUSR2s the incumbent, as a reload does. Not folded into
+// codeFingerprint(): the watcher's "unreadable" warning reads it.
+//
 // Temp + rename: a reader that opens this mid-write would compare against a
 // truncated hash and retire a healthy proxy.
 function publishFingerprint(port) {
@@ -806,7 +813,7 @@ function publishFingerprint(port) {
   if (!fp) return;
   const path = fingerprintPath(port);
   try {
-    writeFileSync(`${path}.${process.pid}`, fp);
+    writeFileSync(`${path}.${process.pid}`, `${fp} ${HOLDER_TREE}`);
     renameSync(`${path}.${process.pid}`, path);
   } catch { /* best effort: an unwritable tmpdir must not stop a proxy starting */ }
 }
@@ -898,8 +905,8 @@ function runningOurCode(port) {
   try { theirs = readFileSync(fingerprintPath(port), "utf8").trim(); } catch { return null; }
   if (!theirs) return null;                       // no record: cannot tell
   const ours = codeFingerprint(PROXY_DIR);
-  if (!ours) return null;                         // cannot read our own: same
-  return theirs === ours;
+  if (!ours || !HOLDER_TREE) return null;         // cannot read our own: same
+  return theirs === `${ours} ${HOLDER_TREE}`;
 }
 
 function holdPort(rest) {

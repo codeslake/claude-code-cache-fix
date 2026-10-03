@@ -2,11 +2,11 @@ import { createServer } from "node:net";
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { appendFileSync } from "node:fs";
-import { mkdtemp, readFile, writeFile, rm, readdir, mkdir, stat, chmod } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm, readdir, mkdir, stat, chmod, copyFile, symlink } from "node:fs/promises";
 import { tmpdir, platform } from "node:os";
 import { join, dirname } from "node:path";
 import { execFile } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { armLineage, reapStamped } from "./proc-helpers.mjs";
@@ -542,11 +542,35 @@ test("install(): an unsupported platform's hint is a command a POSIX shell runs 
     assert.doesNotMatch(cmd, /[\[\]<>]/);
     return cmd;
   };
-  assert.match(await hint({}), /^CACHE_FIX_PROXY_PORT=9811 \S+ \S*claude-via-proxy\.mjs run-service$/);
+  assert.match(await hint({}), /^CACHE_FIX_PROXY_PORT=9811 '[^']+' '[^']*claude-via-proxy\.mjs' run-service$/);
   assert.match(await hint({ HTTPS_PROXY: "http://127.0.0.1:8118" }),
-    /^CACHE_FIX_PROXY_PORT=9811 CACHE_FIX_UPSTREAM_PROXY='http:\/\/127\.0\.0\.1:8118' \S+ \S*claude-via-proxy\.mjs run-service$/);
+    /^CACHE_FIX_PROXY_PORT=9811 CACHE_FIX_UPSTREAM_PROXY='http:\/\/127\.0\.0\.1:8118' '[^']+' '[^']*claude-via-proxy\.mjs' run-service$/);
   assert.match(await hint({ CACHE_FIX_UPSTREAM_PROXY: "http://u:p'x@h:3128" }),
     /CACHE_FIX_UPSTREAM_PROXY='http:\/\/u:p'\\''x@h:3128' /);
+});
+
+test("install(): the unsupported-platform hint runs as printed when node and the package sit under a path with a space", { skip: platform() === "win32" }, async () => {
+  const dir = await newTmp();
+  const realExec = process.execPath;
+  try {
+    const home = join(dir, "a b");
+    await mkdir(join(home, "bin"), { recursive: true });
+    // install-service.mjs finds the launcher beside itself and its imports one level up: a copy of it
+    // under the spaced path, with the real proxy/ linked in, puts the launcher there too.
+    await copyFile(join(__dirname, "..", "bin", "install-service.mjs"), join(home, "bin", "install-service.mjs"));
+    await symlink(join(__dirname, "..", "proxy"), join(home, "proxy"));
+    const node = join(home, "node");
+    await writeFile(node, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o755 });
+    process.execPath = node;
+    const { install: spaced } = await import(pathToFileURL(join(home, "bin", "install-service.mjs")).href);
+    const none = { CACHE_FIX_UPSTREAM_PROXY: undefined, HTTPS_PROXY: undefined, https_proxy: undefined, CACHE_FIX_PROXY_PORT: "9811" };
+    const err = (await withEnv(none, () => capture(process.stderr, () => spaced({ plat: "freebsd" })))).join("");
+    const { stdout } = await execFileP("sh", ["-c", /`([^`]+)`/.exec(err)[1]]);
+    assert.deepEqual(stdout.trim().split("\n"), [join(home, "bin", "claude-via-proxy.mjs"), "run-service"]);
+  } finally {
+    process.execPath = realExec;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("help: `server` is not described as what systemd/launchd run; the units run run-service", async () => {
@@ -1047,16 +1071,22 @@ test("getDefaults: a fallback proxy variable naming the service's own port is no
   assert.match(warned[0], /CACHE_FIX_UPSTREAM_PROXY/);
 });
 
-// Stand-ins for BOTH service managers' CLIs and for lsof that only log their
-// argv, and a process.kill that only logs, so a case can read the ORDER uninstall()
+// Stand-ins for BOTH service managers' CLIs, for lsof and for ps, and a process.kill
+// that only logs, so a case can read the ORDER uninstall()
 // issued its commands and signals in, and never reaches a real service manager
 // or a real pid. Both managers, so a case whose platform branch is wrong still
-// stays off the host's real one. The lsof lists two pids for its first `lists`
-// calls and none after (the holder draining); `noLsof` leaves it off PATH. A
+// stays off the host's real one. The lsof lists the `holders` (a pid, the address it
+// listens on, and the command line the ps answers with, null for a ps that fails) that the
+// request's -iTCP spec reaches, for its first `lists` calls and none after (the holder
+// draining; one marked `stays` is listed for ever); `noLsof` leaves it off PATH. A
 // null unitText installs no unit. The result carries uninstall()'s stderr as `.stderr`.
 // `failOn` makes that call of the lsof fail the way its 5 s timeout does: spawnSync's own `error`
 // (here ENOBUFS, more than maxBuffer of blank lines) beside an empty list.
-async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, noLsof = false, drainMs = 300, failOn = 0 } = {}) {
+const LINEAGE = [
+  { pid: 4242, addr: "127.0.0.1", cmd: "node /opt/pkg/bin/claude-via-proxy.mjs run-service" },
+  { pid: 4243, addr: "127.0.0.1", cmd: "node /opt/pkg/proxy/server.mjs" },
+];
+async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, noLsof = false, drainMs = 300, failOn = 0, holders = LINEAGE } = {}) {
   const dir = await newTmp();
   const realKill = process.kill;
   try {
@@ -1069,8 +1099,12 @@ async function uninstallCalls(plat, unitName, unitText, env = {}, { lists = 1, n
       await writeFile(join(bin, "lsof"),
         `#!/bin/sh\necho "lsof $*" >> "${log}"\nn=0; [ -f "${count}" ] && read n < "${count}"\nn=$((n+1)); echo $n > "${count}"\n` +
         `[ $n -eq ${failOn} ] && { head -c 2000000 /dev/zero | tr '\\0' '\\n'; exit 0; }\n` +
-        `[ $n -le ${lists} ] && echo 4242 && echo 4243\nexit 0\n`, { mode: 0o755 });
+        `spec=; for a in "$@"; do case "$a" in -iTCP*) spec="\${a#-iTCP}";; esac; done\n` +
+        holders.map((h) => `${h.stays ? "" : `[ $n -le ${lists} ] && `}case "$spec" in :*|"@${h.addr}":*) echo ${h.pid};; esac\n`).join("") +
+        `exit 0\n`, { mode: 0o755 });
     }
+    await writeFile(join(bin, "ps"), `#!/bin/sh\nfor a; do p=$a; done\n` +
+      holders.filter((h) => h.cmd).map((h) => `[ "$p" = ${h.pid} ] && { echo '${h.cmd}'; exit 0; }\n`).join("") + `exit 1\n`, { mode: 0o755 });
     const unitDir = plat === "linux" ? join(dir, ".config", "systemd", "user") : join(dir, "Library", "LaunchAgents");
     await mkdir(unitDir, { recursive: true });
     if (unitText !== null) await writeFile(join(unitDir, unitName), unitText);
@@ -1125,6 +1159,33 @@ const SYSTEMD = ["linux", "cache-fix-proxy.service", "[Service]\nEnvironment=CAC
 const LAUNCHD = ["darwin", "com.cnighswonger.cache-fix-proxy.plist", "<key>CACHE_FIX_PROXY_PORT</key>\n        <string>9877</string>\n"];
 const lsofCalls = (calls) => calls.filter((c) => c.startsWith("lsof "));
 const endIdx = (calls) => calls.findIndex((c) => c === "systemctl --user stop cache-fix-proxy" || c.startsWith("launchctl bootout"));
+const sighups = (calls) => calls.filter((c) => c.startsWith("kill SIGHUP "));
+
+test("uninstall(): a process of ours is SIGHUP'd on whatever address it listens on, one per way of naming our lineage", async () => {
+  // The unit names no bind, yet a bind set by a drop-in or the manager's environment reaches the proxy.
+  const holders = [
+    { pid: 4242, addr: "0.0.0.0", cmd: "node /opt/pkg/bin/claude-via-proxy.mjs run-service" },
+    { pid: 4243, addr: "10.0.0.5", cmd: "node /opt/pkg/proxy/server.mjs" },
+    { pid: 4244, addr: "::1", cmd: "node /opt/pkg/bin/gap-relay.mjs" },
+  ];
+  for (const [plat, name, text] of [SYSTEMD, LAUNCHD]) {
+    const calls = await uninstallCalls(plat, name, text, {}, { holders });
+    assert.deepEqual(sighups(calls), ["kill SIGHUP 4242", "kill SIGHUP 4243", "kill SIGHUP 4244"], `${plat}:\n${calls.join("\n")}`);
+  }
+});
+
+test("uninstall(): a foreign process on the unit's port is neither SIGHUP'd nor waited for, and a pid whose ps cannot be read is skipped", async () => {
+  const holders = [
+    ...LINEAGE,
+    { pid: 4244, addr: "10.0.0.5", cmd: "python3 -m http.server 9877", stays: true },
+    { pid: 4245, addr: "127.0.0.1", cmd: null, stays: true },
+  ];
+  for (const [plat, name, text] of [SYSTEMD, LAUNCHD]) {
+    const calls = await uninstallCalls(plat, name, text, {}, { holders });
+    assert.deepEqual(sighups(calls), ["kill SIGHUP 4242", "kill SIGHUP 4243"], `${plat}:\n${calls.join("\n")}`);
+    assert.doesNotMatch(calls.stderr, /still held/, `${plat}: only our own processes keep the drain waiting`);
+  }
+});
 
 test("uninstall(): no unit file means nothing installed, so no lsof, no signal and no default port read", async () => {
   // A port getDefaults() throws on, and a hop that names the port it would warn on.
@@ -1211,7 +1272,7 @@ test("install-service: next steps reload, never restart; a missing lsof warns an
     assert.doesNotMatch(noLsof.stdout, /in-flight/);
     // A changed unit never reaches the serving lineage: only an uninstall ends it.
     assert.ok(noLsof.stdout.includes(SETTINGS_LINE));
-    assert.ok(noLsof.stdout.includes("or does nothing when the proxy/ tree is the same."));
+    assert.ok(noLsof.stdout.includes("or does nothing when the proxy/ and bin/ trees are the same."));
     assert.match(noLsof.stderr, /lsof/, "no lsof on PATH must warn");
     // Control: the same install with an lsof on PATH is silent, so the warning
     // above came from the missing binary and not from anything else on stderr.
@@ -1236,7 +1297,7 @@ test("install(): the launchd next steps update by SIGUSR2, then kickstart withou
     assert.ok(out.includes(CONTRAST), out);
     assert.doesNotMatch(out, /in-flight/);
     assert.ok(out.includes(SETTINGS_LINE));
-    assert.ok(out.includes("or does nothing when the proxy/ tree is the same."));
+    assert.ok(out.includes("or does nothing when the proxy/ and bin/ trees are the same."));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
