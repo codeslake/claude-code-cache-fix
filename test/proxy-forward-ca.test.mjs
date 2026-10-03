@@ -174,6 +174,52 @@ test("ensureCA: reuses the CA across calls (does not rotate the root)", () => {
   });
 });
 
+// The reuse path above must not carry a CA minted before the extensions a strict
+// verifier requires (Python 3.13's default context sets VERIFY_X509_STRICT).
+// Every install whose CA predates 84ba7c2 serves a CA with no keyUsage, and
+// every leaf re-signed under it fails `openssl verify -x509_strict` with "CA
+// cert does not include key usage extension"; a plain verify passes, so node
+// never noticed. Re-certifying (same key, same subject) fixes it without the
+// rotation that would orphan a running session's captured bundle: the OLD CA
+// must still verify the NEW leaf.
+for (const { fault, absent, extra } of [
+  { fault: "no keyUsage", absent: "X509v3 Key Usage", extra: [] },
+  { fault: "no subjectKeyIdentifier", absent: "X509v3 Subject Key Identifier",
+    extra: ["-addext", "keyUsage=critical,keyCertSign,cRLSign", "-addext", "subjectKeyIdentifier=none"] },
+]) {
+  test(`ensureCA: a reused CA with ${fault} is re-certified from the same key`, (t) => {
+    withCA({}, (dir) => {
+      const sh = (args) => spawnSync("openssl", args, { cwd: dir, encoding: "utf8" });
+      const ok = (args) => { const r = sh(args); assert.equal(r.status, 0, r.stderr); };
+      const text = () => sh(["x509", "-in", "ca.pem", "-noout", "-text"]).stdout;
+      // The argv from before 84ba7c2: no -addext at all.
+      const minted = sh(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem",
+                         "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA", ...extra]);
+      // A verifier that cannot mint this fault (LibreSSL has no `none`) cannot ask the question.
+      if (minted.status !== 0 || text().includes(absent)) return t.skip(`openssl cannot mint a CA with ${fault}`);
+      ok(["genrsa", "-out", "leaf.key", "2048"]);
+      ok(["req", "-new", "-key", "leaf.key", "-out", "leaf.csr", "-subj", "/CN=api.anthropic.com"]);
+      writeFileSync(join(dir, "leaf.ext"), "subjectAltName=DNS:api.anthropic.com\nextendedKeyUsage=serverAuth\n");
+      ok(["x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-set_serial", "0x01",
+          "-out", "leaf.pem", "-days", "3650", "-extfile", "leaf.ext"]);
+      const caKeyBefore = readFileSync(join(dir, "ca.key"));
+      const oldCa = readFileSync(join(dir, "ca.pem"));
+      writeFileSync(join(dir, "old-ca.pem"), oldCa);
+
+      const r = ensureCA();
+
+      assertValidPair(r);
+      assert.equal(sh(["verify", "-x509_strict", "-CAfile", "ca.pem", "leaf.pem"]).status, 0,
+                   "the re-signed leaf still fails a strict verifier");
+      assert.equal(sh(["verify", "-CAfile", "old-ca.pem", "leaf.pem"]).status, 0,
+                   "the OLD CA no longer verifies the new leaf: a running session's bundle is orphaned");
+      const spki = (pem) => new X509Certificate(pem).publicKey.export({ type: "spki", format: "der" });
+      assert.equal(Buffer.compare(spki(readFileSync(join(dir, "ca.pem"))), spki(oldCa)), 0, "the CA key was rotated");
+      assert.equal(Buffer.compare(readFileSync(join(dir, "ca.key")), caKeyBefore), 0, "ca.key changed");
+    });
+  });
+}
+
 // Blocker #1 (never generate without the lock): a .gen.lock owned by a LIVE
 // process means a generator is really working (or wedged) — after the bounded
 // wait, ensureCA must refuse to generate over it rather than fall through,
