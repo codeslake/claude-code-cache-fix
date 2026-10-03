@@ -1204,7 +1204,7 @@ test("install-service: next steps reload, never restart; a missing lsof warns an
     assert.doesNotMatch(noLsof.stdout, /in-flight/);
     // A changed unit never reaches the serving lineage: only an uninstall ends it.
     assert.ok(noLsof.stdout.includes(SETTINGS_LINE));
-    assert.ok(noLsof.stdout.includes("or does nothing when the proxy/ tree is the same."));
+    assert.ok(noLsof.stdout.includes("or does nothing when the proxy/ and bin/ trees are the same."));
     assert.match(noLsof.stderr, /lsof/, "no lsof on PATH must warn");
     // Control: the same install with an lsof on PATH is silent, so the warning
     // above came from the missing binary and not from anything else on stderr.
@@ -1229,7 +1229,7 @@ test("install(): the launchd next steps update by SIGUSR2, then kickstart withou
     assert.ok(out.includes(CONTRAST), out);
     assert.doesNotMatch(out, /in-flight/);
     assert.ok(out.includes(SETTINGS_LINE));
-    assert.ok(out.includes("or does nothing when the proxy/ tree is the same."));
+    assert.ok(out.includes("or does nothing when the proxy/ and bin/ trees are the same."));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

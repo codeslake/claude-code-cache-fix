@@ -553,7 +553,7 @@ npm install -g claude-code-cache-fix@4
 systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-No `daemon-reload` required — the unit file content is unchanged. After the first reload the serving process is a successor the unit no longer tracks, so `reload` alone works once; `start` then hands over to it (and does nothing when the `proxy/` tree is the same).
+No `daemon-reload` required — the unit file content is unchanged. After the first reload the serving process is a successor the unit no longer tracks, so `reload` alone works once; `start` then hands over to it (and does nothing when the `proxy/` and `bin/` trees are the same).
 
 **macOS (launchd user agent):**
 
@@ -568,7 +568,7 @@ A unit or plist installed by an earlier version runs the bare proxy and has no r
 
 ### Flow 2 — opt back into hot-reload at the supervisor layer
 
-Run if you actively use hot-reload (e.g., you drop custom extensions into the extensions dir on a live proxy and want them picked up without restart). This rewrites the unit / plist so `CACHE_FIX_HOT_RELOAD=on` is set every time the supervisor starts the proxy. A changed unit never reaches the serving proxy (`reload` and `start` hand over only when the `proxy/` tree changed), so the service is uninstalled first: `uninstall-service` ends the running proxy, and this one cuts once.
+Run if you actively use hot-reload (e.g., you drop custom extensions into the extensions dir on a live proxy and want them picked up without restart). This rewrites the unit / plist so `CACHE_FIX_HOT_RELOAD=on` is set every time the supervisor starts the proxy. A changed unit never reaches the serving proxy (`reload` and `start` hand over only when the `proxy/` or `bin/` tree changed), so the service is uninstalled first: `uninstall-service` ends the running proxy, and this one cuts once.
 
 **Linux (systemd user unit):**
 

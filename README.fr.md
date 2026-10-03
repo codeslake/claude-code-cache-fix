@@ -387,7 +387,7 @@ npm install -g claude-code-cache-fix@4
 systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-Après le premier reload, le processus qui sert est un successeur que l'unité ne suit plus : `reload` seul ne marche donc qu'une fois, puis `start` lui passe le relais (et ne fait rien si l'arbre `proxy/` est identique).
+Après le premier reload, le processus qui sert est un successeur que l'unité ne suit plus : `reload` seul ne marche donc qu'une fois, puis `start` lui passe le relais (et ne fait rien si les arbres `proxy/` et `bin/` sont identiques).
 
 **macOS (launchd user agent) :**
 
@@ -402,7 +402,7 @@ Une unité ou un plist installé par une version antérieure exécute le proxy n
 
 ### Flux 2 — réactivation du hot-reload au niveau superviseur
 
-Une unité modifiée n'atteint jamais le proxy en service (`reload` et `start` ne passent le relais que si l'arbre `proxy/` a changé) : on désinstalle donc d'abord le service. `uninstall-service` termine le proxy en cours, et cela coupe une fois.
+Une unité modifiée n'atteint jamais le proxy en service (`reload` et `start` ne passent le relais que si l'arbre `proxy/` ou `bin/` a changé) : on désinstalle donc d'abord le service. `uninstall-service` termine le proxy en cours, et cela coupe une fois.
 
 **Linux :**
 

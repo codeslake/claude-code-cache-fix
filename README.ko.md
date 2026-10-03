@@ -442,7 +442,7 @@ npm install -g claude-code-cache-fix@4
 systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-`daemon-reload`는 필요하지 않으며, 유닛 파일 내용은 변경되지 않았습니다. 첫 번째 reload 이후에는 서비스 중인 프로세스가 유닛이 더 이상 추적하지 않는 후속 프로세스이므로 `reload`만으로는 한 번만 동작하며, 이후에는 `start`가 그 프로세스에 인계합니다(`proxy/` 트리가 같으면 아무 일도 하지 않습니다).
+`daemon-reload`는 필요하지 않으며, 유닛 파일 내용은 변경되지 않았습니다. 첫 번째 reload 이후에는 서비스 중인 프로세스가 유닛이 더 이상 추적하지 않는 후속 프로세스이므로 `reload`만으로는 한 번만 동작하며, 이후에는 `start`가 그 프로세스에 인계합니다(`proxy/`와 `bin/` 트리가 모두 같으면 아무 일도 하지 않습니다).
 
 **macOS (launchd 사용자 에이전트):**
 
@@ -457,7 +457,7 @@ launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchct
 
 ### 흐름 2 — 관리자 레벨에서 핫리로드 재활성화
 
-핫리로드를 활성화하는 경우(예: 사용 중인 프록시에 사용자 확장을 확장 디렉토리에 배치하고 재시작 없이 선택하려는 경우), 다음 작업을 실행하세요. 이 작업은 유닛 / plist를 재작성하여 관리자가 프록시를 시작할 때마다 `CACHE_FIX_HOT_RELOAD=on`이 설정되도록 합니다. 변경된 유닛은 서비스 중인 프록시에 전달되지 않으므로(`reload`와 `start`는 `proxy/` 트리가 바뀐 경우에만 인계합니다) 서비스를 먼저 제거합니다. `uninstall-service`가 실행 중인 프록시를 종료하므로 한 번 끊깁니다.
+핫리로드를 활성화하는 경우(예: 사용 중인 프록시에 사용자 확장을 확장 디렉토리에 배치하고 재시작 없이 선택하려는 경우), 다음 작업을 실행하세요. 이 작업은 유닛 / plist를 재작성하여 관리자가 프록시를 시작할 때마다 `CACHE_FIX_HOT_RELOAD=on`이 설정되도록 합니다. 변경된 유닛은 서비스 중인 프록시에 전달되지 않으므로(`reload`와 `start`는 `proxy/` 또는 `bin/` 트리가 바뀐 경우에만 인계합니다) 서비스를 먼저 제거합니다. `uninstall-service`가 실행 중인 프록시를 종료하므로 한 번 끊깁니다.
 
 **Linux (systemd 사용자 유닛):**
 
