@@ -298,10 +298,7 @@ for (const { name, skip, inject } of [
   test(`ensureCA: serves the existing pair when ${name}`, { skip }, (t) => {
     withCA({ CACHE_FIX_CA_LOCK_WAIT_MS: "5000" }, (dir) => {
       const sh = plantLegacyCA(dir);
-      // A fixture CA that already carries keyUsage needs no re-certification, so there is nothing to fail.
-      if (sh(["x509", "-in", "ca.pem", "-noout", "-text"]).stdout.includes("X509v3 Key Usage")) {
-        return t.skip("openssl cannot mint a CA with no keyUsage");
-      }
+      if (sh(["x509", "-in", "ca.pem", "-noout", "-text"]).stdout.includes("X509v3 Key Usage")) return t.skip("openssl cannot mint a CA with no keyUsage");
       const before = snapshot(dir);
       const restore = inject(dir);
       const write = process.stderr.write;
