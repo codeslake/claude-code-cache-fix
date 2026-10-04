@@ -40,13 +40,16 @@ export const cmdOf = (pid) => {
 //
 // Filtered HERE and not at the call sites, because it already existed at some of
 // them and the rest never got it.
+//
+// lsof exits 1 on ANY error it hit (a process vanishing mid-scan under load is
+// one) and still prints the pids it found, so a throw keeps its stdout.
 export function listeners(port) {
+  let out;
   try {
-    return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split("\n").filter(Boolean)
-      .filter((p) => OURS.test(cmdOf(p)));
-  } catch { return []; }
+    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch (e) { out = e.stdout ?? ""; }
+  return out.trim().split("\n").filter(Boolean).filter((p) => OURS.test(cmdOf(p)));
 }
 
 // EVERY FIXTURE ON A PORT, LISTENING OR NOT.

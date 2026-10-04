@@ -17,6 +17,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
+import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
@@ -67,6 +68,24 @@ describe("fixture reaping", () => {
         `are what later files' readiness assertions time out on`);
     } finally {
       try { kid.kill("SIGKILL"); } catch { }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the pids lsof printed when it exits non-zero", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ccf-reap-"));
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    writeFileSync(join(dir, "bin", "idle.mjs"), "setTimeout(() => {}, 20000);\n");
+    const kid = spawn(process.execPath, [join(dir, "bin", "idle.mjs")], { stdio: "ignore" });
+    await once(kid, "spawn");
+    writeFileSync(join(dir, "lsof"), `#!/bin/sh\necho ${kid.pid}\nexit 1\n`, { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${dir}:${path}`;
+    try {
+      assert.deepEqual(listeners(1), [String(kid.pid)]);
+    } finally {
+      process.env.PATH = path;
+      kid.kill("SIGKILL");
       rmSync(dir, { recursive: true, force: true });
     }
   });
