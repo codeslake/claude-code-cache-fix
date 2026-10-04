@@ -1,6 +1,7 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { once } from "node:events";
 import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -345,6 +346,19 @@ it("cuts nothing on the held port while the proxy restarts", async () => {
   });
 });
 
+const hit = (port) => http.get({ host: "127.0.0.1", port, path: "/health", agent: false });
+// "ok", "ERR:<status> <body>", an error code, or "HUNG" once `ms` pass in silence.
+const verdict = (r, ms) => new Promise((res) => {
+  r.on("response", (q) => {
+    let b = ""; q.on("data", (d) => (b += d));
+    q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode} ${b.slice(0, 160)}`));
+  });
+  // Timers run before the poll phase, so after a runner stall a reply that is
+  // already on the socket would read as HUNG. One turn lets it be delivered first.
+  r.setTimeout(ms, () => setImmediate(() => { r.destroy(); res("HUNG"); }));
+  r.on("error", (e) => res(e.code || "ERR"));
+});
+
 // NOTHING IS KILLED HERE. The holder and the proxy hold the SAME listening
 // socket, and the kernel gives each connection to exactly one of them — so a
 // holder that stays open eats a share of ordinary traffic, and a net.Server
@@ -359,22 +373,36 @@ it("cuts nothing on the held port while the proxy restarts", async () => {
 // requests: hung=36 acceptedByHolder=36, exactly 1:1.
 it("serves every concurrent request while nothing restarts", async () => {
   await withHeldPort(async ({ port }) => {
-    const one = () => new Promise((res) => {
-      const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (q) => {
-        let b = ""; q.on("data", (d) => (b += d));
-        q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode} ${b.slice(0, 160)}`));
-      });
-      // Well under the 8s a hung accept would cost, and far above a served
-      // request on loopback: the failure this catches is unbounded, not slow.
-      r.setTimeout(3_000, () => { r.destroy(); res("HUNG"); });
-      r.on("error", (e) => res(e.code || "ERR"));
-    });
-    const out = await Promise.all(Array.from({ length: 200 }, one));
+    // Well under the 8s a hung accept would cost, and far above a served
+    // request on loopback: the failure this catches is unbounded, not slow.
+    const out = await Promise.all(Array.from({ length: 200 }, () => verdict(hit(port), 3_000)));
     const bad = out.filter((r) => r !== "ok");
     assert.equal(bad.length, 0,
       `${bad.length} of 200 concurrent requests were not served: ` +
       `${[...new Set(bad)].join(", ")} — the holder is accepting connections it cannot answer`);
   });
+});
+
+// A stalled runner is not a hung connection. With the runner's loop blocked past
+// the 3s clock above (24 cases shelling out to lsof/ps in one process, on a loaded
+// box: measured 7-22s), every timer fires together in the next turn, ahead of the
+// poll phase that would have read the replies already on the sockets. Measured:
+// "200 of 200 concurrent requests were not served: HUNG". The healthy server is in
+// ANOTHER process, since one in this loop would stall with it.
+it("does not read a reply that arrived during a runner stall as HUNG", async () => {
+  const srv = spawn(process.execPath, ["-e",
+    `const s = require("http").createServer((q, r) => r.end("ok"));
+     s.listen(0, "127.0.0.1", () => process.stdout.write(String(s.address().port)));`], { stdio: ["ignore", "pipe", "inherit"] });
+  try {
+    const port = Number(await new Promise((r) => srv.stdout.once("data", r)));
+    const reqs = Array.from({ length: 20 }, () => hit(port));
+    const out = reqs.map((r) => verdict(r, 250));
+    await Promise.all(reqs.map((r) => once(r, "finish")));   // every request is out
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+    assert.deepEqual([...new Set(await Promise.all(out))], ["ok"], "every reply was already on its socket");
+  } finally {
+    srv.kill("SIGKILL");
+  }
 });
 
 // A client that aborts mid-request (Ctrl-C, a cancelled tool call) sends RST,
