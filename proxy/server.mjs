@@ -725,6 +725,11 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = 
 // — see "relies on node closing idle keep-alives at close()".
 export function createProxyServer() {
   const live = new Set();
+  // Connections that have finished a reply, and the drain sweeps THESE, not
+  // node's closeIdleConnections(): on node 26 that also takes a connection that
+  // has not sent its first request yet (24 and 25 do not), and the old child
+  // accepted such connections just before the handover.
+  const parked = new Map(); // socket -> bytesRead when its last reply finished
   const srv = http.createServer((req, res) => {
     live.add(res);
     // The drain's stall test dates a connection from here ONLY while nothing
@@ -735,6 +740,11 @@ export function createProxyServer() {
     res._bornAt = Date.now();
     res._bornBytes = res.socket?.bytesWritten ?? 0;
     res.on("close", () => live.delete(res));
+    res.on("finish", () => {
+      const s = req.socket;
+      if (!parked.has(s)) s.once("close", () => parked.delete(s));
+      parked.set(s, s.bytesRead);
+    });
     // BEFORE the handler, so a writeHead() that names its own headers keeps this
     // one — setHeader values survive writeHead unless writeHead repeats the name.
     // The in-flight reply still finishes normally; this only stops the NEXT
@@ -823,6 +833,11 @@ export function createProxyServer() {
   // the sweep is what severs an unflushed reply; net's close only stops
   // accepting. Both close paths go through here, so the unbind never waits.
   srv._unbind = (cb) => net.Server.prototype.close.call(srv, cb);
+  srv._sweepIdle = () => {
+    const busy = new Set([...live].map((r) => r.req.socket));
+    // Not one that has read bytes since its last reply: its next request has begun.
+    for (const [s, read] of parked) if (!busy.has(s) && s.bytesRead === read) s.destroy();
+  };
   srv._draining = false;
   return srv;
 }
@@ -1268,16 +1283,17 @@ export async function startProxy(options = {}) {
         // NODE 18 DOES NOT DO THIS FOR US, and ba2375b silently assumed it did.
         // From 19 on, close() closes idle keep-alives itself; 18.20.8 does not --
         // measured, close never fires where 20.20.2 and 24.11.1 report 1-2 ms.
-        // Optional-call because engines is ">=18" and closeIdleConnections
-        // landed in 18.2.
         //
         // THE SWEEP IS THE ONLY HALF THAT WAITS, because it is the only half that
-        // severs.
-        if (server._unflushed() === 0) return server.closeIdleConnections?.();
+        // severs. `_sweepIdle` spares a connection that has not sent a request
+        // yet: node's headers timeout retires one that never does, and one that
+        // does is answered with `Connection: close` (`_draining`), so it never
+        // becomes an idle keep-alive that needs a second sweep.
+        if (server._unflushed() === 0) return server._sweepIdle();
         const flushTick = setInterval(() => {
           if (server._unflushed() > 0) return;
           clearInterval(flushTick);
-          server.closeIdleConnections?.();
+          server._sweepIdle();
         }, 50);
         flushTick.unref?.();
       }),
