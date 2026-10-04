@@ -142,8 +142,10 @@ const bootHolder = async (upstream, launcher, extraEnv = {}) => {
   holder.stderr.on("data", (d) => { holder.log += d; });
   if (await until(async () => (await probe(port)) === "ok" && "ok", 25_000) !== "ok") {
     holder.kill("SIGKILL");   // the caller never receives it
-    await reapPort(port);
-    assert.fail("the holder never came up, so nothing was measured");
+    // A holder that already died took its port with it, and the number may be a
+    // neighbouring file's by now: reapPort() kills whatever of ours listens there.
+    if (holder.exitCode === null && holder.signalCode === null) await reapPort(port);
+    assert.fail(`the holder never came up, so nothing was measured: ${holder.log.slice(-300)}`);
   }
   return holder;
 };
@@ -353,14 +355,14 @@ describe("a holder stop with a reply in flight", () => {
     const LAST = 60;
     const upstream = await numberedOrigin(LAST);
     const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-    const pkg = mkdtempSync(join(tmpdir(), "ccf-swap-"));
-    for (const d of ["bin", "proxy"]) cpSync(join(root, d), join(pkg, d), { recursive: true });
-    // The node_modules node itself resolves from here: a checkout under .claude/worktrees/ has none at
-    // its own root, only an ancestor's, and a link to the missing one leaves the copy unable to load.
-    symlinkSync(createRequire(import.meta.url).resolve.paths("hpagent").find((d) => existsSync(join(d, "hpagent"))),
-                join(pkg, "node_modules"));
-    let holder, reply;
+    let pkg, holder, reply;
     try {
+      pkg = mkdtempSync(join(tmpdir(), "ccf-swap-"));
+      for (const d of ["bin", "proxy"]) cpSync(join(root, d), join(pkg, d), { recursive: true });
+      // The node_modules node itself resolves from here: a checkout under .claude/worktrees/ has none at
+      // its own root, only an ancestor's, and a link to the missing one leaves the copy unable to load.
+      symlinkSync(createRequire(import.meta.url).resolve.paths("hpagent").find((d) => existsSync(join(d, "hpagent"))),
+                  join(pkg, "node_modules"));
       // CACHE_FIX_HANDOVER_ENV: a handover re-reads CACHE_FIX_* from a file in the
       // operator's claude home, and whatever it holds would reach the successor.
       holder = await bootHolder(upstream, join(pkg, "bin", "claude-via-proxy.mjs"),
@@ -390,7 +392,7 @@ describe("a holder stop with a reply in flight", () => {
       upstream.close();
       try { holder?.kill("SIGKILL"); } catch { }
       if (holder) await reapPort(holder.port);
-      rmSync(pkg, { recursive: true, force: true });
+      if (pkg) rmSync(pkg, { recursive: true, force: true });
     }
   });
 });
