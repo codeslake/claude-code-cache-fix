@@ -558,7 +558,7 @@ it("leaks no descriptor when a client aborts", async () => {
 // Named per call, not per file: two cases running at once on one fixed name
 // would each write the other's stand-in and delete it in their own cleanup.
 let fakeSeq = 0;
-async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
+async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = freePort } = {}) {
   const tag = `${process.pid}-${++fakeSeq}`;
   // NO LEADING DOT. The launcher COPY has to sit inside bin/ — it resolves its
   // imports relative to the real launcher — but a hidden file inside the tree is
@@ -581,14 +581,13 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
   await writeFile(failing, serverSrc);
   await writeFile(copy, readFileSync(launcherPath, "utf8").replace(
     /const SERVER_PATH = .*/, `const SERVER_PATH = ${JSON.stringify(failing)};`));
-  const port = await freePort();
   // The backoff ladder is what these cases measure, and at its 250ms default
   // they measure it by sleeping through it — 22s of the file's runtime. The
   // seam shrinks the RUNGS, not the count, so the shape under assertion (does
   // it back off? does it give up after 5?) is the shipped one.
   const env = { ...process.env };
   for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
-  Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
+  Object.assign(env, { CACHE_FIX_HOLD_PORT: "on",
                        CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: selfHeal || "off",
                        ...(watchMs ? { CACHE_FIX_WATCH_DEPLOY_MS: String(watchMs) } : {}) });
   // An ambient LISTEN_FDS sends the launcher down the socket-activation path
@@ -600,29 +599,51 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
   // through extraEnv, so the ambient value must never reach the child —
   // measured, an exported WATCH_DEPLOY_MS turns "is off unless asked for"
   // into a failure about the shell rather than about the code.
-  const launcher = spawn(process.execPath, [copy, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
-  let err = "";
-  launcher.stderr.on("data", (d) => (err += d));
+  let port, launcher, closed, err = "";
   const bound = () => new Promise((r) => {
     const s = net.createServer();
     s.once("error", () => r(true));
     s.listen({ port, host: "127.0.0.1" }, () => s.close(() => r(false)));
   });
-  try {
-    await fn({ launcher, port, bound, stderr: () => err, serverFile: failing });
-  } finally {
-    // SIGTERM FIRST, and wait for it. SIGKILL cannot be forwarded, so a killed
-    // launcher leaves its proxy running — and that grandchild holds the pipes
-    // this runner is waiting on. Measured: every case here exited in about a
-    // second while the FILE took 300s and then failed with "Promise resolution
-    // is still pending but the event loop has already resolved". On the
-    // personal Mac the same leak sat 29 minutes with holders still alive.
-    launcher.kill("SIGTERM");
+  // SIGTERM FIRST, and wait for it. SIGKILL cannot be forwarded, so a killed
+  // launcher leaves its proxy running — and that grandchild holds the pipes
+  // this runner is waiting on. Measured: every case here exited in about a
+  // second while the FILE took 300s and then failed with "Promise resolution
+  // is still pending but the event loop has already resolved". On the
+  // personal Mac the same leak sat 29 minutes with holders still alive.
+  const stop = async (l) => {
+    l.kill("SIGTERM");
     await Promise.race([
-      new Promise((r) => launcher.on("close", r)),
+      new Promise((r) => l.on("close", r)),
       new Promise((r) => setTimeout(r, 5_000)),
     ]);
-    try { launcher.kill("SIGKILL"); } catch {}
+    try { l.kill("SIGKILL"); } catch {}
+  };
+  try {
+    // THE NUMBER freePort() RELEASED CAN BE TAKEN BEFORE THE LAUNCHER BINDS IT.
+    // The bind then fails with EADDRINUSE and the launcher runs the proxy bare:
+    // no gap relay, nothing respawns a killed child, and a case that kills one
+    // measures nothing. So the case starts only once the launcher HOLDS its
+    // port, and otherwise it goes again on a new number.
+    const tried = [];
+    for (;;) {
+      tried.push(port = await pick());
+      env.CACHE_FIX_PROXY_PORT = String(port);
+      launcher = spawn(process.execPath, [copy, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      err = "";
+      launcher.stderr.on("data", (d) => (err += d));
+      // ARMED AT SPAWN. The case starts only after the launcher is judged below,
+      // and one that fails fast can be gone by then: a listener attached by the
+      // case itself would wait for a `close` that already happened.
+      closed = new Promise((r) => launcher.once("close", r));
+      if (!(await runsBare(launcher, closed, () => err))) break;
+      if (tried.length === 3) throw new Error(`the stand-in launcher ran bare on all 3 ports tried (${tried}; ` +
+        `last launcher.exitCode=${launcher.exitCode}). Launcher stderr: ${JSON.stringify(err.slice(-300))}`);
+      await stop(launcher);
+    }
+    await fn({ launcher, port, bound, closed, stderr: () => err, serverFile: failing });
+  } finally {
+    if (launcher) await stop(launcher);
     // AND THE STANDBY. It is detached and outlives a launcher that exited on
     // its own, which is the point of it — but a case that leaks one leaves an
     // ephemeral port held for the rest of the run. SIGHUP is the word it
@@ -643,6 +664,77 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
   }
 }
 
+// Whether a launcher runs its proxy BARE. A holder parents a gap relay from the
+// moment it binds, before its first proxy child; one whose bind lost to a
+// neighbour parents none, so a proxy child with no relay beside it is already
+// the answer, and waiting out the clock for that would cost every retry. By
+// PARENTAGE, never by port: the neighbour that took the number is often a
+// holder, and its relay carries that same port.
+//
+// A LAUNCHER THAT IS GONE IS JUDGED BY ITS STDERR, NOT BY A POLL. A supervised one
+// lives 3-5s on the fast-failing stand-in under load, and a poll starved by the
+// rest of the file can miss all of it (measured: one poll in 4.9s). Its gap relay
+// writes "carrying" to the launcher's stderr, but each relay opened during backoff
+// is killed by the next start() within 50-400ms, often before node prints it, and
+// at failure 5 the holder returns before any gap; the holder's own "failed to
+// start 5 times" is written synchronously before it settles. A bare one writes
+// neither, and ends after the stand-in's single "simulated". Read by exitCode
+// alone, either way the wrong one reaches the case that expects the launcher to
+// give up. The words are the literals at bin/gap-relay.mjs:371 ("gap-relay
+// carrying") and bin/claude-via-proxy.mjs:1515 ("failed to start 5 times").
+async function runsBare(launcher, closed, stderr) {
+  const until = Date.now() + 8_000;
+  while (launcher.exitCode === null && launcher.signalCode === null && Date.now() < until) {
+    let kids = "";
+    try {
+      kids = execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" })
+        .split("\n").filter(Boolean).map(cmdOf).join("\n");
+    } catch { }
+    if (/\/bin\/gap-relay\.mjs\b/.test(kids)) return false;
+    if (/scratch-fake-server-/.test(kids)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  if (launcher.exitCode === null && launcher.signalCode === null) return true;
+  // BOUNDED: a gap relay holding the inherited stderr pipe keeps "close" from
+  // firing when the launcher dies abnormally; judge from what stderr holds.
+  await Promise.race([closed, new Promise((r) => setTimeout(r, 5_000))]);
+  return !/gap-relay carrying|failed to start 5 times/.test(stderr());
+}
+
+// A neighbour already HOLDING the first number withFakeProxy is offered must cost
+// a retry, not a case that runs against an unsupervised stand-in. The squatter is
+// a real holder because that is what recycles a port in this suite, and its relay
+// must not be mistaken for ours.
+it("hands the case a supervised stand-in when a neighbour holds the first port", async () => {
+  await withHeldPort(async ({ port: taken }) => {
+    const offered = [];
+    await withFakeProxy("setInterval(() => {}, 1e9);\n", async ({ launcher, port }) => {
+      // SUPERVISED is observed, not re-asked of the fixture: a killed stand-in is replaced.
+      const standIn = () => { try { return execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" })
+        .split("\n").filter(Boolean).find((q) => /scratch-fake-server-/.test(cmdOf(q))); } catch { } };
+      const until = async (f) => { for (let i = 0; i < 120; i++) { const v = f(); if (v) return v; await new Promise((r) => setTimeout(r, 25)); } };
+      const first = await until(standIn);
+      assert.ok(first, `no stand-in under the launcher on port ${port}`);
+      process.kill(Number(first), "SIGKILL");
+      assert.ok(await until(() => { const q = standIn(); return q !== first && q; }),
+        `the stand-in on port ${port} was not replaced, so its launcher runs bare`);
+      assert.equal(offered.length, 2, `expected one retry past the taken port, got ports ${offered}`);
+    }, { pick: async () => { const p = offered.length ? await freePort() : taken; offered.push(p); return p; } });
+  });
+});
+
+// A launcher already gone when judged says what it was through its stderr.
+it("judges an exited launcher by whether it ever carried a gap", async () => {
+  const gone = spawn(process.execPath, ["-e", "process.exit(1)"], { stdio: "ignore" });
+  const closed = new Promise((r) => gone.once("close", r));
+  await closed;
+  assert.equal(await runsBare(gone, closed, () => "simulated\n"), true, "a launcher that never carried a gap is bare");
+  assert.equal(await runsBare(gone, closed, () => "simulated\n[cache-fix] gap-relay carrying\n"), false,
+    "a launcher whose gap relay carried was supervised");
+  assert.equal(await runsBare(gone, closed, () => "simulated\n[cache-fix] proxy failed to start 5 times; stopping.\n"), false,
+    "a launcher that gave up after its respawns was supervised, whether or not a gap relay got to print");
+});
+
 // Never served: no session is wired to this port, so nothing is stranded by
 // letting it go — and a lineage that respawns a hopeless proxy forever is the
 // defect. The ADDRESS is a separate question from the SUPERVISOR: a standby
@@ -650,7 +742,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
 // respawning, and the port must still be takeable by anything that asks.
 it("gives the port up when the proxy never starts", async () => {
   await withFakeProxy('process.stderr.write("simulated\\n"); process.exit(1);\n',
-    async ({ launcher, port, bound, stderr }) => {
+    async ({ port, bound, closed, stderr }) => {
       // 30s, and the number is the cost of FIVE NODE STARTUPS — not of the
       // backoff, which the fixture already shrinks to 25ms rungs. Measured:
       // 5,943ms alone, 8,053ms inside the file, against a cap that was 8,000 —
@@ -665,7 +757,7 @@ it("gives the port up when the proxy never starts", async () => {
       // drained in time and passed; in the full file it did not. The repo
       // already moved 15 forks off "exit" for exactly this; this one was missed.
       const exited = await Promise.race([
-        new Promise((r) => launcher.on("close", () => r(true))),
+        closed.then(() => true),
         new Promise((r) => setTimeout(() => r(false), 30_000)),
       ]);
       assert.ok(exited, "the launcher respawned a hopeless proxy forever, holding the port");
@@ -2615,7 +2707,7 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
       try { process.kill(before, "SIGKILL"); } catch { }
       const after = await settleFor(launcher, before, 8_000);
       assert.ok(after && after !== before,
-        "no respawn happened, so this measured nothing — the case needs a real restart");
+        `no respawn happened, so this measured nothing — the case needs a real restart (launcher.exitCode=${launcher.exitCode})`);
       await new Promise((r) => setTimeout(r, 1_000));
       assert.doesNotMatch(stderr(), /source changed/,
         "a restart onto IDENTICAL bytes was announced as a deploy. Launcher stderr: " +
@@ -2682,7 +2774,7 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
       try { process.kill(before, "SIGKILL"); } catch { }
       const after = await settleFor(launcher, before, 8_000);
       assert.ok(after && after !== before,
-        "no respawn happened, so this measured nothing — the case needs a real restart");
+        `no respawn happened, so this measured nothing — the case needs a real restart (launcher.exitCode=${launcher.exitCode})`);
       await new Promise((r) => setTimeout(r, 1_000));
       assert.doesNotMatch(stderr(), /source changed/,
         "a restart announced a deploy while the watcher was OFF. Nothing acted, so " +
