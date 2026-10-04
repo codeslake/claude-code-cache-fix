@@ -532,7 +532,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = fre
       // and one that fails fast can be gone by then: a listener attached by the
       // case itself would wait for a `close` that already happened.
       closed = new Promise((r) => launcher.once("close", r));
-      if (!(await runsBare(launcher))) break;
+      if (!(await runsBare(launcher, closed, () => err))) break;
       if (tried.length === 3) throw new Error(`the stand-in launcher ran bare on all 3 ports tried (${tried}; ` +
         `last launcher.exitCode=${launcher.exitCode}). Launcher stderr: ${JSON.stringify(err.slice(-300))}`);
       await stop(launcher);
@@ -567,12 +567,13 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = fre
 // PARENTAGE, never by port: the neighbour that took the number is often a
 // holder, and its relay carries that same port.
 //
-// A LAUNCHER THAT IS GONE WITHOUT A RELAY EVER SEEN RAN BARE. A supervised one
-// keeps its relay as a child for its whole life (measured 5.9s to give up on the
-// fast-failing stand-in), so a 50ms poll cannot miss it; an unsupervised one
-// ends after the stand-in's single "simulated", which no poll need catch. Read
-// as supervised, it reaches the case that expects the launcher to give up.
-async function runsBare(launcher) {
+// A LAUNCHER THAT IS GONE IS JUDGED BY ITS STDERR, NOT BY A POLL. A supervised one
+// lives 3-5s on the fast-failing stand-in under load, and a poll starved by the
+// rest of the file can miss all of it (measured: one poll in 4.9s). Its gap relay
+// writes "carrying" to the launcher's stderr; a bare one never does, and ends
+// after the stand-in's single "simulated". Read by exitCode alone, either way
+// the wrong one reaches the case that expects the launcher to give up.
+async function runsBare(launcher, closed, stderr) {
   const until = Date.now() + 8_000;
   while (launcher.exitCode === null && launcher.signalCode === null && Date.now() < until) {
     let kids = "";
@@ -584,7 +585,9 @@ async function runsBare(launcher) {
     if (/scratch-fake-server-/.test(kids)) return true;
     await new Promise((r) => setTimeout(r, 50));
   }
-  return true;
+  if (launcher.exitCode === null && launcher.signalCode === null) return true;
+  await closed;
+  return !/gap-relay carrying/.test(stderr());
 }
 
 // A neighbour already HOLDING the first number withFakeProxy is offered must cost
@@ -609,12 +612,14 @@ it("hands the case a supervised stand-in when a neighbour holds the first port",
   });
 });
 
-// The neighbour case with the fast-failing stand-in: the unsupervised launcher
-// exits after one "simulated", and must not be judged supervised for being gone.
-it("judges an exited launcher that never showed a relay as bare", async () => {
+// A launcher already gone when judged says what it was through its stderr.
+it("judges an exited launcher by whether it ever carried a gap", async () => {
   const gone = spawn(process.execPath, ["-e", "process.exit(1)"], { stdio: "ignore" });
-  await new Promise((r) => gone.once("close", r));
-  assert.equal(await runsBare(gone), true, `exitCode=${gone.exitCode}, judged supervised`);
+  const closed = new Promise((r) => gone.once("close", r));
+  await closed;
+  assert.equal(await runsBare(gone, closed, () => "simulated\n"), true, "a launcher that never carried a gap is bare");
+  assert.equal(await runsBare(gone, closed, () => "simulated\n[cache-fix] gap-relay carrying\n"), false,
+    "a launcher whose gap relay carried was supervised");
 });
 
 // Never served: no session is wired to this port, so nothing is stranded by
@@ -2117,8 +2122,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const p = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let err = "";
       p.stderr.on("data", (d) => { err += d; });
+      // "close", NOT "exit": this case reads the stderr the launcher wrote as it
+      // died, and exit can fire with that line still in the pipe (measured twice
+      // under load: code 1, stderr empty).
       const code = await Promise.race([
-        new Promise((r) => p.on("exit", (c) => r(c))),
+        new Promise((r) => p.on("close", (c) => r(c))),
         new Promise((r) => setTimeout(() => r("HUNG"), 25_000)),
       ]);
       try { p.kill("SIGKILL"); } catch {}
