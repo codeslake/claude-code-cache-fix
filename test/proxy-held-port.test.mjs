@@ -1,7 +1,6 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { once } from "node:events";
 import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -12,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, hit, listeners, onPort, verdict } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -61,49 +60,6 @@ async function freePort() {
   usedPorts.push(p);
   return p;
 }
-
-const hit = (port) => http.get({ host: "127.0.0.1", port, path: "/health", agent: false });
-// "ok", "ERR:<status> <body>", an error code, or "HUNG" once `ms` pass in silence.
-const verdict = (r, ms) => new Promise((res) => {
-  r.on("response", (q) => {
-    let b = ""; q.on("data", (d) => (b += d));
-    q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode} ${b.slice(0, 160)}`));
-  });
-  // Timers run before the poll phase, so after a runner stall a reply that is
-  // already on the socket would read as HUNG. One turn lets it be delivered first.
-  r.setTimeout(ms, () => setImmediate(() => { r.destroy(); res("HUNG"); }));
-  r.on("error", (e) => res(e.code || "ERR"));
-});
-
-// A stalled runner is not a hung connection. With the runner's loop blocked past
-// the 3s clock of "serves every concurrent request" (24 cases shelling out to
-// lsof/ps in one process, on a loaded box: measured 7-22s), every timer fires
-// together in the next turn, ahead of the poll phase that would have read the
-// replies already on the sockets. Measured: "200 of 200 concurrent requests were
-// not served: HUNG". The healthy server is in ANOTHER process, since one in this
-// loop would stall with it.
-//
-// TOP LEVEL, BEFORE THE DESCRIBE, ON PURPOSE: node runs root-level tests one at a
-// time, so nothing else in this file is mid-flight while the loop is blocked.
-// Inside the describe, "fails loudly when the bind address can never work" saw an
-// empty stderr after the stall and went red 5 of 6 quiet runs, 0 of 3 without it.
-it("does not read a reply that arrived during a runner stall as HUNG", async () => {
-  const srv = spawn(process.execPath, ["-e",
-    `const s = require("http").createServer((q, r) => r.end("ok"));
-     s.listen(0, "127.0.0.1", () => process.stdout.write(String(s.address().port)));
-     process.stdin.on("end", () => process.exit()).resume();`],   // EOF: the runner is gone
-  { stdio: ["pipe", "pipe", "inherit"] });
-  try {
-    const port = Number(await new Promise((r) => srv.stdout.once("data", r)));
-    const reqs = Array.from({ length: 20 }, () => hit(port));
-    const out = reqs.map((r) => verdict(r, 250));
-    await Promise.all(reqs.map((r) => once(r, "finish")));   // every request is out
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
-    assert.deepEqual([...new Set(await Promise.all(out))], ["ok"], "every reply was already on its socket");
-  } finally {
-    srv.kill("SIGKILL");
-  }
-});
 
 // Its own file: every case here drives a REAL launcher holding a REAL port, so
 // a mis-signalled pid or a stuck child aborts the whole runner process. Node
