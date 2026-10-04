@@ -1501,8 +1501,7 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
       const signalled = Date.now();
       proc.kill("SIGUSR2");
       // The keep-alive closing is the sweep having run, so it is waited on as the event.
-      const swept = await Promise.race([kept.closed.then(() => true), new Promise((r) => setTimeout(r, 5_000, false))]);
-      assert.equal(swept, true, "a drain left a keep-alive that had its reply and went idle open");
+      await withDeadline(kept.closed, 5_000, proc, "a drain left a keep-alive that had its reply and went idle open");
       const reply = await health(fresh.s);
       assert.match(reply, /^HTTP\/1\.1 200/,
         "the drain closed a connection that had not sent a request yet; its request got " +
