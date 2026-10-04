@@ -14,7 +14,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, listeners, onPort, reapStamped, stamped, waitForHolder } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, hit, listeners, onPort, reapStamped, stamped, verdict, waitForHolder } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -500,17 +500,9 @@ it("cuts nothing on the held port while the proxy restarts", async () => {
 // requests: hung=36 acceptedByHolder=36, exactly 1:1.
 it("serves every concurrent request while nothing restarts", async () => {
   await withHeldPort(async ({ port }) => {
-    const one = () => new Promise((res) => {
-      const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (q) => {
-        let b = ""; q.on("data", (d) => (b += d));
-        q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode} ${b.slice(0, 160)}`));
-      });
-      // Well under the 8s a hung accept would cost, and far above a served
-      // request on loopback: the failure this catches is unbounded, not slow.
-      r.setTimeout(3_000, () => { r.destroy(); res("HUNG"); });
-      r.on("error", (e) => res(e.code || "ERR"));
-    });
-    const out = await Promise.all(Array.from({ length: 200 }, one));
+    // Well under the 8s a hung accept would cost, and far above a served
+    // request on loopback: the failure this catches is unbounded, not slow.
+    const out = await Promise.all(Array.from({ length: 200 }, () => verdict(hit(port), 3_000)));
     const bad = out.filter((r) => r !== "ok");
     assert.equal(bad.length, 0,
       `${bad.length} of 200 concurrent requests were not served: ` +
