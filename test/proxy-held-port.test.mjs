@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, ours } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -495,7 +495,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = fre
   // through extraEnv, so the ambient value must never reach the child —
   // measured, an exported WATCH_DEPLOY_MS turns "is off unless asked for"
   // into a failure about the shell rather than about the code.
-  let port, launcher, err = "";
+  let port, launcher, closed, err = "";
   const bound = () => new Promise((r) => {
     const s = net.createServer();
     s.once("error", () => r(true));
@@ -528,12 +528,16 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = fre
       launcher = spawn(process.execPath, [copy, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
       err = "";
       launcher.stderr.on("data", (d) => (err += d));
-      if (await holds(launcher, port)) break;
-      if (tried.length === 3) throw new Error(`the stand-in launcher never held its port in 3 attempts (ports ${tried}; ` +
+      // ARMED AT SPAWN. The case starts only after the launcher is judged below,
+      // and one that fails fast can be gone by then: a listener attached by the
+      // case itself would wait for a `close` that already happened.
+      closed = new Promise((r) => launcher.once("close", r));
+      if (!(await runsBare(launcher))) break;
+      if (tried.length === 3) throw new Error(`the stand-in launcher ran bare on all 3 ports tried (${tried}; ` +
         `last launcher.exitCode=${launcher.exitCode}). Launcher stderr: ${JSON.stringify(err.slice(-300))}`);
-      if (launcher.exitCode === null) await stop(launcher);
+      await stop(launcher);
     }
-    await fn({ launcher, port, bound, stderr: () => err, serverFile: failing });
+    await fn({ launcher, port, bound, closed, stderr: () => err, serverFile: failing });
   } finally {
     await stop(launcher);
     // AND THE STANDBY. It is detached and outlives a launcher that exited on
@@ -556,46 +560,45 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = fre
   }
 }
 
-// Whether a launcher HOLDS its port. A holder places a standby relay on it the
-// moment it binds, before its first proxy child, and that relay OUTLIVES a
-// launcher that gives up, so it is looked for by port and not by parentage: a
-// poll starved past a failing stand-in's whole life (~1.5s) still finds it.
-// One whose bind lost to a neighbour runs the proxy bare and places none, so a
-// proxy child with no relay behind it is already the answer, and waiting out
-// the clock for that would cost every retry.
-async function holds(launcher, port) {
+// Whether a launcher runs its proxy BARE. A holder parents a gap relay from the
+// moment it binds, before its first proxy child; one whose bind lost to a
+// neighbour parents none, so a proxy child with no relay beside it is already
+// the answer, and waiting out the clock for that would cost every retry. By
+// PARENTAGE, never by port: the neighbour that took the number is often a
+// holder, and its relay carries that same port.
+//
+// ONLY EVIDENCE COUNTS. A launcher that is gone when we look is no verdict: a
+// stand-in that fails fast has the launcher give up inside ~1.5s, which a poll
+// starved by the rest of the suite can miss whole, and the case that does that
+// expects it.
+async function runsBare(launcher) {
   const until = Date.now() + 8_000;
-  for (;;) {
-    // BOTH READ BEFORE THE SCAN. An exit seen first means the scan runs after it,
-    // and a child seen first means its relay already exists for the scan to find.
-    const exited = launcher.exitCode !== null;
-    let bare = false;
+  while (launcher.exitCode === null && Date.now() < until) {
+    let kids = "";
     try {
-      bare = execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" })
-        .split("\n").filter(Boolean).some((q) => /scratch-fake-server-/.test(cmdOf(q)));
+      kids = execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" })
+        .split("\n").filter(Boolean).map(cmdOf).join("\n");
     } catch { }
-    if (ours(port).some((q) => /\/bin\/gap-relay\.mjs\b/.test(cmdOf(q)))) return true;
-    if (bare || exited || Date.now() > until) return false;
+    if (/\/bin\/gap-relay\.mjs\b/.test(kids)) return false;
+    if (/scratch-fake-server-/.test(kids)) return true;
     await new Promise((r) => setTimeout(r, 50));
   }
+  return launcher.exitCode === null;
 }
 
-// A neighbour listening on the first number withFakeProxy is offered must cost a
-// retry, not a case that runs against an unsupervised stand-in.
-it("hands the case a supervised stand-in when a neighbour took the first port", async () => {
-  const squatter = net.createServer(() => {});
-  await new Promise((r) => squatter.listen(0, "127.0.0.1", r));
-  const taken = squatter.address().port;
-  const offered = [];
-  try {
+// A neighbour already HOLDING the first number withFakeProxy is offered must cost
+// a retry, not a case that runs against an unsupervised stand-in. The squatter is
+// a real holder because that is what recycles a port in this suite, and its relay
+// must not be mistaken for ours.
+it("hands the case a supervised stand-in when a neighbour holds the first port", async () => {
+  await withHeldPort(async ({ port: taken }) => {
+    const offered = [];
     await withFakeProxy("setInterval(() => {}, 1e9);\n", async ({ launcher, port }) => {
-      assert.ok(await holds(launcher, port),
-        `the stand-in on port ${port} is unsupervised (launcher.exitCode=${launcher.exitCode})`);
+      assert.equal(await runsBare(launcher), false,
+        `the stand-in on port ${port} runs bare (launcher.exitCode=${launcher.exitCode})`);
       assert.equal(offered.length, 2, `expected one retry past the taken port, got ports ${offered}`);
     }, { pick: async () => { const p = offered.length ? await freePort() : taken; offered.push(p); return p; } });
-  } finally {
-    squatter.close();
-  }
+  });
 });
 
 // Never served: no session is wired to this port, so nothing is stranded by
@@ -605,7 +608,7 @@ it("hands the case a supervised stand-in when a neighbour took the first port", 
 // respawning, and the port must still be takeable by anything that asks.
 it("gives the port up when the proxy never starts", async () => {
   await withFakeProxy('process.stderr.write("simulated\\n"); process.exit(1);\n',
-    async ({ launcher, port, bound, stderr }) => {
+    async ({ port, bound, closed, stderr }) => {
       // 30s, and the number is the cost of FIVE NODE STARTUPS — not of the
       // backoff, which the fixture already shrinks to 25ms rungs. Measured:
       // 5,943ms alone, 8,053ms inside the file, against a cap that was 8,000 —
@@ -620,7 +623,7 @@ it("gives the port up when the proxy never starts", async () => {
       // drained in time and passed; in the full file it did not. The repo
       // already moved 15 forks off "exit" for exactly this; this one was missed.
       const exited = await Promise.race([
-        new Promise((r) => launcher.on("close", () => r(true))),
+        closed.then(() => true),
         new Promise((r) => setTimeout(() => r(false), 30_000)),
       ]);
       assert.ok(exited, "the launcher respawned a hopeless proxy forever, holding the port");
