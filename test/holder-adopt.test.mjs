@@ -7,7 +7,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, w
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { HOP_ENV, OURS, cmdOf, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, cmdOf, onPort } from "./proc-helpers.mjs";
 
 // A HOLDER THAT ADOPTS ITS PREDECESSOR'S SOCKET, started the way a handover
 // starts one: the listening socket on fd 3 and the two handover variables. It
@@ -21,12 +21,14 @@ after(() => rmSync(scratch, { recursive: true, force: true }));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // reap() below runs in a case's `finally`, which an abort skips. This hook is the
-// backstop, and it signals only pids THIS file spawned, and only while their
-// command line is still one of ours: a pid that has exited can be reused.
-const spawned = new Set();
-const track = (p) => { spawned.add(p.pid); return p; };
+// backstop. It signals the processes THIS file spawned while they are unreaped (a
+// pid that has exited can be reused, a ChildProcess cannot), then sweeps the ports
+// adopt() opened: the holder's standby and proxy are nobody's child.
+const spawned = [], ports = new Set();
+const track = (p) => { spawned.push(p); return p; };
 process.on("exit", () => {
-  for (const pid of spawned) if (OURS.test(cmdOf(pid))) { try { process.kill(pid, "SIGKILL"); } catch { } }
+  for (const p of spawned) if (p.exitCode === null && p.signalCode === null) { try { p.kill("SIGKILL"); } catch { } }
+  for (const port of ports) for (const p of onPort(port)) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
 });
 
 // `script` is a symlink to the launcher, so the command line the scan reads is
@@ -37,6 +39,7 @@ async function adopt(script, { env: extra = {}, alongside = [] } = {}) {
   const sock = net.createServer();
   await new Promise((r) => sock.listen(0, "127.0.0.1", r));
   const port = sock.address().port, fd = sock._handle.fd;
+  ports.add(port);
   const env = { ...process.env, ...extra };
   for (const k of [...HOP_ENV, "LISTEN_PID", "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
   Object.assign(env, { CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_HOLDER_HANDOVER: "1",
