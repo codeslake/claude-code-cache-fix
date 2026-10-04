@@ -1925,8 +1925,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const p = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let err = "";
       p.stderr.on("data", (d) => { err += d; });
+      // "close", not "exit": under load "exit" fires before the child's stderr is
+      // read (measured: err === "" at "exit" in 82 of 120 concurrent copies, the
+      // message there at "close"). "close" waits for the stdio to drain.
       const code = await Promise.race([
-        new Promise((r) => p.on("exit", (c) => r(c))),
+        new Promise((r) => p.on("close", (c) => r(c))),
         new Promise((r) => setTimeout(() => r("HUNG"), 25_000)),
       ]);
       try { p.kill("SIGKILL"); } catch {}
