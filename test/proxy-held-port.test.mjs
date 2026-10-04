@@ -573,6 +573,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = fre
 // writes "carrying" to the launcher's stderr; a bare one never does, and ends
 // after the stand-in's single "simulated". Read by exitCode alone, either way
 // the wrong one reaches the case that expects the launcher to give up.
+// The word is the literal at bin/gap-relay.mjs:371 ("gap-relay carrying").
 async function runsBare(launcher, closed, stderr) {
   const until = Date.now() + 8_000;
   while (launcher.exitCode === null && launcher.signalCode === null && Date.now() < until) {
