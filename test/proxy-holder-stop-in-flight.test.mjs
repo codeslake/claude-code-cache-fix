@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
@@ -142,9 +142,7 @@ const bootHolder = async (upstream, launcher, extraEnv = {}) => {
   holder.stderr.on("data", (d) => { holder.log += d; });
   if (await until(async () => (await probe(port)) === "ok" && "ok", 25_000) !== "ok") {
     holder.kill("SIGKILL");   // the caller never receives it
-    // A holder that already died took its port with it, and the number may be a
-    // neighbouring file's by now: reapPort() kills whatever of ours listens there.
-    if (holder.exitCode === null && holder.signalCode === null) await reapPort(port);
+    await reapAfterFailedBoot(holder, port);
     assert.fail(`the holder never came up, so nothing was measured: ${holder.log.slice(-300)}`);
   }
   return holder;
@@ -162,6 +160,23 @@ const reapPort = async (port) => {
     for (const o of owners) { try { process.kill(Number(o), "SIGKILL"); } catch { } }
     await sleep(300);
   }
+};
+
+// WHETHER THE PORT IS STILL THIS HOLDER'S TO CLEAR. It is while the holder is
+// alive, and after its death while a listener on it names the holder in its own
+// variables: the proxy inherited the socket as fd 3 and an armed standby holds it
+// too, so a dead holder leaves them listening. Otherwise the number may be a
+// neighbouring file's by now, and reapPort() kills whatever of ours listens there.
+// /proc, so linux only; elsewhere only the first arm applies.
+const namesHolder = (pid, holder) => {
+  try {
+    return readFileSync(`/proc/${pid}/environ`, "utf8").split("\0")
+      .some((v) => v === `CACHE_FIX_HELD_BY=${holder}` || v === `CACHE_FIX_STANDBY_PARENT=${holder}`);
+  } catch { return false; }
+};
+const reapAfterFailedBoot = async (holder, port) => {
+  if ((holder.exitCode === null && holder.signalCode === null)
+      || listeners(port).some((q) => namesHolder(q, holder.pid))) await reapPort(port);
 };
 
 // THE PRODUCTION STOP, WITH SOMETHING IN FLIGHT. Every other holder case here
@@ -423,5 +438,54 @@ describe("the exit sweep of standbys", () => {
       for (const p of [ours, stranger]) { try { p.kill("SIGKILL"); } catch { } }
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// A DEAD HOLDER DOES NOT TAKE ITS PORT WITH IT: its proxy inherited the listening
+// socket as fd 3, and an armed standby holds it too, so they outlive the holder
+// and nothing else ends them. What tells them from a neighbouring file's listener
+// on a reused number is the holder pid each carries in its own variables. Both
+// listeners here are this test's own stand-ins.
+describe("the reap after a boot that failed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ccf-failedboot-"));
+  mkdirSync(join(dir, "bin"));
+  writeFileSync(join(dir, "bin", "stand-in.mjs"),
+    'import net from "node:net";\nnet.createServer().listen({ fd: 3 });\nsetInterval(() => {}, 1e6);\n');
+  after(() => rmSync(dir, { recursive: true, force: true }));
+  const deadHolder = async () => {
+    const h = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    await new Promise((r) => h.on("exit", r));
+    return h;
+  };
+  const listening = async (env) => {
+    const sock = net.createServer();
+    await new Promise((r) => sock.listen(0, "127.0.0.1", r));
+    const port = sock.address().port;
+    const p = spawn(process.execPath, [join(dir, "bin", "stand-in.mjs")],
+      { env: { ...process.env, ...env }, stdio: ["ignore", "ignore", "ignore", sock._handle.fd] });
+    sock.close();
+    return { p, port };
+  };
+  const skip = !existsSync("/proc");
+
+  for (const key of ["CACHE_FIX_HELD_BY", "CACHE_FIX_STANDBY_PARENT"]) {
+    it(`clears what names the dead holder through ${key}`, { skip }, async () => {
+      const holder = await deadHolder();
+      const { p, port } = await listening({ [key]: String(holder.pid) });
+      try {
+        await reapAfterFailedBoot(holder, port);
+        assert.ok(await until(() => p.signalCode, 5_000), "the proxy of a dead holder was left on the port");
+      } finally { try { p.kill("SIGKILL"); } catch { } }
+    });
+  }
+
+  it("leaves a listener that names another holder alone", { skip }, async () => {
+    const holder = await deadHolder();
+    const { p, port } = await listening({ CACHE_FIX_HELD_BY: String(process.pid) });
+    try {
+      await reapAfterFailedBoot(holder, port);
+      await sleep(300);
+      assert.equal(p.signalCode ?? p.exitCode, null, "a listener of another holder was killed");
+    } finally { try { p.kill("SIGKILL"); } catch { } }
   });
 });
