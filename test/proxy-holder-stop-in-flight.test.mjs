@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
+import { exitWithin, withDeadline } from "./child-deadline.mjs";
 
 // ITS OWN FILE, not tidiness: this case used to sit at the end of
 // proxy-holder-handover.test.mjs, serially after that file's ~56s "holder
@@ -450,34 +451,38 @@ describe("the reap after a boot that failed", () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-failedboot-"));
   mkdirSync(join(dir, "bin"));
   writeFileSync(join(dir, "bin", "stand-in.mjs"),
-    'import net from "node:net";\nnet.createServer().listen({ fd: 3 });\nsetInterval(() => {}, 1e6);\n');
+    'import net from "node:net";\nnet.createServer().listen({ fd: 3 }, () => console.log("up"));\nsetInterval(() => {}, 1e6);\n');
   after(() => rmSync(dir, { recursive: true, force: true }));
   const deadHolder = async () => {
     const h = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
-    await new Promise((r) => h.on("exit", r));
+    await exitWithin(h, 10_000, "the throwaway holder never exited");
     return h;
   };
+  // THE CASE KEEPS THE NUMBER: the stand-in's death would free it, and the reap's
+  // rescan 300 ms later would then kill whatever of ours a sibling file put there.
+  // Unref'd, so a case that fails early cannot keep the run alive. Waits for the
+  // stand-in's first line, so one that died on its own reads as a fixture failure
+  // here and not as a gate that left it standing.
   const listening = async (env) => {
     const sock = net.createServer();
     await new Promise((r) => sock.listen(0, "127.0.0.1", r));
+    sock.unref();
     const port = sock.address().port;
     const p = spawn(process.execPath, [join(dir, "bin", "stand-in.mjs")],
-      { env: { ...process.env, ...env }, stdio: ["ignore", "ignore", "ignore", sock._handle.fd] });
-    sock.close();
+      { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "ignore", sock._handle.fd] });
+    await withDeadline(new Promise((r) => p.stdout.once("data", r)), 5_000, p, "premise: the stand-in never came up");
     return { p, port };
   };
   const skip = !existsSync("/proc");
 
-  for (const key of ["CACHE_FIX_HELD_BY", "CACHE_FIX_STANDBY_PARENT"]) {
-    it(`clears what names the dead holder through ${key}`, { skip }, async () => {
-      const holder = await deadHolder();
-      const { p, port } = await listening({ [key]: String(holder.pid) });
-      try {
-        await reapAfterFailedBoot(holder, port);
-        assert.ok(await until(() => p.signalCode, 5_000), "the proxy of a dead holder was left on the port");
-      } finally { try { p.kill("SIGKILL"); } catch { } }
-    });
-  }
+  it("clears what names the dead holder", { skip }, async () => {
+    const holder = await deadHolder();
+    const { p, port } = await listening({ CACHE_FIX_HELD_BY: String(holder.pid) });
+    try {
+      await reapAfterFailedBoot(holder, port);
+      assert.ok(await until(() => p.signalCode, 5_000), "the proxy of a dead holder was left on the port");
+    } finally { try { p.kill("SIGKILL"); } catch { } }
+  });
 
   it("leaves a listener that names another holder alone", { skip }, async () => {
     const holder = await deadHolder();

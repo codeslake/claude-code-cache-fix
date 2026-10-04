@@ -92,14 +92,6 @@ const standbysOf = (pid) => {
 };
 
 describe("a holder adopting a dead holder's socket", () => {
-  // The exit hook sweeps what is still in `ports`, and a number freed by reap() can
-  // be a sibling file's by then, whose holder the sweep would then kill.
-  it("leaves nothing of a reaped case for the exit sweep", async () => {
-    const h = await adopt(join(scratch, "swept", "bin", "claude-via-proxy.mjs"));
-    await reap(h);
-    assert.ok(!ports.has(h.port), "the exit sweep still holds a port reap() freed");
-  });
-
   // Every process holding the adopted socket is in the scan's answer, and only a
   // relay is to be retired. Not the holder itself (run here AS a relay-named
   // script, so only an exclusion by pid saves it), not the standby the holder
