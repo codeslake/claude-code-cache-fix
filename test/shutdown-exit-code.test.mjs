@@ -1468,6 +1468,62 @@ describe("SIGTERM exit code", { concurrency: CONCURRENCY }, () => {
     }
   });
 
+  it("sweeps an idle keep-alive but spares a connection that has not sent a request yet, and serves it", async () => {
+    // Node 26's closeIdleConnections() counts a connection that has NOT YET SENT
+    // A REQUEST as idle; 24 and 25 do not. The old child had accepted those
+    // before the handover, and their client was about to speak: it saw a reset
+    // at TLS or at the CONNECT answer. So the first red shows on 26 only. The
+    // half-sent next request is the other direction: node spares it on every
+    // version, so a sweep of our own must too.
+    const { proc, port } = startProxy();
+    const p = await port;
+    const open = async () => {
+      const s = net.connect(p, "127.0.0.1");
+      s.on("error", () => {});
+      const closed = new Promise((r) => s.once("close", r));
+      await new Promise((r) => s.once("connect", r));
+      return { s, closed };
+    };
+    const health = (s, wire = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n") => new Promise((resolve) => {
+      let buf = "";
+      s.on("data", (d) => {
+        buf += d.toString();
+        if (/\r\n\r\n/.test(buf)) resolve(buf);
+      });
+      s.once("close", () => resolve(buf));
+      s.write(wire);
+      setTimeout(() => resolve(buf), 4_000).unref();
+    });
+    const fresh = await open();
+    const kept = await open();
+    const half = await open();
+    try {
+      // Opened after `fresh`, so its reply means `fresh` was accepted too.
+      assert.match(await health(kept.s), /^HTTP\/1\.1 200/, "premise: the keep-alive never got its first reply");
+      // Node's own sweep spares a keep-alive that has begun its next request.
+      assert.match(await health(half.s), /^HTTP\/1\.1 200/, "premise: the second keep-alive never got its first reply");
+      half.s.write("GET /health HTTP/1.1\r\nHost: x\r\n");
+      await new Promise((r) => setTimeout(r, 100));
+      const exited = exitOf(proc);
+      const signalled = Date.now();
+      proc.kill("SIGUSR2");
+      // The keep-alive closing is the sweep having run, so it is waited on as the event.
+      await withDeadline(kept.closed, 5_000, proc, "a drain left a keep-alive that had its reply and went idle open");
+      const reply = await health(fresh.s);
+      assert.match(reply, /^HTTP\/1\.1 200/,
+        "the drain closed a connection that had not sent a request yet; its request got " +
+        `no answer: ${JSON.stringify(reply.slice(0, 80))}`);
+      assert.match(await health(half.s, "\r\n"), /^HTTP\/1\.1 200/,
+        "the drain closed a keep-alive that was midway through its next request");
+      await exited;
+      assert.ok(Date.now() - signalled < 10_000,
+        "the old child outlived its last connection instead of exiting");
+    } finally {
+      for (const c of [fresh, kept, half]) c.s.destroy();
+      try { proc.kill("SIGKILL"); } catch {}
+    }
+  });
+
 
   it("delivers a finished-but-unflushed reply instead of severing it and calling it clean", async () => {
     // MEASURED, on this proxy: a client received 4,217,792 bytes of a declared
