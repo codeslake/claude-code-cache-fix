@@ -1526,7 +1526,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           // ETIMEDOUT,404] -> classify all null -> refused=[] -> the assert
           // passes holding three real refusals, in a case named for counting.
           const get = () => new Promise((res) => {
-            const q = http.get({ host: "127.0.0.1", port, path: "/health", timeout: 1_000 }, (r) => {
+            const q = http.get({ host: "127.0.0.1", port, path: "/health", timeout: 15_000 }, (r) => {
               let b = ""; r.on("data", (d) => (b += d));
               r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
             });
@@ -1535,17 +1535,22 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             // so an unhandled one leaves this promise pending and the hammer
             // below stops at that iteration for good.
             //
-            // AND 1s, NOT 3s, BECAUSE THE READINESS BUDGET IS SPENT IN THESE.
-            // Unhandled, a timeout cost nothing because the attempt simply never
-            // resolved; handled, each one costs its full value. At 3s against a
-            // 10s budget the loop got three tries under whole-file load and the
-            // stand-in had not come up -- measured, and it is why the budget
-            // below matches the other fixtures in this file rather than 10s.
+            // AND 15s, BECAUSE THIS PROCESS STALLS, NOT THE STAND-IN. The file
+            // runs its cases concurrently in one process, and a sibling's
+            // synchronous lsof/ps (proc-helpers.mjs) blocks its event loop for
+            // seconds. The stand-in has already answered, but timers run before
+            // the socket is read when the loop resumes, so a short value times
+            // out a request that succeeded. Measured under 4 concurrent copies of
+            // this file: stalls up to 9.7s, so 1s (5d2159f) reds the readiness
+            // assert and so would 3s. 15s is 1.5x that; only a real hang gets here.
             q.on("timeout", () => { q.destroy(); res("ERR:ETIMEDOUT"); });
           });
           const up = Date.now() + 25_000;
-          while (Date.now() < up && (await get()) !== "ok") await new Promise((r) => setTimeout(r, 50));
-          assert.equal(await get(), "ok", "the stand-in never came up behind the holder");
+          // Assert the loop's last value: a second get() after "ok" is one more
+          // chance to time out on a stall.
+          let v;
+          while (Date.now() < up && (v = await get()) !== "ok") await new Promise((r) => setTimeout(r, 50));
+          assert.equal(v, "ok", "the stand-in never came up behind the holder");
 
           const seen = [];
           const hammer = (async () => {
@@ -2182,8 +2187,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const p = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let err = "";
       p.stderr.on("data", (d) => { err += d; });
+      // "close", not "exit": under load "exit" fires before the child's stderr is
+      // read (measured: err === "" at "exit" in 82 of 120 concurrent copies, the
+      // message there at "close"). "close" waits for the stdio to drain.
       const code = await Promise.race([
-        new Promise((r) => p.on("exit", (c) => r(c))),
+        new Promise((r) => p.on("close", (c) => r(c))),
         new Promise((r) => setTimeout(() => r("HUNG"), 25_000)),
       ]);
       try { p.kill("SIGKILL"); } catch {}
