@@ -831,18 +831,16 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           // due. CI was green on all three node versions at the same commit.
           //
           // THE WINDOW IS SIZED TO THE STALLS, NOT TO THE REPLY. The fake upstream
-          // above lives in THIS process, and so do the sibling cases' synchronous
-          // lsof and ps calls, which hold its event loop for seconds at a time.
-          // Measured on 8 whole-file runs under 4 concurrent copies: the first chunk
-          // came 7.8 to 18.7s after the request (alone: 59ms), three of the eight
-          // later than the 15s this window used to be, through 4 or 5 stalls of 3.8
-          // to 6.5s that summed to 9.4 to 20.7s. T1629 saw 24.2s of stall in one run
-          // of a case and 9.7s in a single stretch. 45s is 1.7x the worst of those.
+          // above lives in THIS process, with the sibling cases' synchronous lsof
+          // and ps calls, which hold its loop for seconds. Measured, 8 whole-file
+          // runs under 4 concurrent copies: the first chunk came 7.8 to 18.7s after
+          // the request (alone: 59ms), three later than the old 15s, through 4 or
+          // 5 stalls of 3.8 to 6.5s summing to 9.4 to 20.7s; the worst of 12 earlier
+          // runs summed 24.3s. 45s is 1.9x that.
           const warm = Date.now() + 45_000;
           while (chunks < 1 && Date.now() < warm) await new Promise((r) => setTimeout(r, 50));
-          // AND THE LOOP ENDS IN THE TIMERS PHASE, BEFORE THE POLL PHASE. A stall
-          // that spans the deadline resumes with this timer and the chunk, already
-          // in the socket, still unread: yield once so it is.
+          // The loop ends in the timers phase, before the poll phase: a stall that
+          // spans the deadline leaves the chunk in the socket, unread. Yield once.
           await new Promise((r) => setImmediate(r));
           assert.ok(chunks >= 1, `premise: the reply never started streaming (${chunks} chunks)`);
 
