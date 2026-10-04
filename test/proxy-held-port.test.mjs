@@ -539,7 +539,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = fre
     }
     await fn({ launcher, port, bound, closed, stderr: () => err, serverFile: failing });
   } finally {
-    await stop(launcher);
+    if (launcher) await stop(launcher);
     // AND THE STANDBY. It is detached and outlives a launcher that exited on
     // its own, which is the point of it — but a case that leaks one leaves an
     // ephemeral port held for the rest of the run. SIGHUP is the word it
@@ -567,13 +567,14 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = fre
 // PARENTAGE, never by port: the neighbour that took the number is often a
 // holder, and its relay carries that same port.
 //
-// ONLY EVIDENCE COUNTS. A launcher that is gone when we look is no verdict: a
-// stand-in that fails fast has the launcher give up inside ~1.5s, which a poll
-// starved by the rest of the suite can miss whole, and the case that does that
-// expects it.
+// A LAUNCHER THAT IS GONE WITHOUT A RELAY EVER SEEN RAN BARE. A supervised one
+// keeps its relay as a child for its whole life (measured 5.9s to give up on the
+// fast-failing stand-in), so a 50ms poll cannot miss it; an unsupervised one
+// ends after the stand-in's single "simulated", which no poll need catch. Read
+// as supervised, it reaches the case that expects the launcher to give up.
 async function runsBare(launcher) {
   const until = Date.now() + 8_000;
-  while (launcher.exitCode === null && Date.now() < until) {
+  while (launcher.exitCode === null && launcher.signalCode === null && Date.now() < until) {
     let kids = "";
     try {
       kids = execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" })
@@ -583,7 +584,7 @@ async function runsBare(launcher) {
     if (/scratch-fake-server-/.test(kids)) return true;
     await new Promise((r) => setTimeout(r, 50));
   }
-  return launcher.exitCode === null;
+  return true;
 }
 
 // A neighbour already HOLDING the first number withFakeProxy is offered must cost
@@ -594,11 +595,26 @@ it("hands the case a supervised stand-in when a neighbour holds the first port",
   await withHeldPort(async ({ port: taken }) => {
     const offered = [];
     await withFakeProxy("setInterval(() => {}, 1e9);\n", async ({ launcher, port }) => {
-      assert.equal(await runsBare(launcher), false,
-        `the stand-in on port ${port} runs bare (launcher.exitCode=${launcher.exitCode})`);
+      // SUPERVISED is observed, not re-asked of the fixture: a killed stand-in is replaced.
+      const standIn = () => { try { return execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" })
+        .split("\n").filter(Boolean).find((q) => /scratch-fake-server-/.test(cmdOf(q))); } catch { } };
+      const until = async (f) => { for (let i = 0; i < 120; i++) { const v = f(); if (v) return v; await new Promise((r) => setTimeout(r, 25)); } };
+      const first = await until(standIn);
+      assert.ok(first, `no stand-in under the launcher on port ${port}`);
+      process.kill(Number(first), "SIGKILL");
+      assert.ok(await until(() => { const q = standIn(); return q !== first && q; }),
+        `the stand-in on port ${port} was not replaced, so its launcher runs bare`);
       assert.equal(offered.length, 2, `expected one retry past the taken port, got ports ${offered}`);
     }, { pick: async () => { const p = offered.length ? await freePort() : taken; offered.push(p); return p; } });
   });
+});
+
+// The neighbour case with the fast-failing stand-in: the unsupervised launcher
+// exits after one "simulated", and must not be judged supervised for being gone.
+it("judges an exited launcher that never showed a relay as bare", async () => {
+  const gone = spawn(process.execPath, ["-e", "process.exit(1)"], { stdio: "ignore" });
+  await new Promise((r) => gone.once("close", r));
+  assert.equal(await runsBare(gone), true, `exitCode=${gone.exitCode}, judged supervised`);
 });
 
 // Never served: no session is wired to this port, so nothing is stranded by
