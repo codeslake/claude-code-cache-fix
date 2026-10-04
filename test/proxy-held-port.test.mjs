@@ -570,10 +570,14 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "", pick = fre
 // A LAUNCHER THAT IS GONE IS JUDGED BY ITS STDERR, NOT BY A POLL. A supervised one
 // lives 3-5s on the fast-failing stand-in under load, and a poll starved by the
 // rest of the file can miss all of it (measured: one poll in 4.9s). Its gap relay
-// writes "carrying" to the launcher's stderr; a bare one never does, and ends
-// after the stand-in's single "simulated". Read by exitCode alone, either way
-// the wrong one reaches the case that expects the launcher to give up.
-// The word is the literal at bin/gap-relay.mjs:371 ("gap-relay carrying").
+// writes "carrying" to the launcher's stderr, but each relay opened during backoff
+// is killed by the next start() within 50-400ms, often before node prints it, and
+// at failure 5 the holder returns before any gap; the holder's own "failed to
+// start 5 times" is written synchronously before it settles. A bare one writes
+// neither, and ends after the stand-in's single "simulated". Read by exitCode
+// alone, either way the wrong one reaches the case that expects the launcher to
+// give up. The words are the literals at bin/gap-relay.mjs:371 ("gap-relay
+// carrying") and bin/claude-via-proxy.mjs:1515 ("failed to start 5 times").
 async function runsBare(launcher, closed, stderr) {
   const until = Date.now() + 8_000;
   while (launcher.exitCode === null && launcher.signalCode === null && Date.now() < until) {
@@ -587,8 +591,10 @@ async function runsBare(launcher, closed, stderr) {
     await new Promise((r) => setTimeout(r, 50));
   }
   if (launcher.exitCode === null && launcher.signalCode === null) return true;
-  await closed;
-  return !/gap-relay carrying/.test(stderr());
+  // BOUNDED: a gap relay holding the inherited stderr pipe keeps "close" from
+  // firing when the launcher dies abnormally; judge from what stderr holds.
+  await Promise.race([closed, new Promise((r) => setTimeout(r, 5_000))]);
+  return !/gap-relay carrying|failed to start 5 times/.test(stderr());
 }
 
 // A neighbour already HOLDING the first number withFakeProxy is offered must cost
@@ -621,6 +627,8 @@ it("judges an exited launcher by whether it ever carried a gap", async () => {
   assert.equal(await runsBare(gone, closed, () => "simulated\n"), true, "a launcher that never carried a gap is bare");
   assert.equal(await runsBare(gone, closed, () => "simulated\n[cache-fix] gap-relay carrying\n"), false,
     "a launcher whose gap relay carried was supervised");
+  assert.equal(await runsBare(gone, closed, () => "simulated\n[cache-fix] proxy failed to start 5 times; stopping.\n"), false,
+    "a launcher that gave up after its respawns was supervised, whether or not a gap relay got to print");
 });
 
 // Never served: no session is wired to this port, so nothing is stranded by
