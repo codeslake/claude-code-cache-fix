@@ -945,8 +945,19 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           // test runner fans out at CPU count, so this host runs ~12x more files
           // at once than a 4-core runner and delivered 2 chunks where 75 were
           // due. CI was green on all three node versions at the same commit.
-          const warm = Date.now() + 15_000;
+          //
+          // THE WINDOW IS SIZED TO THE STALLS, NOT TO THE REPLY. The fake upstream
+          // above lives in THIS process, with the sibling cases' synchronous lsof
+          // and ps calls, which hold its loop for seconds. Measured, 8 whole-file
+          // runs under 4 concurrent copies: the first chunk came 7.8 to 18.7s after
+          // the request (alone: 59ms), three later than the old 15s, through 4 or
+          // 5 stalls of 3.8 to 6.5s summing to 9.4 to 20.7s; the worst of 12 earlier
+          // runs summed 24.3s. 45s is 1.9x that.
+          const warm = Date.now() + 45_000;
           while (chunks < 1 && Date.now() < warm) await new Promise((r) => setTimeout(r, 50));
+          // The loop ends in the timers phase, before the poll phase: a stall that
+          // spans the deadline leaves the chunk in the socket, unread. Yield once.
+          await new Promise((r) => setImmediate(r));
           assert.ok(chunks >= 1, `premise: the reply never started streaming (${chunks} chunks)`);
 
           const t0 = Date.now();
