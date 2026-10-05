@@ -55,6 +55,7 @@ process.env.CACHE_FIX_UPSTREAM_IDLE_TIMEOUT_MS = "2000";
 const ENV_KEYS = [
   "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_PROXY_UPSTREAM", "CACHE_FIX_PROXY_REJECT_UNAUTHORIZED",
   "CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS", "CACHE_FIX_FALLBACK_PROXIES",
+  "CACHE_FIX_UPSTREAM_SOCKET_MAX_LIFETIME_MS",
   "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
   "NO_PROXY", "no_proxy",
 ];
@@ -621,5 +622,107 @@ describe("upstream leg resets: sibling free sockets", () => {
       backend.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// The pool's tunnels outlive a hop instance. A socket reused more often than the
+// idle timeout never idles out, so when the hop's address is re-pointed to a new
+// instance (blue/green behind one port) the pool kept every tunnel on the old one
+// for good, and the old instance's drain never finished.
+describe("upstream pool: tunnels are retired, so a re-pointed hop is picked up", () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const listen = (s) => new Promise((r) => s.listen(0, "127.0.0.1", () => r(`127.0.0.1:${s.address().port}`)));
+
+  // `cutover(status)` points new CONNECTs at the new instance; the old one keeps
+  // answering the tunnels it holds, with `status`. `/stream` is a response that
+  // outlives a short socket lifetime.
+  async function rig(env, fn) {
+    let oldStatus = 200;
+    const oldB = http.createServer((req, res) => {
+      if (req.url === "/hang") return;
+      if (req.url !== "/stream") { res.statusCode = oldStatus; res.end("old"); return; }
+      res.write("a");
+      setTimeout(() => res.write("b"), 100);
+      setTimeout(() => res.end("c"), 200);
+    });
+    const newB = http.createServer((req, res) => { res.end("new"); });
+    const oldAddr = await listen(oldB);
+    const newAddr = await listen(newB);
+    const hop = startResettingHop({ forward: oldAddr });
+    const servers = [oldB, newB, hop];
+    const closeAll = servers.map(trackConnections);
+    const hopAddr = await listen(hop);
+    try {
+      await withEnv({
+        CACHE_FIX_PROXY_UPSTREAM: `http://${oldAddr}`,
+        CACHE_FIX_UPSTREAM_PROXY: `http://${hopAddr}`,
+        ...env,
+      }, async () => {
+        const { forwardRequest } = await import("../proxy/upstream.mjs");
+        const call = async (url = "/v1/messages") => {
+          const r = await forwardRequest({ ...mockReq(), url }, "{}", null);
+          let body = "";
+          for await (const c of r.upstreamRes) body += c;
+          return { status: r.statusCode, body, id: r.upstreamConnectionId };
+        };
+        await fn(call, (status) => { hop.forward = newAddr; oldStatus = status; });
+      });
+    } finally {
+      closeAll.forEach((c) => c());
+      servers.forEach((s) => s.close());
+    }
+  }
+
+  it("a socket reused faster than the idle timeout is retired at its max lifetime", async () => {
+    await rig({ CACHE_FIX_UPSTREAM_SOCKET_MAX_LIFETIME_MS: "100" }, async (call, cutover) => {
+      assert.equal((await call()).body, "old");
+      cutover(200);
+      const t0 = Date.now();
+      let r;
+      do { await sleep(20); r = await call(); } while (r.body === "old" && Date.now() - t0 < 600);
+      assert.equal(r.body, "new", "the pool kept reusing a tunnel to the old instance past its lifetime");
+    });
+  });
+
+  it("a stream in flight across the lifetime boundary completes, and the socket is not reused", async () => {
+    await rig({ CACHE_FIX_UPSTREAM_SOCKET_MAX_LIFETIME_MS: "100" }, async (call) => {
+      const s = await call("/stream");
+      assert.equal(s.body, "abc", "the lifetime cut a response mid-stream");
+      assert.notEqual((await call()).id, s.id, "a socket past its lifetime went back to the pool");
+    });
+  });
+
+  it("a 5xx on a pooled socket retires that socket", async () => {
+    await rig({}, async (call, cutover) => {
+      const first = await call();
+      cutover(502);
+      const bad = await call();
+      assert.deepEqual([bad.status, bad.id], [502, first.id], "premise: the 502 did not come over the pooled socket");
+      const next = await call();
+      assert.equal(next.body, "new", "the socket that answered 502 was reused");
+    });
+  });
+
+  it("three 5xx in a row empty the idle pool", async () => {
+    await rig({}, async (call, cutover) => {
+      const warm = await Promise.all([call(), call(), call(), call()]);
+      assert.equal(new Set(warm.map((r) => r.id)).size, 4, "premise: four concurrent calls did not open four sockets");
+      cutover(502);
+      for (let i = 0; i < 3; i++) assert.equal((await call()).status, 502);
+      assert.equal((await call()).body, "new", "an idle socket survived the failure streak");
+    });
+  });
+
+  it("three timeouts in a row empty the idle pool", async () => {
+    const { default: config } = await import("../proxy/config.mjs");
+    await rig({}, async (call, cutover) => {
+      await Promise.all([call(), call(), call(), call()]);
+      cutover(200);
+      config.timeout = 100;   // read live by forwardRequest; restored below
+      try {
+        for (let i = 0; i < 3; i++) await assert.rejects(call("/hang"), /Upstream timeout/);
+      } finally { config.timeout = 600_000; }
+      assert.equal((await call()).body, "new", "an idle socket survived the timeout streak");
+    });
   });
 });

@@ -37,6 +37,11 @@ const config = {
   // never the wait for a first response byte — that stays on `timeout` above.
   // 0 = off. A getter, unlike `timeout`: tests flip the env per case.
   get upstreamConnectTimeoutMs() { return envInt("CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS", 30_000); },
+  // A pooled socket older than this is destroyed when released, never mid-request.
+  // The idle timeout above cannot bound a socket reused more often than that, so
+  // without this a hop re-pointed to a new instance keeps its old tunnels for ever.
+  // 0 = off. A getter, like the budget above: read per socket, so tests flip it.
+  get upstreamSocketMaxLifetimeMs() { return envInt("CACHE_FIX_UPSTREAM_SOCKET_MAX_LIFETIME_MS", 300_000); },
   extensionsDir: process.env.CACHE_FIX_EXTENSIONS_DIR || join(__dirname, "extensions"),
   extensionsConfig: process.env.CACHE_FIX_EXTENSIONS_CONFIG || join(__dirname, "extensions.json"),
   debug: process.env.CACHE_FIX_DEBUG === "1",
