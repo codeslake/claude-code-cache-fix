@@ -9,9 +9,10 @@ import { readdirSync, readFileSync, existsSync, mkdirSync, mkdtempSync, writeFil
 import { createHash } from "node:crypto";
 import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
+import { onPorts } from "./proc-helpers.mjs";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, onPorts } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
