@@ -1356,7 +1356,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
           let b = ""; r.on("data", (d) => (b += d));
           r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
-        }).on("error", (e) => res(`ERR:${e.code}`));
+        }).on("error", (e) => res(`ERR:${e.code}`))
+          // `timeout:` alone only emits; without this a wedged socket never settles.
+          .on("timeout", function () { this.destroy(); res("ERR:ETIMEDOUT"); });
       });
       const old = spawn(process.execPath, [launcherPath, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let warned = "";
@@ -1381,7 +1383,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
                    // hide exactly the loss this sampler exists to count.
                    (r) => { let b = ""; r.on("data", (d) => (b += d));
                             r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode} ${b.slice(0, 160)}`)); })
-            .on("error", (e) => res(`ERR:${e.code}`));
+            .on("error", (e) => res(`ERR:${e.code}`))
+            .on("timeout", function () { this.destroy(); res("ERR:ETIMEDOUT"); });
         });
         const pump = (async () => {
           while (!stop) {
@@ -1394,15 +1397,30 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
 
         taker = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
         taker.stderr.on("data", (d) => { warned += d.toString(); });
-        // Past the retry ladder, so a per-attempt spawn would have happened.
-        await new Promise((r) => setTimeout(r, 3_000));
+        const ctx = () => `taker exit=${taker.exitCode}, stderr tail ${JSON.stringify(warned.slice(-400))}`;
+        // THE EVENT, NOT A CLOCK. The takeover is over once the incumbent has
+        // let go AND the address answers 200, which only the taker's child can
+        // do. The sampler above keeps running until then, so `served` and the
+        // refusals still cover the whole window. A fixed 3 s here read the
+        // child's boot as "never came back": with the boot held 5 s the probe got
+        // ECONNREFUSED at 3 s and the port answered 200 by itself about 4 s later.
+        const deadline = Date.now() + 30_000;   // release()'s 20 s to win the bind, plus a boot
+        let back = "ERR:the incumbent never let go";
+        while (Date.now() < deadline) {
+          // Read BEFORE dialling: a 200 asked while the incumbent lived is its own.
+          const gone = old.exitCode !== null || old.signalCode !== null;
+          if (gone && !(back = await get()).startsWith("ERR:")) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
         stop = true; await pump;
 
-        assert.ok(served > 0, "no request succeeded at all — the probe measured nothing");
+        assert.ok(served > 0, `no request succeeded at all — the probe measured nothing; ${ctx()}`);
 
         // A CROSS-TREE TAKEOVER CANNOT BE FREE IN NODE, so this bounds the
-        // outage rather than forbidding it — and the bound is what catches a
-        // regression that turns a blip into an outage.
+        // outage rather than forbidding it. The bound is the ceiling above, not
+        // a duration: the new child's boot has no deadline of its own and a fixed
+        // 4 s read a loaded boot as a stranded address. A stranded address never
+        // answers, so the ceiling still catches "a blip became an outage".
         //
         // Why zero is unreachable here. The socket survives its listener's
         // death (measured: parent binds, child listens, child SIGKILLed, port
@@ -1417,16 +1435,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // unowned until our child boots. The zero-loss paths are the ones that
         // never change process tree — the holder restarting its own child, and
         // the proxy handing its socket to its own successor.
-        const outage = refused.length
-          ? refused[refused.length - 1].at - refused[0].at
-          : 0;
-        assert.ok(outage < 4_000,
-          `the port was refusing for ${outage}ms across a takeover (${refused.length} of ` +
-          `${served + refused.length} requests: ${[...new Set(refused.map((r) => r.code))].join(", ")}) ` +
-          `— that is past a child's boot, so the takeover did not complete, it ` +
-          `stranded the address`);
-        assert.equal((await get()).startsWith("ERR:"), false,
-          "the port never came back after the takeover");
+        assert.ok(!back.startsWith("ERR:"),
+          `the port never came back within 30s of the takeover (last probe ${back}; ${refused.length} of ` +
+          `${served + refused.length} requests refused: ${[...new Set(refused.map((r) => r.code))].join(", ")}) ` +
+          `— the takeover did not complete, it stranded the address; ${ctx()}`);
         // PROXIES, which is what the sentence says. A holder also parents one
         // standby relay, so counting children counts something else.
         // POLL, DO NOT SNAPSHOT. This read used to be a single pgrep taken the
@@ -1473,13 +1485,13 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         }
         // 0 and >1 are DIFFERENT failures and the old message called both a
         // retry storm, which sends the reader at the wrong mechanism.
-        assert.equal(kidCount, 1, kidCount === 0
+        assert.equal(kidCount, 1, (kidCount === 0
           ? `the holder supervises no proxy 10s after the takeover — it never spawned one, `
             + `or the one it spawned died`
           : `the holder supervises ${kidCount} proxies and never settled to one; `
-            + `a bind retry spawned one per attempt`);
+            + `a bind retry spawned one per attempt`) + `; ${ctx()}`);
         assert.ok(!/MaxListenersExceeded/.test(warned),
-          "listen() is still being handed a callback per attempt");
+          `listen() is still being handed a callback per attempt; ${ctx()}`);
       } finally {
         // SIGTERM AND WAIT, before any SIGKILL. SIGKILL cannot be forwarded, so
         // a killed launcher strands its proxy — and that grandchild holds the
