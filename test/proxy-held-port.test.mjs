@@ -1407,8 +1407,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // THE EVENT, NOT A CLOCK, in two waits so a failure names the one that did not
         // happen. A taker gone 2 s (an incumbent mid-drain gets that) with its event still
         // absent never delivers it: stop paying the ceiling. The sampler runs through both,
-        // so `served` and `refused` cover the whole window. A fixed 3 s read the child's
-        // boot as "never came back": boot held 5 s, 200 about 4 s later.
+        // so `served` and `refused` cover the whole window.
         const waitFor = async (pred, ms) => {
           for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 100))) {
             if (await pred()) return true;
