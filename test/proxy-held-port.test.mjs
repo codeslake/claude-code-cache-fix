@@ -1362,6 +1362,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           // `timeout:` alone only emits; without this a wedged socket never settles.
           .on("timeout", function () { this.destroy(); res("ERR:ETIMEDOUT"); });
       });
+      const bootAt = Date.now();
       const old = spawn(process.execPath, [launcherPath, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let warned = "";
       let taker = null;
@@ -1370,6 +1371,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         let body = await get();
         while (body.startsWith("ERR:") && Date.now() < up) body = await get();
         assert.equal(JSON.parse(body).status, "ok", "nothing served the port");
+        const bootMs = Date.now() - bootAt;   // this box's own node boot, at this load, seconds before the takeover
 
         // TRAFFIC ACROSS THE TAKEOVER, started before the taker exists — the
         // whole window is between the incumbent letting go and the new child
@@ -1400,28 +1402,36 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         taker = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
         taker.stderr.on("data", (d) => { warned += d.toString(); });
         const ctx = () => `taker exit=${taker.exitCode}, stderr tail ${JSON.stringify(warned.slice(-400))}`;
-        // THE EVENT, NOT A CLOCK: over once the incumbent has let go AND the
-        // address answers 200, which only the taker's child can do. The sampler
-        // keeps running until then, so `served` and the refusals cover the whole
-        // window. A fixed 3 s read the child's boot as "never came back": boot
-        // held 5 s, ECONNREFUSED at 3 s, 200 about 4 s later.
-        const deadline = Date.now() + 30_000;   // release()'s 20 s to win the bind, plus a boot
-        let back = "ERR:the incumbent never let go";
-        while (Date.now() < deadline) {
-          // Read BEFORE dialling: a 200 asked while the incumbent lived is its own.
-          const gone = (old.exitCode ?? old.signalCode) !== null;
-          if (gone && !(back = await get()).startsWith("ERR:")) break;
-          await new Promise((r) => setTimeout(r, 100));
-        }
+        let tookOff = 0;
+        taker.on("exit", () => { tookOff = Date.now(); });
+        // THE EVENT, NOT A CLOCK, in two waits so a failure names the one that did not
+        // happen. A taker gone 2 s (an incumbent mid-drain gets that) with its event still
+        // absent never delivers it: stop paying the ceiling. The sampler runs through both,
+        // so `served` and `refused` cover the whole window. A fixed 3 s read the child's
+        // boot as "never came back": boot held 5 s, 200 about 4 s later.
+        const waitFor = async (pred, ms) => {
+          for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 100))) {
+            if (await pred()) return true;
+            if (tookOff && Date.now() > tookOff + 2_000) break;
+          }
+          return false;
+        };
+        // (a) the taker's node boot (15 s, as `up`) + 11 lsof/ps probes before its SIGHUP (measured) at 10 s each (this case's PROBE_TIMEOUT) + 5 s drain
+        const letGo = await waitFor(() => (old.exitCode ?? old.signalCode) !== null, 15_000 + 11 * 10_000 + 5_000);
+        // (b) release()'s 20 s to win the bind, plus a boot. `old` is gone, so a 200 is the new holder's.
+        let back = "";
+        const answered = letGo && await waitFor(async () => !(back = await get()).startsWith("ERR:"), 30_000);
         stop = true; await pump;
 
         assert.ok(served > 0, `no request succeeded at all — the probe measured nothing; ${ctx()}`);
 
         // A CROSS-TREE TAKEOVER CANNOT BE FREE IN NODE, so this bounds the
-        // outage rather than forbidding it. The bound is the ceiling above, not
-        // a duration: the new child's boot has no deadline of its own and a fixed
-        // 4 s read a loaded boot as a stranded address. A stranded address never
-        // answers, so the ceiling still catches "a blip became an outage".
+        // outage rather than forbidding it. Two bounds, two failures: the 30 s
+        // ceiling catches a stranded address (it never answers), the outage
+        // bound catches a blip that became an outage (it answers, late). The
+        // outage bound is 3x the incumbent's own boot measured above, floor 4 s:
+        // a refusal waits on a node boot, and a loaded box boots in 5 to 8 s, so
+        // a fixed 4 s read a loaded boot as a stranded address.
         //
         // Why zero is unreachable here. The socket survives its listener's
         // death (measured: parent binds, child listens, child SIGKILLed, port
@@ -1436,10 +1446,16 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // unowned until our child boots. The zero-loss paths are the ones that
         // never change process tree — the holder restarting its own child, and
         // the proxy handing its socket to its own successor.
-        assert.ok(!back.startsWith("ERR:"),
-          `the port never came back within 30s of the takeover (last probe ${back}; ${refused.length} of ` +
-          `${served + refused.length} requests refused: ${[...new Set(refused.map((r) => r.code))].join(", ")}) ` +
-          `— the takeover did not complete, it stranded the address; ${ctx()}`);
+        const seen = `${refused.length} of ${served + refused.length} requests refused: ` +
+                     `${[...new Set(refused.map((r) => r.code))].join(", ")}`;
+        assert.ok(letGo, `the incumbent never let go; ${ctx()}`);
+        assert.ok(answered, `the address was stranded after the incumbent left: no 200 within 30s ` +
+                            `(last probe ${back}; ${seen}); ${ctx()}`);
+        const outage = refused.length ? refused[refused.length - 1].at - refused[0].at : 0;
+        const bound = Math.max(4_000, 3 * bootMs);
+        assert.ok(outage < bound,
+          `the port was refusing for ${outage}ms across a takeover, past the ${bound}ms bound ` +
+          `(3x the incumbent's ${bootMs}ms boot, floor 4s; ${seen}) — a blip became an outage; ${ctx()}`);
         // PROXIES, which is what the sentence says. A holder also parents one
         // standby relay, so counting children counts something else.
         // POLL, DO NOT SNAPSHOT. This read used to be a single pgrep taken the
