@@ -1446,8 +1446,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     // a MaxListenersExceededWarning as the only clue.
     it("supervises exactly one proxy after taking the port over", async () => {
       const port = await freePort();
+      // PROBE BOUND RAISED, as at the stranger case: a `ps` that times out reads "cannot tell",
+      // and the taker then exits 0 having signalled nothing (measured under load).
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
-                    CACHE_FIX_SELF_HEAL: "off" };
+                    CACHE_FIX_SELF_HEAL: "off", CACHE_FIX_PROBE_TIMEOUT_MS: "10000" };
       for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
       // 200 OR IT IS NOT THE PROXY: a standby relay carrying this address answers
       // /health with a 503 and a JSON body of its own. readyBody() is the test;
@@ -1456,8 +1458,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
           let b = ""; r.on("data", (d) => (b += d));
           r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
-        }).on("error", (e) => res(`ERR:${e.code}`));
+        }).on("error", (e) => res(`ERR:${e.code}`))
+          // `timeout:` alone only emits; without this a wedged socket never settles.
+          .on("timeout", function () { this.destroy(); res("ERR:ETIMEDOUT"); });
       });
+      const bootAt = Date.now();
       const old = spawn(process.execPath, [launcherPath, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let warned = "";
       let taker = null;
@@ -1476,6 +1481,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // listening, so a probe that begins afterwards measures nothing.
         // agent:false, a fresh connection each time: what is under test is
         // whether the ADDRESS ever refuses, and a pooled socket would not ask.
+        const bootMs = Date.now() - bootAt;   // this box's own node boot, at this load, seconds before the takeover
         let stop = false, served = 0;
         const refused = [];
         const once = () => new Promise((res) => {
@@ -1485,7 +1491,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
                    // hide exactly the loss this sampler exists to count.
                    (r) => { let b = ""; r.on("data", (d) => (b += d));
                             r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode} ${b.slice(0, 160)}`)); })
-            .on("error", (e) => res(`ERR:${e.code}`));
+            .on("error", (e) => res(`ERR:${e.code}`))
+            .on("timeout", function () { this.destroy(); res("ERR:ETIMEDOUT"); });
         });
         const pump = (async () => {
           while (!stop) {
@@ -1498,15 +1505,36 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
 
         taker = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
         taker.stderr.on("data", (d) => { warned += d.toString(); });
-        // Past the retry ladder, so a per-attempt spawn would have happened.
-        await new Promise((r) => setTimeout(r, 3_000));
+        const ctx = () => `taker exit=${taker.exitCode}, stderr tail ${JSON.stringify(warned.slice(-400))}`;
+        let tookOff = 0;
+        taker.on("exit", () => { tookOff = Date.now(); });
+        // THE EVENT, NOT A CLOCK, in two waits so a failure names the one that did not
+        // happen. A taker gone 2 s (an incumbent mid-drain gets that) with its event still
+        // absent never delivers it: stop paying the ceiling. The sampler runs through both,
+        // so `served` and `refused` cover the whole window.
+        const waitFor = async (pred, ms) => {
+          for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 100))) {
+            if (await pred()) return true;
+            if (tookOff && Date.now() > tookOff + 2_000) break;
+          }
+          return false;
+        };
+        // (a) the taker's node boot (15 s, as `up`) + 11 lsof/ps probes before its SIGHUP (measured) at 10 s each (this case's PROBE_TIMEOUT) + 5 s drain
+        const letGo = await waitFor(() => (old.exitCode ?? old.signalCode) !== null, 15_000 + 11 * 10_000 + 5_000);
+        // (b) release()'s 20 s to win the bind, plus a boot. `old` is gone, so a 200 is the new holder's.
+        let back = "";
+        const answered = letGo && await waitFor(async () => !(back = await get()).startsWith("ERR:"), 30_000);
         stop = true; await pump;
 
-        assert.ok(served > 0, "no request succeeded at all — the probe measured nothing");
+        assert.ok(served > 0, `no request succeeded at all — the probe measured nothing; ${ctx()}`);
 
         // A CROSS-TREE TAKEOVER CANNOT BE FREE IN NODE, so this bounds the
-        // outage rather than forbidding it — and the bound is what catches a
-        // regression that turns a blip into an outage.
+        // outage rather than forbidding it. Two bounds, two failures: the 30 s
+        // ceiling catches a stranded address (it never answers), the outage
+        // bound catches a blip that became an outage (it answers, late). The
+        // outage bound is 3x the incumbent's own boot measured above, floor 4 s:
+        // a refusal waits on a node boot, and a loaded box boots in 5 to 8 s, so
+        // a fixed 4 s read a loaded boot as a stranded address.
         //
         // Why zero is unreachable here. The socket survives its listener's
         // death (measured: parent binds, child listens, child SIGKILLed, port
@@ -1521,16 +1549,16 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // unowned until our child boots. The zero-loss paths are the ones that
         // never change process tree — the holder restarting its own child, and
         // the proxy handing its socket to its own successor.
-        const outage = refused.length
-          ? refused[refused.length - 1].at - refused[0].at
-          : 0;
-        assert.ok(outage < 4_000,
-          `the port was refusing for ${outage}ms across a takeover (${refused.length} of ` +
-          `${served + refused.length} requests: ${[...new Set(refused.map((r) => r.code))].join(", ")}) ` +
-          `— that is past a child's boot, so the takeover did not complete, it ` +
-          `stranded the address`);
-        assert.equal((await get()).startsWith("ERR:"), false,
-          "the port never came back after the takeover");
+        const seen = `${refused.length} of ${served + refused.length} requests refused: ` +
+                     `${[...new Set(refused.map((r) => r.code))].join(", ")}`;
+        assert.ok(letGo, `the incumbent never let go; ${ctx()}`);
+        assert.ok(answered, `the address was stranded after the incumbent left: no 200 within 30s ` +
+                            `(last probe ${back}; ${seen}); ${ctx()}`);
+        const outage = refused.length ? refused[refused.length - 1].at - refused[0].at : 0;
+        const bound = Math.max(4_000, 3 * bootMs);
+        assert.ok(outage < bound,
+          `the port was refusing for ${outage}ms across a takeover, past the ${bound}ms bound ` +
+          `(3x the incumbent's ${bootMs}ms boot, floor 4s; ${seen}) — a blip became an outage; ${ctx()}`);
         // PROXIES, which is what the sentence says. A holder also parents one
         // standby relay, so counting children counts something else.
         // POLL, DO NOT SNAPSHOT. This read used to be a single pgrep taken the
@@ -1577,13 +1605,13 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         }
         // 0 and >1 are DIFFERENT failures and the old message called both a
         // retry storm, which sends the reader at the wrong mechanism.
-        assert.equal(kidCount, 1, kidCount === 0
+        assert.equal(kidCount, 1, (kidCount === 0
           ? `the holder supervises no proxy 10s after the takeover — it never spawned one, `
             + `or the one it spawned died`
           : `the holder supervises ${kidCount} proxies and never settled to one; `
-            + `a bind retry spawned one per attempt`);
+            + `a bind retry spawned one per attempt`) + `; ${ctx()}`);
         assert.ok(!/MaxListenersExceeded/.test(warned),
-          "listen() is still being handed a callback per attempt");
+          `listen() is still being handed a callback per attempt; ${ctx()}`);
       } finally {
         // SIGTERM AND WAIT, before any SIGKILL. SIGKILL cannot be forwarded, so
         // a killed launcher strands its proxy — and that grandchild holds the
