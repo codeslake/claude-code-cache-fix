@@ -445,6 +445,62 @@ setInterval(() => {}, 1e9);
   }
 });
 
+// THE LAUNCHER'S SIDE OF THE SAME HAZARD. holderPidOn() handed back the pid of
+// ANY listener, so a run-service that lost its bind to a stranger sent SIGHUP to
+// it — and node's default for SIGHUP is to die. Measured: a neighbouring test
+// file's in-process upstream took the number freePort() had released, and the
+// runner exited 129 at 1537 ms with `release <- takeOver` on the stack. In
+// production it is any unrelated program on the configured port.
+//
+// A CHILD holds the port, and answers SIGHUP with exit 129, so the fault is an
+// assertion that quotes `{ who: "foreign", code: 129 }` instead of this file
+// dying with it.
+it("leaves a listener that is not ours alone and fails naming it", async () => {
+  const port = await freePort();
+  const fg = spawn(process.execPath, ["-e",
+    `process.on("SIGHUP", () => process.exit(129));
+     require("node:net").createServer(() => {}).listen(${port}, "127.0.0.1", () => console.log("up"));`],
+    { stdio: ["ignore", "pipe", "ignore"] });
+  // PROBE BOUND RAISED: a `ps` that times out is "cannot tell" (exit 0, the other branch).
+  // Measured at load 94, one 2 s bound lapsed and the case read exit 0 for a stranger.
+  const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_SELF_HEAL: "off",
+                CACHE_FIX_PROBE_TIMEOUT_MS: "10000" };
+  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
+  let p, err = "";
+  try {
+    // BOUNDED, like the stand-in at proxy-holder-handover.test.mjs: a neighbour can
+    // take the number freePort() released, and fg then dies on EADDRINUSE having
+    // printed nothing (its stderr is ignored), which would hang this case for ever.
+    await new Promise((res, rej) => {
+      fg.stdout.once("data", res);
+      fg.once("exit", () => rej(new Error(`the stand-in listener died before it listened on ${port}`)));
+      setTimeout(() => rej(new Error("stand-in listener never came up")), 10_000).unref();
+    });
+    p = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "ignore", "pipe"] });
+    p.stderr.on("data", (d) => { err += d; });
+    // Bounded on what ends the case, not on a sleep: the launcher closing, or the
+    // stranger dying (the defect), whichever comes first.
+    const ended = await Promise.race([
+      new Promise((r) => p.on("close", (code) => r({ who: "run-service", code }))),
+      new Promise((r) => fg.on("exit", (code, signal) => r({ who: "foreign", code, signal }))),
+      new Promise((r) => setTimeout(() => r({ who: "timeout" }), 25_000)),
+    ]);
+    assert.equal(ended.who, "run-service",
+      `the launcher signalled a listener that is not ours: ${JSON.stringify(ended)}`);
+    assert.equal(ended.code, 1, `run-service exited ${ended.code}: a port held by a stranger is a failure, ` +
+      `not "nothing to do". stderr: ${err.slice(-400)}`);
+    assert.equal(err.split(`${port} is held by a process that is not one of ours`).length - 1, 1,
+      `the refusal must be said once, naming the port. stderr: ${err.slice(-400)}`);
+    assert.ok(await new Promise((r) => net.connect(port, "127.0.0.1").once("connect", function () { this.destroy(); r(true); })
+                                          .once("error", () => r(false))),
+      "the stranger no longer listens on its port");
+  } finally {
+    try { p?.kill("SIGKILL"); } catch { }
+    try { fg.kill("SIGKILL"); } catch { }
+    for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+  }
+});
+
 it("cuts nothing on the held port while the proxy restarts", async () => {
   await withHeldPort(async ({ get, killProxy }) => {
     killProxy();
@@ -1841,7 +1897,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
 
     it("takes the port from a holder running an older deploy", async () => {
       const src = readFileSync(launcherPath, "utf8");
-      const rule = /function holderPidOn[\s\S]*?\n}/.exec(src)?.[0];
+      // From OUR_CMD down: the rule's "is it ours" test is a module const it reads.
+      const rule = /const OUR_CMD = [^\n]*\n[\s\S]*?function holderPidOn[\s\S]*?\n}/.exec(src)?.[0];
       const fpFns = /function codeFingerprint[\s\S]*?\nfunction runningOurCode[\s\S]*?\n}/.exec(src)?.[0];
       // holderPidOn asks lsof about the address the proxy BINDS, not a literal
       // 127.0.0.1 — the two disagreed under CACHE_FIX_PROXY_BIND and the probe
@@ -1887,6 +1944,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const sibling = join(srcDir, "upstream.mjs");
       writeFileSync(ours, "// build A\n");
       writeFileSync(sibling, "// helper A\n");
+      // Per-pid `ps` answers a row sets, over decide()'s defaults.
+      let cmds = {};
       const record = join(dir, `cache-fix-proxy-${9901}.sha256`);
       const publish = (holderTree) => publishRecord(fpFns, { srcDir, record, dir }, holderTree);
 
@@ -1915,6 +1974,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             if (cmd === "pgrep") return "4243\n";
             if (cmd === "ps") {
               const pid = args[args.indexOf("-p") + 1];
+              if (pid in cmds) return cmds[pid];
               if (pid === "4242") return "4241 node /any/proxy/server.mjs\n";
               if (pid === "4241") return "node /usr/local/bin/cache-fix-proxy run-service\n";
               return "node /any/proxy/server.mjs\n";
@@ -2024,6 +2084,23 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         rmSync(record, { force: true });
         assert.equal(decide("4242\n"), "holder",
           "via the parent lookup, an unreadable record did not mean LEAVE ALONE");
+
+        // WHO HOLDS THE PORT, in `ps`'s words: nothing is signalled that is not ours.
+        said.length = 0;
+        // README.md launches `node proxy/server.mjs`, with no `/` before `proxy`.
+        cmds = { 4242: "node proxy/server.mjs\n" };
+        assert.equal(decide("4242\n"), 4242,
+          "`node proxy/server.mjs` is one of ours, and an incumbent that is ours is taken over");
+        cmds = { 4242: "node /x/node_modules/other/bin/cli.mjs\n" };
+        assert.equal(decide("4242\n"), "stranger",
+          "another package's bin/ script was read as ours, so a deploy signals it");
+        // Listeners, but `ps` named none (timed out): cannot tell, never signalled.
+        cmds = { 4241: "", 4242: "" };
+        assert.equal(decide("4241\n4242\n"), null,
+          "no holder's command line readable must be 'cannot tell' (leave it alone)");
+        cmds = {};
+        // POLLED (100 ms for 10 s, 500 ms for 20 s), so silent; the launcher says it once.
+        assert.deepEqual(said, [], "holderPidOn wrote to stderr; its pollers print it once per poll");
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }

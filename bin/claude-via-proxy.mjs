@@ -535,10 +535,17 @@ function holderVerdict(port, pid) {
   return same !== false ? "holder" : pid;
 }
 
+// One of our listeners in `ps`, by the NAME of an entry point we launch or the npm
+// shim; not any .mjs under a bin/ or proxy/, which signals another package's script.
+// test/proc-helpers.mjs OURS is a different rule for a different job (a test's sweep).
+const OUR_CMD = /(?:^|[\s/])(?:proxy\/server\.mjs|bin\/(?:claude-via-proxy|gap-relay)\.mjs|cache-fix-proxy)(?:\s|$)/;
+
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
-// when it is something else we may ask to stop, or null when we cannot tell —
-// and NULL MEANS LEAVE IT ALONE. Signalling a pid we did not identify is how a
-// deploy comes to kill an unrelated service that happened to be on the port.
+// when it is something of ours we may ask to stop, "stranger" when listeners
+// are there and none is ours (a FAILURE: it is never signalled, and null would
+// exit 0), or null when we cannot tell — and NULL MEANS LEAVE IT ALONE.
+// Signalling a pid we did not identify is how a deploy comes to kill an
+// unrelated service that happened to be on the port.
 function holderPidOn(port) {
   let out = "";
   try {
@@ -579,7 +586,11 @@ function holderPidOn(port) {
     }
     return cmdOf.get(pid);
   };
-  for (const p of pids) {
+  // OURS BY COMMAND LINE, before anything below can name a pid to signal. An
+  // unreadable one (`ps` timed out, the pid went away) is "cannot tell".
+  const mine = pids.filter((p) => OUR_CMD.test(psOf(p)));
+  if (!mine.length) return pids.some((p) => psOf(p) !== "") ? "stranger" : null;
+  for (const p of mine) {
     if (/\brun-service\b/.test(psOf(p))) return holderVerdict(port, p);
   }
   // NOT THE STANDBY, unless it is all there is. lsof returns ascending pid order
@@ -592,8 +603,8 @@ function holderPidOn(port) {
   // standby must still be releasable, so it stays eligible when nothing else is.
   // An empty answer means the pid is gone, which is not "a real proxy" — the
   // old code reached the same verdict through its catch.
-  const real = pids.filter((p) => { const c = psOf(p); return c !== "" && !/gap-relay/.test(c); });
-  const pid = (real.length ? real : pids)[0];
+  const real = mine.filter((p) => !/gap-relay/.test(psOf(p)));
+  const pid = (real.length ? real : mine)[0];
   // A holder of ours is running the `run-service` SUBCOMMAND. Nothing weaker
   // works: the rule was "names our launcher and is not server.mjs", and the
   // incumbent a real deploy meets is
@@ -1775,7 +1786,7 @@ function holdPort(rest) {
     const takeOver = () => {
       const incumbent = holderPidOn(port);
       if (incumbent === "holder") return settle(0);   // ours already; nothing to do
-      if (!incumbent) return settle(0);               // cannot identify it: leave it alone
+      if (incumbent === "stranger" || !incumbent) return leaveAlone(incumbent);
       // ASK A HOLDER TO HAND THE PORT ON RATHER THAN DROP IT.
       //
       // A holder can spawn our replacement itself and pass it this very socket,
@@ -1807,12 +1818,25 @@ function holdPort(rest) {
       release();
     };
 
+    // The two answers that end the run WITHOUT a signal, said once here rather than
+    // in the polled holderPidOn(). A stranger fails (1). An unreadable incumbent
+    // exits 0 so a healthy holder of ours under fork pressure does not fail a
+    // start, and says so, since that 0 otherwise reads as "already running it".
+    const leaveAlone = (verdict) => {
+      warn(verdict === "stranger"
+        ? `[cache-fix] ${port} is held by a process that is not one of ours; leaving it alone\n`
+        : `[cache-fix] ${port}: could not read the command line of any process holding it; nothing was ` +
+          `signalled or started. If this was a deploy, it has NOT taken effect.\n`);
+      return settle(verdict === "stranger" ? 1 : 0);
+    };
+
     // The older route: ask the incumbent to let go, then bind what it drops.
     // Whatever arrives here cannot hand a socket on, so the port is unowned for
     // as long as our child takes to boot.
     const release = () => {
       const incumbent = holderPidOn(port);
-      if (incumbent === "holder" || !incumbent) return settle(0);
+      if (incumbent === "holder") return settle(0);
+      if (incumbent === "stranger" || !incumbent) return leaveAlone(incumbent);
       try { process.kill(incumbent, "SIGHUP"); } catch { return settle(0); }
       // Retry the bind until it lands. The incumbent drains first, so this is
       // not a fixed wait — a busy proxy takes longer and we simply keep asking.
@@ -1831,7 +1855,7 @@ function holdPort(rest) {
         if (Date.now() - asked > 500) {
           asked = Date.now();
           const still = holderPidOn(port);
-          if (still && still !== "holder") { try { process.kill(still, "SIGHUP"); } catch { } }
+          if (Number.isInteger(still)) { try { process.kill(still, "SIGHUP"); } catch { } }
         }
         if (Date.now() > deadline) {
           process.stderr.write(
