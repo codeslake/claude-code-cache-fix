@@ -47,14 +47,29 @@ export const cmdOf = (pid) => {
 //
 // lsof exits 1 on ANY error it hit (a process vanishing mid-scan under load is
 // one) and still prints the pids it found, so a throw keeps its stdout.
+//
+// `port` is one port or an array of them: a sweep over a whole file's ports is ONE
+// lsof, since each call costs ~0.5 s here. An empty set returns [] and must not
+// reach lsof, which given no port prints every listener on the box.
 export function listeners(port) {
+  const ports = [port].flat();
+  if (!ports.length) return [];
   let out;
   try {
-    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${ports.join(",")}`, "-sTCP:LISTEN"],
                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch (e) { out = e.stdout ?? ""; }
   return out.trim().split("\n").filter(Boolean).filter((p) => OURS.test(cmdOf(p)));
 }
+
+// onPort() over a whole set of ports, for a file's after() sweep: ONE lsof, not one
+// per port. Port 0 is a proxy told to pick its own, never a port to sweep, so it is
+// dropped, and an empty set must not reach lsof or ours(): `Number([]) === 0` would
+// match a proxy that was given port 0.
+export const onPorts = (ports) => {
+  const ps = ports.filter((p) => Number(p) > 0);
+  return ps.length ? [...new Set([...listeners(ps), ...ps.flatMap((p) => ours(p))])] : [];
+};
 
 // EVERY FIXTURE ON A PORT, LISTENING OR NOT.
 //

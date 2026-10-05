@@ -12,6 +12,7 @@ import { readdirSync, readFileSync, existsSync, mkdirSync, mkdtempSync, writeFil
 import { createHash } from "node:crypto";
 import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
+import { onPorts } from "./proc-helpers.mjs";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
 import { HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, hit, listeners, onPort, reapStamped, stamped, verdict, waitForHolder } from "./proc-helpers.mjs";
@@ -2846,10 +2847,8 @@ it("leaves a standby for the file-level sweep to find, on a port it never regist
 after(async () => {
   for (let i = 0; i < 6; i++) {
     let any = false;
-    for (const port of usedPorts) {
-      for (const q of onPort(port)) {
-        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
-      }
+    for (const q of onPorts(usedPorts)) {
+      try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
     }
     if (!any && i) break;
     await new Promise((r) => setTimeout(r, 700));
