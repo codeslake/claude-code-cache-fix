@@ -455,7 +455,9 @@ function buildAgent(isHTTPS, proxyUrl) {
 // A socket's retirement deadline (epoch ms; 0 = retire at release, absent =
 // never), stamped when the pool creates it and zeroed on an upstream failure.
 // Enforced where Node asks "may this socket go back to the pool?", i.e. at
-// release, so a response in flight is never cut.
+// release, so a response in flight is never cut; a kept socket's idle timer is
+// clamped to the time left, so it cannot be handed out past its deadline either
+// (Node's free-socket onTimeout destroys only a socket still in the free list).
 const _retireAt = new WeakMap();
 const _failStreak = new WeakMap();   // agent → consecutive upstream failures
 const FAIL_STREAK_MAX = 3;
@@ -468,7 +470,16 @@ function withPoolPolicy(agent) {
     cb(err, sock);
   });
   const keepSocketAlive = agent.keepSocketAlive.bind(agent);
-  agent.keepSocketAlive = (sock) => Date.now() < (_retireAt.get(sock) ?? Infinity) && keepSocketAlive(sock);
+  agent.keepSocketAlive = (sock) => {
+    const left = (_retireAt.get(sock) ?? Infinity) - Date.now();
+    if (!(left > 0) || !keepSocketAlive(sock)) return false;
+    if (left !== Infinity) sock.setTimeout(Math.min(sock.timeout || Infinity, left));
+    return true;
+  };
+  // Node re-arms the timeout on reuse only when the request's own differs from the
+  // agent's, so undo the clamp first, or an equal pair leaves it armed mid-request.
+  const reuseSocket = agent.reuseSocket.bind(agent);
+  agent.reuseSocket = (sock, req) => { reuseSocket(sock, req); sock.setTimeout(agent.options.timeout || 0); };
 }
 
 // Destroys every idle socket of `agent` whose pool name starts with `prefix`.

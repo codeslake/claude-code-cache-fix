@@ -684,6 +684,40 @@ describe("upstream pool: tunnels are retired, so a re-pointed hop is picked up",
     });
   });
 
+  it("a socket that passed the check just before its deadline is not handed out after it", async () => {
+    await rig({ CACHE_FIX_UPSTREAM_SOCKET_MAX_LIFETIME_MS: "100" }, async (call, cutover) => {
+      assert.equal((await call()).body, "old");   // released early: the lifetime check passes
+      cutover(200);
+      await sleep(300);   // past the lifetime, far under the file's 2000ms idle timeout
+      assert.equal((await call()).body, "new", "an idle socket was handed out past its lifetime");
+    });
+  });
+
+  it("a reused socket's response in flight is not cut by the idle clamp, even when Node leaves it armed", async () => {
+    // Node re-arms a socket's timeout on reuse only when the request's own differs from
+    // the agent's. Budget off makes the request's `config.timeout`; equal it to the idle one.
+    const { default: config } = await import("../proxy/config.mjs");
+    const prior = config.timeout;
+    config.timeout = config.idleTimeoutMs;
+    try {
+      await rig({ CACHE_FIX_UPSTREAM_SOCKET_MAX_LIFETIME_MS: "80", CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS: "0" }, async (call) => {
+        const first = await call();
+        const s = await call("/stream");   // 100ms between chunks, over the ~70ms the clamp left
+        assert.equal(s.id, first.id, "premise: the stream did not reuse the pooled socket");
+        assert.equal(s.body, "abc", "the idle clamp cut a response in flight");
+      });
+    } finally { config.timeout = prior; }
+  });
+
+  it("a lifetime of 0 turns the retirement off", async () => {
+    await rig({ CACHE_FIX_UPSTREAM_SOCKET_MAX_LIFETIME_MS: "0" }, async (call, cutover) => {
+      const first = await call();
+      cutover(200);
+      await sleep(300);
+      assert.equal((await call()).id, first.id, "a socket was retired with the lifetime off");
+    });
+  });
+
   it("a stream in flight across the lifetime boundary completes, and the socket is not reused", async () => {
     await rig({ CACHE_FIX_UPSTREAM_SOCKET_MAX_LIFETIME_MS: "100" }, async (call) => {
       const s = await call("/stream");
@@ -718,10 +752,11 @@ describe("upstream pool: tunnels are retired, so a re-pointed hop is picked up",
     await rig({}, async (call, cutover) => {
       await Promise.all([call(), call(), call(), call()]);
       cutover(200);
+      const prior = config.timeout;
       config.timeout = 100;   // read live by forwardRequest; restored below
       try {
         for (let i = 0; i < 3; i++) await assert.rejects(call("/hang"), /Upstream timeout/);
-      } finally { config.timeout = 600_000; }
+      } finally { config.timeout = prior; }
       assert.equal((await call()).body, "new", "an idle socket survived the timeout streak");
     });
   });
