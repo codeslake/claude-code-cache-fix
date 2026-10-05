@@ -1815,6 +1815,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const sibling = join(srcDir, "upstream.mjs");
       writeFileSync(ours, "// build A\n");
       writeFileSync(sibling, "// helper A\n");
+      // Per-pid `ps` answers a row sets, over decide()'s defaults.
+      let cmds = {};
       const record = join(dir, `cache-fix-proxy-${9901}.sha256`);
       const sha = () => sourceFingerprintSync(srcDir);
 
@@ -1836,7 +1838,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // so the message is the only thing that separates them for an operator,
       // and a fixture that discards it passes against silence.
       const said = [];
-      const decide = (lsofOut = "4241\n4242\n", cmds = {}) => {
+      const decide = (lsofOut = "4241\n4242\n") => {
         const fake = {
           execFileSync: (cmd, args) => {
             if (cmd === "lsof") return lsofOut;
@@ -1947,13 +1949,17 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // WHO HOLDS THE PORT, in `ps`'s words: nothing is signalled that is not ours.
         said.length = 0;
         // README.md launches `node proxy/server.mjs`, with no `/` before `proxy`.
-        assert.equal(decide("4242\n", { 4242: "node proxy/server.mjs\n" }), 4242,
+        cmds = { 4242: "node proxy/server.mjs\n" };
+        assert.equal(decide("4242\n"), 4242,
           "`node proxy/server.mjs` is one of ours, and an incumbent that is ours is taken over");
-        assert.equal(decide("4242\n", { 4242: "node /x/node_modules/other/bin/cli.mjs\n" }), "stranger",
+        cmds = { 4242: "node /x/node_modules/other/bin/cli.mjs\n" };
+        assert.equal(decide("4242\n"), "stranger",
           "another package's bin/ script was read as ours, so a deploy signals it");
         // Listeners, but `ps` named none (timed out): cannot tell, never signalled.
-        assert.equal(decide("4241\n4242\n", { 4241: "", 4242: "" }), null,
+        cmds = { 4241: "", 4242: "" };
+        assert.equal(decide("4241\n4242\n"), null,
           "no holder's command line readable must be 'cannot tell' (leave it alone)");
+        cmds = {};
         // POLLED (100 ms for 10 s, 500 ms for 20 s), so silent; the launcher says it once.
         assert.deepEqual(said, [], "holderPidOn wrote to stderr; its pollers print it once per poll");
       } finally {
