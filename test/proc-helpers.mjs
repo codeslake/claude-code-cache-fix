@@ -43,10 +43,16 @@ export const cmdOf = (pid) => {
 //
 // lsof exits 1 on ANY error it hit (a process vanishing mid-scan under load is
 // one) and still prints the pids it found, so a throw keeps its stdout.
+//
+// `port` is one port or an array of them: a sweep over a whole file's ports is ONE
+// lsof, since each call costs ~0.5 s here. An empty set returns [] and must not
+// reach lsof, which given no port prints every listener on the box.
 export function listeners(port) {
+  const ports = [port].flat();
+  if (!ports.length) return [];
   let out;
   try {
-    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${ports.join(",")}`, "-sTCP:LISTEN"],
                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch (e) { out = e.stdout ?? ""; }
   return out.trim().split("\n").filter(Boolean).filter((p) => OURS.test(cmdOf(p)));
@@ -75,7 +81,9 @@ export function listeners(port) {
 // Still filtered by OURS, for the same reason listeners() is: a port number is
 // not ownership, and freePort() hands the same number to neighbouring files.
 export function ours(port) {
-  const want = new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=${Number(port)}(?:\\s|$)`);
+  const ports = [port].flat();
+  if (!ports.length) return [];  // an empty alternation would match a proxy given port 0
+  const want = new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=(?:${ports.map(Number).join("|")})(?:\\s|$)`);
   const out = [];
   try {
     // Linux: /proc is authoritative and needs no shell-out.

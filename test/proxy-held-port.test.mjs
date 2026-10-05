@@ -2656,10 +2656,8 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
 after(async () => {
   for (let i = 0; i < 6; i++) {
     let any = false;
-    for (const port of usedPorts) {
-      for (const q of onPort(port)) {
-        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
-      }
+    for (const q of onPort(usedPorts)) {
+      try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
     }
     if (!any && i) break;
     await new Promise((r) => setTimeout(r, 700));

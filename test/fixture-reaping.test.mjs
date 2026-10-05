@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { listeners, ours } from "./proc-helpers.mjs";
+import { freePort, listeners, onPort, ours } from "./proc-helpers.mjs";
 
 
 describe("fixture reaping", () => {
@@ -83,6 +83,62 @@ describe("fixture reaping", () => {
     process.env.PATH = `${dir}:${path}`;
     try {
       assert.deepEqual(listeners(1), [String(kid.pid)]);
+    } finally {
+      process.env.PATH = path;
+      kid.kill("SIGKILL");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // A file's after() sweeps every port it handed out. One lsof per port made 56
+  // synchronous calls of ~490 ms each there, so the helpers take the whole set.
+  it("sweeps a set of ports in one call", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ccf-reap-"));
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    const script = join(dir, "bin", "hold.mjs");
+    writeFileSync(script, 'import net from "node:net";\n' +
+      'if (process.argv[2]) net.createServer().listen(+process.argv[2], "127.0.0.1", () => console.log("up"));\n' +
+      'else setTimeout(() => {}, 20000);\n');
+    const ports = new Set();
+    while (ports.size < 4) ports.add(await freePort());
+    const [a, b, c, outside] = ports;
+    const kids = [];
+    const start = async (args, held) => {
+      const env = { ...process.env, ...(held && { CACHE_FIX_HELD_PORT: String(held) }) };
+      const kid = spawn(process.execPath, [script, ...args], { env, stdio: ["ignore", "pipe", "ignore"] });
+      kids.push(kid);
+      await (args.length ? once(kid.stdout, "data") : once(kid, "spawn"));
+      return String(kid.pid);
+    };
+    try {
+      const listening = await start([b]);            // in the set, holds the listen
+      const standby = await start([], c);            // in the set, lists no listen
+      const stranger = await start([outside], outside); // ours, but its port is not in the set
+      await new Promise((r) => setTimeout(r, 300));  // let its environ settle
+      assert.deepEqual(listeners([a, b, c]), [listening]);
+      assert.deepEqual(ours([a, b, c]), [standby]);
+      assert.deepEqual(onPort([a, b, c]).sort(), [listening, standby].sort(),
+        `onPort(set) must find the listener and the listen-less standby, and not pid ${stranger} on a port outside it`);
+    } finally {
+      for (const k of kids) try { k.kill("SIGKILL"); } catch { }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sweeps nothing for an empty port set", async () => {
+    // lsof with no port list prints every listener, and `PORT=` + nothing
+    // matches a proxy that was given port 0, so the empty set must not reach them.
+    const dir = mkdtempSync(join(tmpdir(), "ccf-reap-"));
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    writeFileSync(join(dir, "bin", "idle.mjs"), "setTimeout(() => {}, 20000);\n");
+    const kid = spawn(process.execPath, [join(dir, "bin", "idle.mjs")],
+      { env: { ...process.env, CACHE_FIX_PROXY_PORT: "0" }, stdio: "ignore" });
+    await once(kid, "spawn");
+    writeFileSync(join(dir, "lsof"), `#!/bin/sh\necho ${kid.pid}\nexit 1\n`, { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${dir}:${path}`;
+    try {
+      assert.deepEqual(onPort([]), []);
     } finally {
       process.env.PATH = path;
       kid.kill("SIGKILL");
