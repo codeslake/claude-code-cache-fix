@@ -472,8 +472,8 @@ function withPoolPolicy(agent) {
   const keepSocketAlive = agent.keepSocketAlive.bind(agent);
   agent.keepSocketAlive = (sock) => {
     const left = (_retireAt.get(sock) ?? Infinity) - Date.now();
-    if (!(left > 0) || !keepSocketAlive(sock)) return false;
-    if (left !== Infinity) sock.setTimeout(Math.min(sock.timeout || Infinity, left));
+    if (left <= 0 || !keepSocketAlive(sock)) return false;
+    if (left < Infinity) sock.setTimeout(Math.min(sock.timeout || Infinity, left));
     return true;
   };
   // Node re-arms the timeout on reuse only when the request's own differs from the
