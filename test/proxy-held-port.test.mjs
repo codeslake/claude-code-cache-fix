@@ -1344,8 +1344,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     // a MaxListenersExceededWarning as the only clue.
     it("supervises exactly one proxy after taking the port over", async () => {
       const port = await freePort();
+      // PROBE BOUND RAISED, as at the stranger case: a `ps` that times out reads "cannot tell",
+      // and the taker then exits 0 having signalled nothing (measured under load).
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
-                    CACHE_FIX_SELF_HEAL: "off" };
+                    CACHE_FIX_SELF_HEAL: "off", CACHE_FIX_PROBE_TIMEOUT_MS: "10000" };
       for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
       // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
       // /health with a 503 and a JSON body of its own, and a helper that returned
