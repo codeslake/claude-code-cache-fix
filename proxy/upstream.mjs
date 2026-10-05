@@ -452,6 +452,54 @@ function buildAgent(isHTTPS, proxyUrl) {
   return null;
 }
 
+// A socket's retirement deadline (epoch ms; 0 = retire at release, absent =
+// never), stamped when the pool creates it and zeroed on an upstream failure.
+// Enforced where Node asks "may this socket go back to the pool?", i.e. at
+// release, so a response in flight is never cut; a kept socket's idle timer is
+// clamped to the time left, so it cannot be handed out past its deadline either
+// (Node's free-socket onTimeout destroys only a socket still in the free list).
+const _retireAt = new WeakMap();
+const _failStreak = new WeakMap();   // agent → consecutive upstream failures
+const FAIL_STREAK_MAX = 3;
+
+function withPoolPolicy(agent) {
+  const createSocket = agent.createSocket.bind(agent);
+  agent.createSocket = (req, options, cb) => createSocket(req, options, (err, sock) => {
+    const max = config.upstreamSocketMaxLifetimeMs;
+    if (sock && max > 0) _retireAt.set(sock, Date.now() + max);
+    cb(err, sock);
+  });
+  const keepSocketAlive = agent.keepSocketAlive.bind(agent);
+  agent.keepSocketAlive = (sock) => {
+    const left = (_retireAt.get(sock) ?? Infinity) - Date.now();
+    if (left <= 0 || !keepSocketAlive(sock)) return false;
+    if (left < Infinity) sock.setTimeout(Math.min(sock.timeout || Infinity, left));
+    return true;
+  };
+  // Node re-arms the timeout on reuse only when the request's own differs from the
+  // agent's, so undo the clamp first, or an equal pair leaves it armed mid-request.
+  const reuseSocket = agent.reuseSocket.bind(agent);
+  agent.reuseSocket = (sock, req) => { reuseSocket(sock, req); sock.setTimeout(agent.options.timeout || 0); };
+}
+
+// Destroys every idle socket of `agent` whose pool name starts with `prefix`.
+function destroyFree(agent, prefix = "") {
+  for (const [n, list] of Object.entries(agent.freeSockets ?? {})) {
+    if (n.startsWith(prefix)) for (const s of list) s.destroy();
+  }
+}
+
+// A 5xx or a timeout retires the socket that carried it. A streak of them means
+// the whole idle pool is suspect (tunnels still pinned to a hop instance that
+// has gone bad), so it goes too. Anything else ends the streak.
+function noteUpstream(agent, sock, failed) {
+  if (!agent || !sock) return;
+  if (failed) _retireAt.set(sock, 0);
+  const streak = failed ? (_failStreak.get(agent) ?? 0) + 1 : 0;
+  _failStreak.set(agent, streak % FAIL_STREAK_MAX);
+  if (streak === FAIL_STREAK_MAX) destroyFree(agent);
+}
+
 // Exported so other egress paths (e.g. the forward-proxy's download rewrite to
 // storage.googleapis.com) reuse the SAME proxy/NO_PROXY/CA/TLS policy instead of
 // reimplementing a subset of it.
@@ -473,6 +521,7 @@ export function getAgent(isHTTPS, hostname, hop) {
   let agent = _agents.get(cacheKey);
   if (agent === undefined) {
     agent = buildAgent(isHTTPS, proxyUrl);
+    if (agent) withPoolPolicy(agent);
     _agents.set(cacheKey, agent);
     if (proxyUrl && !_loggedProxies.has(`${proxyUrl}|${isHTTPS}`)) {
       _loggedProxies.add(`${proxyUrl}|${isHTTPS}`);
@@ -645,6 +694,7 @@ export async function forwardRequest(clientReq, body, signal) {
 
     const upstreamReq = transport.request(options, (upstreamRes) => {
       settled = true;
+      noteUpstream(options.agent, upstreamRes.socket, upstreamRes.statusCode >= 500);
       const responseHeaders = filterResponseHeaders(upstreamRes.headers);
       resolve({
         upstreamRes,
@@ -680,11 +730,7 @@ export async function forwardRequest(clientReq, body, signal) {
           // under, so an exact-name lookup silently sweeps nothing. Every
           // name (http or https) starts with `hostname:port:`, so match on
           // that prefix instead — both share it by construction.
-          const prefix = `${options.hostname}:${options.port}:`;
-          for (const [n, list] of Object.entries(agent.freeSockets ?? {})) {
-            if (!n.startsWith(prefix)) continue;
-            for (const s of list) s.destroy();
-          }
+          destroyFree(agent, `${options.hostname}:${options.port}:`);
         }
         resolve(attempt(true));
         return;
@@ -694,6 +740,7 @@ export async function forwardRequest(clientReq, body, signal) {
     // Named so a rejection reads as which phase timed out; `established`
     // already decides retry-eligibility above, this is cosmetic only.
     upstreamReq.on("timeout", () => {
+      if (established) noteUpstream(options.agent, upstreamReq.socket, true);
       upstreamReq.destroy(new Error(established
         ? "Upstream timeout"
         : `upstream connect budget (${connectBudgetMs}ms) exceeded`));

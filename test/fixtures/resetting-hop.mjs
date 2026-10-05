@@ -20,6 +20,11 @@
 // proof, not for this test file; that probe must never consume the injection
 // meant for the real CONNECT that follows it.
 //
+// `hop.forward = "host:port"` re-points every CONNECT accepted from then on; a
+// tunnel already relayed keeps the target it was built to. That is a blue/green
+// switch behind one hop address: the old instance keeps answering the
+// connections it already holds.
+//
 // Exports only, no top-level side effects (test/proc-helpers.mjs,
 // test/child-deadline.mjs: same convention). Standalone, e.g. (run from the
 // repo root):
@@ -29,9 +34,6 @@
 import net from "node:net";
 
 export function startResettingHop({ forward, resetFirstConnect = false, stallFirstConnect = false } = {}) {
-  const sep = String(forward).lastIndexOf(":");
-  const fwdHost = forward.slice(0, sep);
-  const fwdPort = Number(forward.slice(sep + 1));
   let seen = 0;   // CONNECT REQUESTS seen (bytes sent), not raw accepts.
 
   const server = net.createServer((client) => {
@@ -63,7 +65,8 @@ export function startResettingHop({ forward, resetFirstConnect = false, stallFir
         return;
       }
 
-      const target = net.connect(fwdPort, fwdHost, () => {
+      const sep = String(server.forward).lastIndexOf(":");
+      const target = net.connect(Number(server.forward.slice(sep + 1)), server.forward.slice(0, sep), () => {
         client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         if (rest.length) target.write(rest);
         client.pipe(target);
@@ -74,6 +77,7 @@ export function startResettingHop({ forward, resetFirstConnect = false, stallFir
     };
     client.on("data", onData);
   });
+  server.forward = forward;
   server.injected = 0;   // count of reset/stall injections actually fired
   return server;
 }
