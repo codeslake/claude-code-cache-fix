@@ -58,6 +58,15 @@ export function listeners(port) {
   return out.trim().split("\n").filter(Boolean).filter((p) => OURS.test(cmdOf(p)));
 }
 
+// onPort() over a whole set of ports, for a file's after() sweep: ONE lsof, not one
+// per port. Port 0 is a proxy told to pick its own, never a port to sweep, so it is
+// dropped, and an empty set must not reach lsof or ours(): `Number([]) === 0` would
+// match a proxy that was given port 0.
+export const onPorts = (ports) => {
+  const ps = ports.filter((p) => Number(p) > 0);
+  return ps.length ? [...new Set([...listeners(ps), ...ps.flatMap((p) => ours(p))])] : [];
+};
+
 // EVERY FIXTURE ON A PORT, LISTENING OR NOT.
 //
 // listeners() is `lsof -sTCP:LISTEN`, so it finds a process only while it HOLDS
@@ -81,9 +90,7 @@ export function listeners(port) {
 // Still filtered by OURS, for the same reason listeners() is: a port number is
 // not ownership, and freePort() hands the same number to neighbouring files.
 export function ours(port) {
-  const ports = [port].flat();
-  if (!ports.length) return [];  // an empty alternation would match a proxy given port 0
-  const want = new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=(?:${ports.map(Number).join("|")})(?:\\s|$)`);
+  const want = new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=${Number(port)}(?:\\s|$)`);
   const out = [];
   try {
     // Linux: /proc is authoritative and needs no shell-out.

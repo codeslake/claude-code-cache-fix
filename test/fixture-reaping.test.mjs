@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { freePort, listeners, onPort, ours } from "./proc-helpers.mjs";
+import { freePort, listeners, onPorts, ours } from "./proc-helpers.mjs";
 
 
 describe("fixture reaping", () => {
@@ -91,43 +91,45 @@ describe("fixture reaping", () => {
   });
 
   // A file's after() sweeps every port it handed out. One lsof per port made 56
-  // synchronous calls of ~490 ms each there, so the helpers take the whole set.
+  // synchronous calls of ~490 ms each there, so the sweep takes the whole set.
   it("sweeps a set of ports in one call", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ccf-reap-"));
     mkdirSync(join(dir, "bin"), { recursive: true });
     const script = join(dir, "bin", "hold.mjs");
     writeFileSync(script, 'import net from "node:net";\n' +
       'if (process.argv[2]) net.createServer().listen(+process.argv[2], "127.0.0.1", () => console.log("up"));\n' +
-      'else setTimeout(() => {}, 20000);\n');
+      'else { console.log("up"); setTimeout(() => {}, 20000); }\n');
     const ports = new Set();
     while (ports.size < 4) ports.add(await freePort());
     const [a, b, c, outside] = ports;
     const kids = [];
-    const start = async (args, held) => {
-      const env = { ...process.env, ...(held && { CACHE_FIX_HELD_PORT: String(held) }) };
-      const kid = spawn(process.execPath, [script, ...args], { env, stdio: ["ignore", "pipe", "ignore"] });
+    const start = async (args, env) => {
+      const kid = spawn(process.execPath, [script, ...args],
+        { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "ignore"] });
       kids.push(kid);
-      await (args.length ? once(kid.stdout, "data") : once(kid, "spawn"));
+      // Racing the exit makes a child that dies before it prints fail the case, not hang it.
+      await Promise.race([once(kid.stdout, "data"),
+        once(kid, "exit").then(() => { throw new Error(`pid ${kid.pid} exited before it was ready`); })]);
       return String(kid.pid);
     };
     try {
-      const listening = await start([b]);            // in the set, holds the listen
-      const standby = await start([], c);            // in the set, lists no listen
-      const stranger = await start([outside], outside); // ours, but its port is not in the set
-      await new Promise((r) => setTimeout(r, 300));  // let its environ settle
+      const listening = await start([b]);                                   // in the set, holds the listen
+      const standby = await start([], { CACHE_FIX_HELD_PORT: String(c) });  // in the set, lists no listen
+      const stranger = await start([outside], { CACHE_FIX_HELD_PORT: String(outside) }); // ours, outside the set
+      const zero = await start([], { CACHE_FIX_PROXY_PORT: "0" });          // ours, given port 0
       assert.deepEqual(listeners([a, b, c]), [listening]);
-      assert.deepEqual(ours([a, b, c]), [standby]);
-      assert.deepEqual(onPort([a, b, c]).sort(), [listening, standby].sort(),
-        `onPort(set) must find the listener and the listen-less standby, and not pid ${stranger} on a port outside it`);
+      assert.deepEqual(onPorts([0, a, b, c]).sort(), [listening, standby].sort(),
+        `onPorts must find the listener and the listen-less standby, and neither pid ${stranger} (port outside the set) nor ${zero} (port 0)`);
     } finally {
       for (const k of kids) try { k.kill("SIGKILL"); } catch { }
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("sweeps nothing for an empty port set", async () => {
-    // lsof with no port list prints every listener, and `PORT=` + nothing
-    // matches a proxy that was given port 0, so the empty set must not reach them.
+  it("sweeps nothing for an empty set or one that is only port 0", async () => {
+    // lsof with no port list prints every listener on the box, and the empty set
+    // handed to a single-port helper is `Number([]) === 0`, which matches a proxy
+    // given port 0. The fake lsof and that proxy are both OURS, so either leak shows.
     const dir = mkdtempSync(join(tmpdir(), "ccf-reap-"));
     mkdirSync(join(dir, "bin"), { recursive: true });
     writeFileSync(join(dir, "bin", "idle.mjs"), "setTimeout(() => {}, 20000);\n");
@@ -138,7 +140,8 @@ describe("fixture reaping", () => {
     const path = process.env.PATH;
     process.env.PATH = `${dir}:${path}`;
     try {
-      assert.deepEqual(onPort([]), []);
+      assert.deepEqual(onPorts([]), []);
+      assert.deepEqual(onPorts([0]), []);
     } finally {
       process.env.PATH = path;
       kid.kill("SIGKILL");
