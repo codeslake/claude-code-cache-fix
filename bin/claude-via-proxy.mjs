@@ -535,11 +535,9 @@ function holderVerdict(port, pid) {
   return same !== false ? "holder" : pid;
 }
 
-// One of our listeners in `ps`, by the NAME of an entry point we launch (proxy,
-// launcher, standby relay) or the npm shim. Not any .mjs under a bin/ or proxy/
-// (another package's script would be signalled), and not requiring a `/` before
-// `proxy` (`node proxy/server.mjs`, README.md). test/proc-helpers.mjs OURS is a
-// different rule for a different job: what a test's sweep may kill.
+// One of our listeners in `ps`, by the NAME of an entry point we launch or the npm
+// shim; not any .mjs under a bin/ or proxy/, which signals another package's script.
+// test/proc-helpers.mjs OURS is a different rule for a different job (a test's sweep).
 const OUR_CMD = /(?:^|[\s/])(?:proxy\/server\.mjs|bin\/(?:claude-via-proxy|gap-relay)\.mjs|cache-fix-proxy)(?:\s|$)/;
 
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
@@ -547,8 +545,7 @@ const OUR_CMD = /(?:^|[\s/])(?:proxy\/server\.mjs|bin\/(?:claude-via-proxy|gap-r
 // are there and none is ours (a FAILURE: it is never signalled, and null would
 // exit 0), or null when we cannot tell — and NULL MEANS LEAVE IT ALONE.
 // Signalling a pid we did not identify is how a deploy comes to kill an
-// unrelated service that happened to be on the port. SILENT, because it is
-// polled; the launcher says what it decided once, where it settles.
+// unrelated service that happened to be on the port.
 function holderPidOn(port) {
   let out = "";
   try {
