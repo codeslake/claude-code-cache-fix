@@ -1398,17 +1398,16 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         taker = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
         taker.stderr.on("data", (d) => { warned += d.toString(); });
         const ctx = () => `taker exit=${taker.exitCode}, stderr tail ${JSON.stringify(warned.slice(-400))}`;
-        // THE EVENT, NOT A CLOCK. The takeover is over once the incumbent has
-        // let go AND the address answers 200, which only the taker's child can
-        // do. The sampler above keeps running until then, so `served` and the
-        // refusals still cover the whole window. A fixed 3 s here read the
-        // child's boot as "never came back": with the boot held 5 s the probe got
-        // ECONNREFUSED at 3 s and the port answered 200 by itself about 4 s later.
+        // THE EVENT, NOT A CLOCK: over once the incumbent has let go AND the
+        // address answers 200, which only the taker's child can do. The sampler
+        // keeps running until then, so `served` and the refusals cover the whole
+        // window. A fixed 3 s read the child's boot as "never came back": boot
+        // held 5 s, ECONNREFUSED at 3 s, 200 about 4 s later.
         const deadline = Date.now() + 30_000;   // release()'s 20 s to win the bind, plus a boot
         let back = "ERR:the incumbent never let go";
         while (Date.now() < deadline) {
           // Read BEFORE dialling: a 200 asked while the incumbent lived is its own.
-          const gone = old.exitCode !== null || old.signalCode !== null;
+          const gone = (old.exitCode ?? old.signalCode) !== null;
           if (gone && !(back = await get()).startsWith("ERR:")) break;
           await new Promise((r) => setTimeout(r, 100));
         }
