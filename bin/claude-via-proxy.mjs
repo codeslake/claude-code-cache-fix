@@ -535,20 +535,16 @@ function holderVerdict(port, pid) {
   return same !== false ? "holder" : pid;
 }
 
-// WHAT ONE OF OUR LISTENERS LOOKS LIKE IN `ps`: a script under bin/ or proxy/
-// (claude-via-proxy, gap-relay, proxy/server.mjs), or the npm shim, whose argv
-// carries no .mjs. The script half is test/proc-helpers.mjs OURS, which was got
-// wrong twice before it settled: `node` alone claims every node process, a bare
-// filename claims a test file named for one of ours.
+// One of our listeners in `ps`: a script under bin/ or proxy/ (test/proc-helpers.mjs
+// OURS, whose shape took two tries), or the npm shim, whose argv has no .mjs.
 const OUR_CMD = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b|\/cache-fix-proxy(?:\s|$)/;
 
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
-// when it is something of ours we may ask to stop, "stranger" when a listener
-// is there and NONE is ours, or null when we cannot tell — and NULL MEANS LEAVE
-// IT ALONE. Signalling a pid we did not identify is how a deploy comes to kill
-// an unrelated service that happened to be on the port: measured, a test
-// runner's own listener took a port freePort() had released and the launcher
-// SIGHUPped it, exit 129. A stranger is a FAILURE, not a null: null exits 0.
+// when it is something of ours we may ask to stop, "stranger" when listeners
+// are there and none is ours (a FAILURE: it is never signalled, and null would
+// exit 0), or null when we cannot tell — and NULL MEANS LEAVE IT ALONE.
+// Signalling a pid we did not identify is how a deploy comes to kill an
+// unrelated service that happened to be on the port.
 function holderPidOn(port) {
   let out = "";
   try {
@@ -590,8 +586,7 @@ function holderPidOn(port) {
     return cmdOf.get(pid);
   };
   // OURS BY COMMAND LINE, before anything below can name a pid to signal. An
-  // unreadable one (`ps` timed out, the pid went away) proves nothing either
-  // way, so it is "cannot tell" and not a stranger.
+  // unreadable one (`ps` timed out, the pid went away) is "cannot tell".
   const mine = pids.filter((p) => OUR_CMD.test(psOf(p)));
   if (!mine.length) {
     const other = pids.find((p) => psOf(p) !== "");
