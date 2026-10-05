@@ -535,10 +535,20 @@ function holderVerdict(port, pid) {
   return same !== false ? "holder" : pid;
 }
 
+// WHAT ONE OF OUR LISTENERS LOOKS LIKE IN `ps`: a script under bin/ or proxy/
+// (claude-via-proxy, gap-relay, proxy/server.mjs), or the npm shim, whose argv
+// carries no .mjs. The script half is test/proc-helpers.mjs OURS, which was got
+// wrong twice before it settled: `node` alone claims every node process, a bare
+// filename claims a test file named for one of ours.
+const OUR_CMD = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b|\/cache-fix-proxy(?:\s|$)/;
+
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
-// when it is something else we may ask to stop, or null when we cannot tell —
-// and NULL MEANS LEAVE IT ALONE. Signalling a pid we did not identify is how a
-// deploy comes to kill an unrelated service that happened to be on the port.
+// when it is something of ours we may ask to stop, "stranger" when a listener
+// is there and NONE is ours, or null when we cannot tell — and NULL MEANS LEAVE
+// IT ALONE. Signalling a pid we did not identify is how a deploy comes to kill
+// an unrelated service that happened to be on the port: measured, a test
+// runner's own listener took a port freePort() had released and the launcher
+// SIGHUPped it, exit 129. A stranger is a FAILURE, not a null: null exits 0.
 function holderPidOn(port) {
   let out = "";
   try {
@@ -579,7 +589,17 @@ function holderPidOn(port) {
     }
     return cmdOf.get(pid);
   };
-  for (const p of pids) {
+  // OURS BY COMMAND LINE, before anything below can name a pid to signal. An
+  // unreadable one (`ps` timed out, the pid went away) proves nothing either
+  // way, so it is "cannot tell" and not a stranger.
+  const mine = pids.filter((p) => OUR_CMD.test(psOf(p)));
+  if (!mine.length) {
+    const other = pids.find((p) => psOf(p) !== "");
+    if (other === undefined) return null;
+    warn(`[cache-fix] ${port} is held by pid ${other}, which is not identified as one of ours; leaving it alone\n`);
+    return "stranger";
+  }
+  for (const p of mine) {
     if (/\brun-service\b/.test(psOf(p))) return holderVerdict(port, p);
   }
   // NOT THE STANDBY, unless it is all there is. lsof returns ascending pid order
@@ -592,8 +612,8 @@ function holderPidOn(port) {
   // standby must still be releasable, so it stays eligible when nothing else is.
   // An empty answer means the pid is gone, which is not "a real proxy" — the
   // old code reached the same verdict through its catch.
-  const real = pids.filter((p) => { const c = psOf(p); return c !== "" && !/gap-relay/.test(c); });
-  const pid = (real.length ? real : pids)[0];
+  const real = mine.filter((p) => !/gap-relay/.test(psOf(p)));
+  const pid = (real.length ? real : mine)[0];
   // A holder of ours is running the `run-service` SUBCOMMAND. Nothing weaker
   // works: the rule was "names our launcher and is not server.mjs", and the
   // incumbent a real deploy meets is
@@ -1668,6 +1688,7 @@ function holdPort(rest) {
     // 0 rather than churning it.
     const takeOver = () => {
       const incumbent = holderPidOn(port);
+      if (incumbent === "stranger") return settle(1); // not ours: it said so; never a signal
       if (incumbent === "holder") return settle(0);   // ours already; nothing to do
       if (!incumbent) return settle(0);               // cannot identify it: leave it alone
       // ASK A HOLDER TO HAND THE PORT ON RATHER THAN DROP IT.
@@ -1706,6 +1727,7 @@ function holdPort(rest) {
     // as long as our child takes to boot.
     const release = () => {
       const incumbent = holderPidOn(port);
+      if (incumbent === "stranger") return settle(1);
       if (incumbent === "holder" || !incumbent) return settle(0);
       try { process.kill(incumbent, "SIGHUP"); } catch { return settle(0); }
       // Retry the bind until it lands. The incumbent drains first, so this is
@@ -1725,7 +1747,7 @@ function holdPort(rest) {
         if (Date.now() - asked > 500) {
           asked = Date.now();
           const still = holderPidOn(port);
-          if (still && still !== "holder") { try { process.kill(still, "SIGHUP"); } catch { } }
+          if (Number.isInteger(still)) { try { process.kill(still, "SIGHUP"); } catch { } }
         }
         if (Date.now() > deadline) {
           process.stderr.write(

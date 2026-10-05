@@ -333,6 +333,54 @@ setInterval(() => {}, 1e9);
   }
 });
 
+// THE LAUNCHER'S SIDE OF THE SAME HAZARD. holderPidOn() handed back the pid of
+// ANY listener, so a run-service that lost its bind to a stranger sent SIGHUP to
+// it — and node's default for SIGHUP is to die. Measured: a neighbouring test
+// file's in-process upstream took the number freePort() had released, and the
+// runner exited 129 at 1537 ms with `release <- takeOver` on the stack. In
+// production it is any unrelated program on the configured port.
+//
+// A CHILD holds the port, and answers SIGHUP with exit 129, so the fault is an
+// assertion that quotes `{ who: "foreign", code: 129 }` instead of this file
+// dying with it.
+it("leaves a listener that is not ours alone and fails naming it", async () => {
+  // ONE DEFINITION OF "OURS": the launcher's pattern must carry the helper's.
+  assert.ok(readFileSync(launcherPath, "utf8").includes(OURS.source),
+    "the launcher's OUR_CMD no longer contains test/proc-helpers.mjs OURS");
+  const port = await freePort();
+  const fg = spawn(process.execPath, ["-e",
+    `process.on("SIGHUP", () => process.exit(129));
+     require("node:net").createServer(() => {}).listen(${port}, "127.0.0.1", () => console.log("up"));`],
+    { stdio: ["ignore", "pipe", "ignore"] });
+  const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_SELF_HEAL: "off" };
+  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
+  let p, err = "";
+  try {
+    await new Promise((r) => fg.stdout.once("data", r));
+    p = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "ignore", "pipe"] });
+    p.stderr.on("data", (d) => { err += d; });
+    // Bounded on what ends the case, not on a sleep: the launcher closing, or the
+    // stranger dying (the defect), whichever comes first.
+    const ended = await Promise.race([
+      new Promise((r) => p.on("close", (code) => r({ who: "run-service", code }))),
+      new Promise((r) => fg.on("exit", (code, signal) => r({ who: "foreign", code, signal }))),
+      new Promise((r) => setTimeout(() => r({ who: "timeout" }), 25_000)),
+    ]);
+    assert.equal(ended.who, "run-service",
+      `the launcher signalled a listener that is not ours: ${JSON.stringify(ended)}`);
+    assert.equal(ended.code, 1, `run-service exited ${ended.code}: a port held by a stranger is a failure, ` +
+      `not "nothing to do". stderr: ${err.slice(-400)}`);
+    assert.match(err, new RegExp(`${port} is held by pid ${fg.pid}, which is not identified as one of ours`));
+    assert.ok(await new Promise((r) => net.connect(port, "127.0.0.1").once("connect", function () { this.destroy(); r(true); })
+                                          .once("error", () => r(false))),
+      "the stranger no longer listens on its port");
+  } finally {
+    try { p?.kill("SIGKILL"); } catch { }
+    try { fg.kill("SIGKILL"); } catch { }
+    for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+  }
+});
+
 it("cuts nothing on the held port while the proxy restarts", async () => {
   await withHeldPort(async ({ get, killProxy }) => {
     killProxy();
@@ -1712,7 +1760,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
 
     it("takes the port from a holder running an older deploy", async () => {
       const src = readFileSync(launcherPath, "utf8");
-      const rule = /function holderPidOn[\s\S]*?\n}/.exec(src)?.[0];
+      // From OUR_CMD down: the rule's "is it ours" test is a module const it reads.
+      const rule = /const OUR_CMD = [^\n]*\n[\s\S]*?function holderPidOn[\s\S]*?\n}/.exec(src)?.[0];
       const fpFns = /function codeFingerprint[\s\S]*?\nfunction runningOurCode[\s\S]*?\n}/.exec(src)?.[0];
       // holderPidOn asks lsof about the address the proxy BINDS, not a literal
       // 127.0.0.1 — the two disagreed under CACHE_FIX_PROXY_BIND and the probe
