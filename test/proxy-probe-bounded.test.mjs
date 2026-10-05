@@ -85,6 +85,8 @@ describe("probe bounding", () => {
 
     const child = spawn(process.execPath, [launcherPath, "run-service"],
                         { env, stdio: ["ignore", "pipe", "pipe"] });
+    let err = "";
+    child.stderr.on("data", (d) => { err += d; });
 
     // Generous: the probe bound is 1s and there are a handful of call sites, so
     // a bounded run finishes in seconds. An UNBOUNDED one never finishes at all,
@@ -100,9 +102,16 @@ describe("probe bounding", () => {
       assert.fail(`the launcher was still running after ${DEADLINE}ms with a hanging ${hang} — ` +
                   "the probe is unbounded, and on a sick machine it would block here for ever");
     }
-    // WHAT it decided is not this test's business — only that it decided. A
-    // probe it cannot answer must become "cannot tell", never "wait for ever".
-    assert.ok(true);
+    // A probe it cannot answer must become "cannot tell", never "wait for ever".
+    // WHAT it decided matters in one row: listeners are there and `ps` could name
+    // none of them, so the run exits 0 having started nothing and signalled nobody
+    // (a healthy holder of ours under fork pressure must not fail a start). That
+    // exit 0 reads as "already running your code", so it has to SAY it was not.
+    if (hang === "ps") {
+      assert.equal(settled.code, 0, `an unreadable holder must leave the run at exit 0. stderr: ${err.slice(-400)}`);
+      assert.match(err, new RegExp(`${port}: could not read the command line of any process holding it.*NOT taken effect`),
+        "the run exited 0 in silence, so a deploy that did not take reads as one that did");
+    }
   });
   }
 });

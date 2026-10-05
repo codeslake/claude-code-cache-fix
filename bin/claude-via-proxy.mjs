@@ -535,16 +535,20 @@ function holderVerdict(port, pid) {
   return same !== false ? "holder" : pid;
 }
 
-// One of our listeners in `ps`: a script under bin/ or proxy/ (test/proc-helpers.mjs
-// OURS, whose shape took two tries), or the npm shim, whose argv has no .mjs.
-const OUR_CMD = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b|\/cache-fix-proxy(?:\s|$)/;
+// One of our listeners in `ps`, by the NAME of an entry point we launch (proxy,
+// launcher, standby relay) or the npm shim. Not any .mjs under a bin/ or proxy/
+// (another package's script would be signalled), and not requiring a `/` before
+// `proxy` (`node proxy/server.mjs`, README.md). test/proc-helpers.mjs OURS is a
+// different rule for a different job: what a test's sweep may kill.
+const OUR_CMD = /(?:^|[\s/])(?:proxy\/server\.mjs|bin\/(?:claude-via-proxy|gap-relay)\.mjs|cache-fix-proxy)(?:\s|$)/;
 
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
 // when it is something of ours we may ask to stop, "stranger" when listeners
 // are there and none is ours (a FAILURE: it is never signalled, and null would
 // exit 0), or null when we cannot tell — and NULL MEANS LEAVE IT ALONE.
 // Signalling a pid we did not identify is how a deploy comes to kill an
-// unrelated service that happened to be on the port.
+// unrelated service that happened to be on the port. SILENT, because it is
+// polled; the launcher says what it decided once, where it settles.
 function holderPidOn(port) {
   let out = "";
   try {
@@ -588,12 +592,7 @@ function holderPidOn(port) {
   // OURS BY COMMAND LINE, before anything below can name a pid to signal. An
   // unreadable one (`ps` timed out, the pid went away) is "cannot tell".
   const mine = pids.filter((p) => OUR_CMD.test(psOf(p)));
-  if (!mine.length) {
-    const other = pids.find((p) => psOf(p) !== "");
-    if (other === undefined) return null;
-    warn(`[cache-fix] ${port} is held by pid ${other}, which is not identified as one of ours; leaving it alone\n`);
-    return "stranger";
-  }
+  if (!mine.length) return pids.some((p) => psOf(p) !== "") ? "stranger" : null;
   for (const p of mine) {
     if (/\brun-service\b/.test(psOf(p))) return holderVerdict(port, p);
   }
@@ -1683,9 +1682,8 @@ function holdPort(rest) {
     // 0 rather than churning it.
     const takeOver = () => {
       const incumbent = holderPidOn(port);
-      if (incumbent === "stranger") return settle(1); // not ours: it said so; never a signal
       if (incumbent === "holder") return settle(0);   // ours already; nothing to do
-      if (!incumbent) return settle(0);               // cannot identify it: leave it alone
+      if (incumbent === "stranger" || !incumbent) return leaveAlone(incumbent);
       // ASK A HOLDER TO HAND THE PORT ON RATHER THAN DROP IT.
       //
       // A holder can spawn our replacement itself and pass it this very socket,
@@ -1717,13 +1715,25 @@ function holdPort(rest) {
       release();
     };
 
+    // The two answers that end the run WITHOUT a signal, said once here rather than
+    // in the polled holderPidOn(). A stranger fails (1). An unreadable incumbent
+    // exits 0 so a healthy holder of ours under fork pressure does not fail a
+    // start, and says so, since that 0 otherwise reads as "already running it".
+    const leaveAlone = (verdict) => {
+      warn(verdict === "stranger"
+        ? `[cache-fix] ${port} is held by a process that is not one of ours; leaving it alone\n`
+        : `[cache-fix] ${port}: could not read the command line of any process holding it; nothing was ` +
+          `signalled or started. If this was a deploy, it has NOT taken effect.\n`);
+      return settle(verdict === "stranger" ? 1 : 0);
+    };
+
     // The older route: ask the incumbent to let go, then bind what it drops.
     // Whatever arrives here cannot hand a socket on, so the port is unowned for
     // as long as our child takes to boot.
     const release = () => {
       const incumbent = holderPidOn(port);
-      if (incumbent === "stranger") return settle(1);
-      if (incumbent === "holder" || !incumbent) return settle(0);
+      if (incumbent === "holder") return settle(0);
+      if (incumbent === "stranger" || !incumbent) return leaveAlone(incumbent);
       try { process.kill(incumbent, "SIGHUP"); } catch { return settle(0); }
       // Retry the bind until it lands. The incumbent drains first, so this is
       // not a fixed wait — a busy proxy takes longer and we simply keep asking.
