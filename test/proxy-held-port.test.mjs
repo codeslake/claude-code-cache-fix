@@ -443,26 +443,19 @@ it("cuts nothing on the held port while the proxy restarts", async () => {
 // by whichever process wins, so a serial probe reads 100% healthy against a
 // holder losing a fifth of everything. Measured before the fix, 200 concurrent
 // requests: hung=36 acceptedByHolder=36, exactly 1:1.
-it("serves every concurrent request while nothing restarts", async (t) => {
+it("serves every concurrent request while nothing restarts", async () => {
   await withHeldPort(async ({ port }) => {
-    // ONE overall deadline, not a cut at 3 s: a starved proxy child still accepts
-    // every connection and answers late (stopped 5 s: 200 of 200 answered at 5.1 s).
-    // This catches a holder that NEVER answers; `late` shows a slow box, not red.
-    const t0 = Date.now();
-    let late = 0;
     const one = () => new Promise((res) => {
       const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (q) => {
         let b = ""; q.on("data", (d) => (b += d));
-        q.on("end", () => {
-          if (q.statusCode === 200 && Date.now() - t0 > 3_000) late++;
-          res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode} ${b.slice(0, 160)}`);
-        });
+        q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode} ${b.slice(0, 160)}`));
       });
-      r.setTimeout(20_000, () => { r.destroy(); res("HUNG"); });
+      // Well under the 8s a hung accept would cost, and far above a served
+      // request on loopback: the failure this catches is unbounded, not slow.
+      r.setTimeout(3_000, () => { r.destroy(); res("HUNG"); });
       r.on("error", (e) => res(e.code || "ERR"));
     });
     const out = await Promise.all(Array.from({ length: 200 }, one));
-    t.diagnostic(`${late} of 200 requests were answered after 3s`);
     const bad = out.filter((r) => r !== "ok");
     assert.equal(bad.length, 0,
       `${bad.length} of 200 concurrent requests were not served: ` +
@@ -1424,9 +1417,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
 
         assert.ok(served > 0, `no request succeeded at all — the probe measured nothing; ${ctx()}`);
 
-        // A CROSS-TREE TAKEOVER CANNOT BE FREE IN NODE, so this bounds the outage
-        // rather than forbidding it. The bound is the ceiling above, not a fixed 4 s
-        // that read a loaded boot as stranded: a stranded address never answers.
+        // A CROSS-TREE TAKEOVER CANNOT BE FREE IN NODE, so this bounds the
+        // outage rather than forbidding it. The bound is the ceiling above, not
+        // a duration: the new child's boot has no deadline of its own and a fixed
+        // 4 s read a loaded boot as a stranded address. A stranded address never
+        // answers, so the ceiling still catches "a blip became an outage".
         //
         // Why zero is unreachable here. The socket survives its listener's
         // death (measured: parent binds, child listens, child SIGKILLed, port
