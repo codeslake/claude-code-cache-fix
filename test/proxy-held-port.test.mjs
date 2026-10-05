@@ -1371,13 +1371,13 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         let body = await get();
         while (body.startsWith("ERR:") && Date.now() < up) body = await get();
         assert.equal(JSON.parse(body).status, "ok", "nothing served the port");
-        const bootMs = Date.now() - bootAt;   // this box's own node boot, at this load, seconds before the takeover
 
         // TRAFFIC ACROSS THE TAKEOVER, started before the taker exists — the
         // whole window is between the incumbent letting go and the new child
         // listening, so a probe that begins afterwards measures nothing.
         // agent:false, a fresh connection each time: what is under test is
         // whether the ADDRESS ever refuses, and a pooled socket would not ask.
+        const bootMs = Date.now() - bootAt;   // this box's own node boot, at this load, seconds before the takeover
         let stop = false, served = 0;
         const refused = [];
         const once = () => new Promise((res) => {
