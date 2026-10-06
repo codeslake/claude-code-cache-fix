@@ -15,7 +15,7 @@ import { join, dirname } from "node:path";
 import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
-import { OURS, armLineage, cmdOf, freePort as takePort, listeners, onPort, reapStamped } from "./proc-helpers.mjs";
+import { DEAD_HOP, OURS, armLineage, cmdOf, freePort as takePort, listeners, onPort, reapStamped } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
@@ -1005,18 +1005,12 @@ describe("/health hop reporting", () => {
   it("says whether the published hop was MEASURED or merely configured", async () => {
     const saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
     const caDir = join(tmpdir(), `ccf-health-hop-${process.pid}`);
-    // A hop address with nothing behind it, so the chain is guaranteed to fail.
-    const probe = net.createServer();
-    await new Promise((r) => probe.listen(0, "127.0.0.1", r));
-    const deadPort = probe.address().port;
-    await new Promise((r) => probe.close(r));
-
     let handle;
     try {
       for (const k of ENV) delete process.env[k];
       process.env.CACHE_FIX_FORWARD_PROXY = "on";
       process.env.CACHE_FIX_CA_DIR = caDir;
-      process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${deadPort}`;
+      process.env.CACHE_FIX_FALLBACK_PROXIES = DEAD_HOP;   // nothing behind it, so the chain is guaranteed to fail
       // THE GRACE IS PAID, and the comment that used to sit here said it was not.
       // CHAIN_GRACE_MS is a module-level const captured at import, so setting the
       // env after upstream.mjs is already loaded changes nothing — measured, this
@@ -1031,7 +1025,7 @@ describe("/health hop reporting", () => {
       // Nothing dialled yet: the candidate is all that is known, and it must be
       // flagged as such rather than read as a confirmed hop.
       const fresh = await health(handle.port);
-      assert.equal(fresh.https_proxy, `http://127.0.0.1:${deadPort}`,
+      assert.equal(fresh.https_proxy, DEAD_HOP,
         "a fresh proxy published no candidate at all — the pin loses its hop entirely");
       assert.equal(fresh.https_proxy_measured, false,
         "a candidate nothing has dialled was published as a measured hop");

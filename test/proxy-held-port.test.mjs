@@ -15,7 +15,7 @@ import { join, dirname } from "node:path";
 import { onPorts } from "./proc-helpers.mjs";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, hit, listeners, onPort, reapStamped, stamped, verdict, waitForHolder } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, hit, listeners, onPort, reapStamped, stamped, triesWithin, verdict, waitForHolder } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -285,7 +285,7 @@ it("holds the same default port the proxy would bind, and only when unset", () =
 // held-port tests need all three; `get` answers "ERR:<code> <body>" rather than
 // throwing so a caller can count failures instead of catching them — and the
 // body is what names which of /health's two 503 authors replied.
-async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
+async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}, tries = 3) {
   const port = await freePort();          // a real number: the holder owns the ADVERTISED port
   // Self-heal OFF by default. A proxy whose holder was SIGKILLed spawns a
   // REPLACEMENT holder about a second later, and nothing in a test tracks that
@@ -309,6 +309,13 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
                        CACHE_FIX_EXIT_WITH_PARENT: "1", ...extraEnv });
   const launcher = spawn(process.execPath, [launcherPath, subcommand], { env, stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise((r) => launcher.on("exit", () => r(true)));
+  const closed = new Promise((r) => launcher.on("close", r));
+  // WHAT THE LAUNCHER SAID, so a start that fails can name it: the fixture used
+  // to read neither pipe, and a readiness failure then said "ERR:ECONNREFUSED"
+  // for a launcher that had printed exactly why it stopped.
+  let said = "", warned = "";
+  launcher.stdout.on("data", (d) => (said = (said + d).slice(-2_000)));
+  launcher.stderr.on("data", (d) => (warned = (warned + d).slice(-2_000)));
   // 200 OR IT IS NOT THE PROXY. The gap relay answers /health too, with a 503
   // and a JSON body of its own, so a readiness loop that took any body finished
   // against the relay that covers a cold start — measured, six cases in this
@@ -329,11 +336,14 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // never settled and the file hung with no child and no handle left (measured:
   // inspector on the idle runner, one test started and never ended).
   const get = () => new Promise((res) => {
-    http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 }, (r) => {
+    const q = http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 }, (r) => {
       let b = ""; r.on("data", (d) => (b += d));
       r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
       r.on("close", () => res("ERR:ECONNRESET"));
-    }).on("error", (e) => res(`ERR:${e.code}`));
+    });
+    q.on("error", (e) => res(`ERR:${e.code}`));
+    // A listener that never answers must RESOLVE this, not hang it.
+    q.on("timeout", () => { q.destroy(); res("ERR:ETIMEDOUT"); });
   });
   // pgrep, never a pid arithmetic shortcut: `process.kill(0, ...)` signals the
   // caller's whole process group — the test runner included — and Number("")
@@ -352,16 +362,32 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
     assert.ok(pid, "no proxy child to kill, so nothing was restarted");
     process.kill(pid, "SIGKILL");
   };
+  // UP IS AN EVENT, NOT A 20 s WAIT. The launcher says "proxy listening on" and
+  // /health then answers 200; a launcher that EXITS first is never going to, so
+  // that fails at once with what it printed. Only a launcher that stays up and
+  // silent runs into the outer bound, and its message carries the last body.
+  // CI run 37414320731 (node 18): a bare "Unexpected token E in JSON" after
+  // 20 s, the ERR body thrown away by JSON.parse and the launcher's stderr unread.
+  let busy = false;
   try {
-    let lastBody;
-    const readyProbe = async () => {
-      lastBody = await get();
-      return readyBody(lastBody) ? "ok" : "ERR:notready";
-    };
-    const body = await waitForHolder(port, { ceilingMs: 20_000, probe: readyProbe });
-    assert.equal(body, "ok", `the held port never came up; ` +
-                             `last body was ${JSON.stringify(String(lastBody).slice(0, 160))}`);
-    await fn({ get, killProxy, proxyPid, launcher, exited, port });
+    const by = Date.now() + 60_000;
+    for (;;) {
+      const r = await Promise.race([get(), exited.then(() => null)]);
+      if (r === null) {
+        await Promise.race([closed, new Promise((q) => setTimeout(q, 500))]);   // 'exit' can beat the last stderr chunk
+        // A neighbour took the number freePort() let go: take another.
+        busy = tries > 1 && /EADDRINUSE/.test(warned);
+        assert.ok(busy, `the launcher exited before the held port came up. stdout: ${said} stderr: ${warned}`);
+        break;
+      }
+      if (!r.startsWith("ERR:") && /proxy listening on/.test(said)) {
+        assert.ok(readyBody(r), `a 200 that is not the proxy's: ${r}`);
+        break;
+      }
+      assert.ok(Date.now() < by, `the held port never came up and the launcher is still running; last probe: ${r}. stdout: ${said} stderr: ${warned}`);
+      await new Promise((q) => setTimeout(q, 50));
+    }
+    if (!busy) await fn({ get, killProxy, proxyPid, launcher, exited, port });
   } finally {
     // SIGTERM first: SIGKILL cannot be forwarded, so the proxy would outlive
     // its parent and keep this file's event loop alive on its pipes.
@@ -401,6 +427,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
       await new Promise((r) => setTimeout(r, 300));
     }
   }
+  if (busy) return withHeldPort(fn, { subcommand, extraEnv }, tries - 1);
 }
 
 // The launcher holds the advertised port and relays, so a proxy that dies
@@ -854,7 +881,7 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
   await rm(flag, { force: true });
   await withFakeProxy(
     `import fs from "node:fs"; import net from "node:net";\n` +
-    `if (fs.existsSync(${JSON.stringify(flag)})) { process.stderr.write("cannot start\\n"); process.exit(1); }\n` +
+    `if (fs.existsSync(${JSON.stringify(flag)})) { process.stderr.write("cannot start " + Date.now() + "\\n"); process.exit(1); }\n` +
     `fs.writeFileSync(${JSON.stringify(flag)}, "1");\n` +
     `const s = net.createServer((c) => c.end("HTTP/1.1 200 OK\\r\\ncontent-length:2\\r\\n\\r\\nok"));\n` +
     `s.listen(0, "127.0.0.1", () => process.stdout.write("proxy listening on 127.0.0.1:" + s.address().port + "\\n"));\n`,
@@ -872,6 +899,7 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
       const kid = Number(out.trim().split("\n").filter(Boolean)
         .find((q) => /scratch-fake-server-/.test(cmdOf(q))));
       assert.ok(Number.isInteger(kid) && kid > 1, "the fake proxy never started, so this measures nothing");
+      const killedAt = Date.now();
       process.kill(kid, "SIGKILL");
       // Long enough for an UNBACKED-OFF loop to blow the ceiling: at the 25ms
       // base the ladder tops out at 500ms, so ~1.2s admits at most a handful of
@@ -893,8 +921,11 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
         held = await bound();
       }
       assert.equal(held, true, "the port was released while sessions were still wired to it");
-      // Backed off: an unbounded loop reaches ~40 in this window.
-      const tries = (stderr().match(/cannot start/g) || []).length;
+      // Backed off: an unbounded loop reaches ~40 in this window. Counted by the
+      // stand-in's own stamps, not by when this runner reads its stderr: a read
+      // after a neighbour's lsof stall saw 0 tries (nothing drained yet) or 15
+      // (everything since the kill).
+      const tries = await triesWithin(stderr, killedAt, 1_200);
       assert.ok(tries <= 10, `respawned ${tries} times in 1.2s — the backoff is not applied`);
     });
   await rm(flag, { force: true });
