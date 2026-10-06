@@ -146,6 +146,23 @@ export const upstreamFixture = (mark, trace) => http.createServer((q, r) => {
   r.writeHead(418); r.end("teapot");
 });
 
+// Polls find() every 50 ms until it answers non-null; throws `timedOut` one whole
+// sleep after the budget. The deadline is read BEFORE each sleep: a sleep a runner
+// stall outlasts ends in the timers phase, ahead of the poll phase that delivers
+// what the stall left in the pipe, so reading it after would throw on a stamp
+// already there.
+export async function pollFor(find, budgetMs, timedOut) {
+  const by = Date.now() + budgetMs;
+  let expired = false;
+  for (;;) {
+    const hit = find();
+    if (hit != null) return hit;
+    if (expired) throw new Error(timedOut);
+    expired = Date.now() > by;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 // How many "cannot start <ms>" stamps a stand-in logged before `from + windowMs`,
 // by ITS clock. A count taken off the stream when the runner gets to it says how
 // much the runner had drained, and a runner stalled by a neighbour's synchronous
@@ -153,12 +170,10 @@ export const upstreamFixture = (mark, trace) => http.createServer((q, r) => {
 // (everything before it has been delivered) and count only inside it. A stamp
 // counts once its newline has arrived: a chunk boundary can cut one short, and
 // a cut-off number reads as a smaller one.
-export async function triesWithin(stderr, from, windowMs) {
-  const end = from + windowMs, by = Date.now() + 8_000;
-  for (;;) {
+export function triesWithin(stderr, from, windowMs, budgetMs = 8_000) {
+  const end = from + windowMs;
+  return pollFor(() => {
     const stamps = [...stderr().matchAll(/cannot start (\d+)\n/g)].map((m) => Number(m[1]));
-    if (stamps.some((t) => t >= end)) return stamps.filter((t) => t < end).length;
-    if (Date.now() > by) throw new Error(`no try was logged after the ${windowMs}ms window within 8s: the stand-in stopped respawning`);
-    await new Promise((r) => setTimeout(r, 50));
-  }
+    return stamps.some((t) => t >= end) ? stamps.filter((t) => t < end).length : null;
+  }, budgetMs, `no try was logged after the ${windowMs}ms window within ${budgetMs}ms: the stand-in stopped respawning`);
 }

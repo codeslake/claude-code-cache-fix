@@ -1,7 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { triesWithin } from "./proc-helpers.mjs";
+import { pollFor, triesWithin } from "./proc-helpers.mjs";
 
 // proxy-held-port's "keeps the port and backs off" counts the tries a launcher
 // made in 1.2 s. It read them off its own stderr after a fixed sleep, so the
@@ -27,15 +27,15 @@ async function triesAfterStall(delays) {
   try {
     let err = "";
     child.stderr.on("data", (d) => (err += d));
-    let first;   // the stand-in is up once a whole stamp has arrived
-    const by = Date.now() + 5_000;
-    while (!(first = /cannot start (\d+)\n/.exec(err))) {
-      assert.ok(Date.now() < by, "no stamp from the stand-in within 5s: it never started");
-      await new Promise((r) => setTimeout(r, 5));
-    }
+    // the stand-in is up once a whole stamp has arrived
+    const first = await pollFor(() => /cannot start (\d+)\n/.exec(err), 5_000, "no stamp from the stand-in within 5s: it never started");
     const from = Number(first[1]);   // its own clock, so a runner slow to notice moves nothing
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);   // the runner is blocked for 1 s
-    return await triesWithin(() => err, from, W);
+    // The runner is blocked for 1 s INSIDE the wait (a check-phase callback, as a
+    // neighbour's lsof blocks it), which has a 100 ms deadline: the stamps are in
+    // the pipe and the next phase is the wait's timer, before any read.
+    const tries = triesWithin(() => err, from, W, 100);
+    setImmediate(() => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000));
+    return await tries;
   } finally {
     child.kill("SIGKILL");
   }
@@ -50,7 +50,7 @@ it("judges a backoff by the stand-in's clock, so a late read cannot redden a cor
 });
 
 it("fails, rather than hangs, when the stand-in never logs a stamp", async () => {
-  await assert.rejects(triesAfterStall([]), /no stamp/);   // a stand-in with nothing to log
+  await assert.rejects(pollFor(() => null, 200, "no stamp"), /no stamp/);   // a 200 ms budget, not the 5 s one
 });
 
 it("does not count a stamp cut off at a chunk boundary as a smaller number", async () => {
