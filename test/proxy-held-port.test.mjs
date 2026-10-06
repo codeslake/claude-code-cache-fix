@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, triesWithin } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -562,7 +562,7 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
   await rm(flag, { force: true });
   await withFakeProxy(
     `import fs from "node:fs"; import net from "node:net";\n` +
-    `if (fs.existsSync(${JSON.stringify(flag)})) { process.stderr.write("cannot start\\n"); process.exit(1); }\n` +
+    `if (fs.existsSync(${JSON.stringify(flag)})) { process.stderr.write("cannot start " + Date.now() + "\\n"); process.exit(1); }\n` +
     `fs.writeFileSync(${JSON.stringify(flag)}, "1");\n` +
     `const s = net.createServer((c) => c.end("HTTP/1.1 200 OK\\r\\ncontent-length:2\\r\\n\\r\\nok"));\n` +
     `s.listen(0, "127.0.0.1", () => process.stdout.write("proxy listening on 127.0.0.1:" + s.address().port + "\\n"));\n`,
@@ -580,6 +580,7 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
       const kid = Number(out.trim().split("\n").filter(Boolean)
         .find((q) => /scratch-fake-server-/.test(cmdOf(q))));
       assert.ok(Number.isInteger(kid) && kid > 1, "the fake proxy never started, so this measures nothing");
+      const killedAt = Date.now();
       process.kill(kid, "SIGKILL");
       // Long enough for an UNBACKED-OFF loop to blow the ceiling: at the 25ms
       // base the ladder tops out at 500ms, so ~1.2s admits at most a handful of
@@ -601,8 +602,12 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
         held = await bound();
       }
       assert.equal(held, true, "the port was released while sessions were still wired to it");
-      // Backed off: an unbounded loop reaches ~40 in this window.
-      const tries = (stderr().match(/cannot start/g) || []).length;
+      // Backed off: an unbounded loop reaches ~40 in this window. COUNTED BY THE
+      // STAND-IN'S STAMPS, not by when this runner reads its stderr: neighbours'
+      // synchronous lsof calls stall the runner for seconds, and a read after the
+      // stall saw 0 tries (nothing drained yet) or 15 (everything since the
+      // kill). A stamp past the window proves the launcher kept retrying.
+      const tries = await triesWithin(stderr, killedAt, 1_200);
       assert.ok(tries <= 10, `respawned ${tries} times in 1.2s — the backoff is not applied`);
     });
   await rm(flag, { force: true });

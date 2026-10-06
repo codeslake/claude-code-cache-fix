@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { startProxy } from "../proxy/server.mjs";
+import { DEAD_HOP, upstreamFixture } from "./proc-helpers.mjs";
 
 const ENV_KEYS = [
   "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_PROXY_UPSTREAM",
@@ -351,28 +352,14 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
   // integrated.conf line 20 already warns that an unproxied test here "hangs on
   // this network until it times out". 418 is a status nothing else in this
   // chain produces, so reaching it cannot be confused with a refusal.
-  const upstream = http.createServer((_q, r) => { r.writeHead(418); r.end("teapot"); });
-  upstream.on("connection", () => trace.push("UPSTREAM"));
+  //
+  // IT RECORDS ONLY A REQUEST CARRYING `mark`, not every accepted connection: a
+  // stranger connecting to its ephemeral port is not the proxy dialling out
+  // (measured: ten foreign connects read as ten "UPSTREAM" and failed the
+  // relayed-path assertion below, though the proxy refused before dialling).
+  const mark = "require-hop-relay";
+  const upstream = upstreamFixture(mark, trace);
   await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
-  // A hop address with nothing behind it: the whole chain refuses.
-  // A PORT NOTHING CAN TAKE, not one we happened to let go of. Binding an
-  // ephemeral port and closing it leaves a number the kernel is free to hand to
-  // the next asker, and this file's own fixtures ask for ephemeral ports
-  // constantly — the suite allocates ~55 of them per run before counting the
-  // proxies and standbys each one spawns. A neighbour that lands on this exact
-  // number turns "the whole chain refuses" into "the chain has a live hop", and
-  // the case then measures something it never meant to.
-  //
-  // Not a theoretical worry: measured here by binding it deliberately, the case
-  // stopped failing cleanly and HUNG instead — `--test-timeout=0` means nothing
-  // ends it — where unoccupied it finishes in about four seconds.
-  //
-  // Port 1 cannot be taken by anything in this suite: binding below 1024 needs
-  // privilege and the runner is unprivileged (uid 1910859 here, and GitHub's
-  // runners do not run tests as root either). Connecting to it refuses in ~2ms,
-  // which is what a dead hop is supposed to do — so this is strictly more
-  // faithful than the port we used to free and hope stayed free.
-  const deadPort = 1;
 
   let handle;
   const connect = (port, target) => new Promise((resolve) => {
@@ -388,7 +375,7 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
   try {
     process.env.CACHE_FIX_FORWARD_PROXY = "on";
     process.env.CACHE_FIX_CA_DIR = caDir;
-    process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${deadPort}`;
+    process.env.CACHE_FIX_FALLBACK_PROXIES = DEAD_HOP;   // nothing behind it: the whole chain refuses
     // THE GRACE IS PAID, and the comment that used to sit here said it was not.
     // CHAIN_GRACE_MS is a module-level const captured at import, so setting the
     // env after upstream.mjs is already loaded changes nothing — measured, this
@@ -458,7 +445,7 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
     handle = await startProxy({ port: 0, watch: false });
     const relayed = await new Promise((resolve) => {
       const r = http.request({ host: "127.0.0.1", port: handle.port, method: "POST",
-                               path: "/v1/messages", headers: { "content-type": "application/json" } },
+                               path: `/v1/messages?${mark}`, headers: { "content-type": "application/json" } },
         (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
       r.on("error", (e) => resolve(`ERR:${e.code}`));
       r.setTimeout(4_000, () => { r.destroy(); resolve("TIMEOUT"); });

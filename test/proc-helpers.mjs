@@ -11,6 +11,7 @@
 
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
+import http from "node:http";
 import net from "node:net";
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
@@ -124,3 +125,37 @@ export const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
 // file's readiness assertion times out on the CPU and ports they hold. See
 // ours() for the mechanism and the two markers it reads.
 export const onPort = (port) => [...new Set([...listeners(port), ...ours(port)])];
+
+// A HOP THAT STAYS DEAD. A freePort() number is only free until the next asker,
+// and a neighbouring file asks constantly, so a case that walks a chain for 2.5 s
+// can find a listener on the address it meant as unreachable. Port 1 is not a
+// number a neighbour can ask for: every allocator (bind to 0) draws from the
+// ephemeral range, which starts at 32768 on Linux and 49152 on macOS and
+// Windows, and nothing in this suite binds a fixed low port. Nothing listens
+// there either, so a probe is refused at once (5 ms measured), as a closed
+// ephemeral port was.
+export const DEAD_HOP = "http://127.0.0.1:1";
+
+// A local upstream (418, "teapot") that records into `trace` only a request whose
+// URL carries `mark`. Counting every accepted connection read a stranger's
+// connect to its ephemeral port as the proxy's dial; only the case's own
+// request carries the marker.
+export const upstreamFixture = (mark, trace) => http.createServer((q, r) => {
+  if (q.url?.includes(mark)) trace.push("UPSTREAM");
+  r.writeHead(418); r.end("teapot");
+});
+
+// How many "cannot start <ms>" stamps a stand-in logged before `from + windowMs`,
+// by ITS clock. A count taken off the stream when the runner gets to it says how
+// much the runner had drained, and a runner stalled by a neighbour's synchronous
+// lsof drains late or not at all. So wait until a stamp past the window exists
+// (everything before it has been delivered) and count only inside it.
+export async function triesWithin(stderr, from, windowMs) {
+  const end = from + windowMs, by = Date.now() + 8_000;
+  const stamps = () => [...stderr().matchAll(/cannot start (\d+)/g)].map((m) => Number(m[1]));
+  while (!stamps().some((t) => t >= end)) {
+    if (Date.now() > by) throw new Error(`no try was logged after the ${windowMs}ms window within 8s: the stand-in stopped respawning`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return stamps().filter((t) => t < end).length;
+}
