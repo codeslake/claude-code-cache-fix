@@ -155,7 +155,7 @@ it("holds the same default port the proxy would bind, and only when unset", () =
 // held-port tests need all three; `get` answers "ERR:<code> <body>" rather than
 // throwing so a caller can count failures instead of catching them — and the
 // body is what names which of /health's two 503 authors replied.
-async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
+async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}, tries = 3) {
   const port = await freePort();          // a real number: the holder owns the ADVERTISED port
   // Self-heal OFF by default. A proxy whose holder was SIGKILLed spawns a
   // REPLACEMENT holder about a second later, and nothing in a test tracks that
@@ -179,6 +179,13 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
                        CACHE_FIX_EXIT_WITH_PARENT: "1", ...extraEnv });
   const launcher = spawn(process.execPath, [launcherPath, subcommand], { env, stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise((r) => launcher.on("exit", () => r(true)));
+  const closed = new Promise((r) => launcher.on("close", r));
+  // WHAT THE LAUNCHER SAID, so a start that fails can name it: the fixture used
+  // to read neither pipe, and a readiness failure then said "ERR:ECONNREFUSED"
+  // for a launcher that had printed exactly why it stopped.
+  let said = "", warned = "";
+  launcher.stdout.on("data", (d) => (said = (said + d).slice(-2_000)));
+  launcher.stderr.on("data", (d) => (warned = (warned + d).slice(-2_000)));
   // 200 OR IT IS NOT THE PROXY. The gap relay answers /health too, with a 503
   // and a JSON body of its own, so a readiness loop that took any body finished
   // against the relay that covers a cold start — measured, six cases in this
@@ -192,10 +199,13 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // ERR:503" named neither, and the case reproduces on no local run — 9 of 9
   // green, 8 of them under saturating load.
   const get = () => new Promise((res) => {
-    http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
+    const q = http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
       let b = ""; r.on("data", (d) => (b += d));
       r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
-    }).on("error", (e) => res(`ERR:${e.code}`));
+    });
+    q.on("error", (e) => res(`ERR:${e.code}`));
+    // A listener that never answers must RESOLVE this, not hang it.
+    q.on("timeout", () => { q.destroy(); res("ERR:ETIMEDOUT"); });
   });
   // pgrep, never a pid arithmetic shortcut: `process.kill(0, ...)` signals the
   // caller's whole process group — the test runner included — and Number("")
@@ -214,12 +224,32 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
     assert.ok(pid, "no proxy child to kill, so nothing was restarted");
     process.kill(pid, "SIGKILL");
   };
+  // UP IS AN EVENT, NOT A 20 s WAIT. The launcher says "proxy listening on" and
+  // /health then answers 200; a launcher that EXITS first is never going to, so
+  // that fails at once with what it printed. Only a launcher that stays up and
+  // silent runs into the outer bound, and its message carries the last body.
+  // CI run 37414320731 (node 18): a bare "Unexpected token E in JSON" after
+  // 20 s, the ERR body thrown away by JSON.parse and the launcher's stderr unread.
+  let busy = false;
   try {
-    const up = Date.now() + 20_000;
-    let body = await get();
-    while (body.startsWith("ERR:") && Date.now() < up) body = await get();
-    assert.equal(JSON.parse(body).status, "ok", "the held port never came up");
-    await fn({ get, killProxy, proxyPid, launcher, exited, port });
+    const by = Date.now() + 60_000;
+    for (;;) {
+      const r = await Promise.race([get(), exited.then(() => null)]);
+      if (r === null) {
+        await Promise.race([closed, new Promise((q) => setTimeout(q, 500))]);   // 'exit' can beat the last stderr chunk
+        // A neighbour took the number freePort() let go: take another.
+        busy = tries > 1 && /EADDRINUSE/.test(warned);
+        assert.ok(busy, `the launcher exited before the held port came up. stdout: ${said} stderr: ${warned}`);
+        break;
+      }
+      if (!r.startsWith("ERR:") && /proxy listening on/.test(said)) {
+        assert.match(r, /"status":\s*"ok"/, `a 200 that is not the proxy's: ${r}`);
+        break;
+      }
+      assert.ok(Date.now() < by, `the held port never came up and the launcher is still running; last probe: ${r}. stdout: ${said} stderr: ${warned}`);
+      await new Promise((q) => setTimeout(q, 50));
+    }
+    if (!busy) await fn({ get, killProxy, proxyPid, launcher, exited, port });
   } finally {
     // SIGTERM first: SIGKILL cannot be forwarded, so the proxy would outlive
     // its parent and keep this file's event loop alive on its pipes.
@@ -259,6 +289,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
       await new Promise((r) => setTimeout(r, 300));
     }
   }
+  if (busy) return withHeldPort(fn, { subcommand, extraEnv }, tries - 1);
 }
 
 // The launcher holds the advertised port and relays, so a proxy that dies
