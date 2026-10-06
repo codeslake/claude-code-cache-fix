@@ -150,11 +150,13 @@ export const upstreamFixture = (mark, trace) => http.createServer((q, r) => {
 // by ITS clock. A count taken off the stream when the runner gets to it says how
 // much the runner had drained, and a runner stalled by a neighbour's synchronous
 // lsof drains late or not at all. So wait until a stamp past the window exists
-// (everything before it has been delivered) and count only inside it.
+// (everything before it has been delivered) and count only inside it. A stamp
+// counts once its newline has arrived: a chunk boundary can cut one short, and
+// a cut-off number reads as a smaller one.
 export async function triesWithin(stderr, from, windowMs) {
   const end = from + windowMs, by = Date.now() + 8_000;
   for (;;) {
-    const stamps = [...stderr().matchAll(/cannot start (\d+)/g)].map((m) => Number(m[1]));
+    const stamps = [...stderr().matchAll(/cannot start (\d+)\n/g)].map((m) => Number(m[1]));
     if (stamps.some((t) => t >= end)) return stamps.filter((t) => t < end).length;
     if (Date.now() > by) throw new Error(`no try was logged after the ${windowMs}ms window within 8s: the stand-in stopped respawning`);
     await new Promise((r) => setTimeout(r, 50));

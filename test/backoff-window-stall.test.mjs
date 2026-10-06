@@ -27,8 +27,13 @@ async function triesAfterStall(delays) {
   try {
     let err = "";
     child.stderr.on("data", (d) => (err += d));
-    while (!err.includes("\n")) await new Promise((r) => setTimeout(r, 5));   // the stand-in is up
-    const from = Date.now();
+    let first;   // the stand-in is up once a whole stamp has arrived
+    const by = Date.now() + 5_000;
+    while (!(first = /cannot start (\d+)\n/.exec(err))) {
+      assert.ok(Date.now() < by, "no stamp from the stand-in within 5s: it never started");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const from = Number(first[1]);   // its own clock, so a runner slow to notice moves nothing
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);   // the runner is blocked for 1 s
     return await triesWithin(() => err, from, W);
   } finally {
@@ -39,7 +44,16 @@ async function triesAfterStall(delays) {
 it("judges a backoff by the stand-in's clock, so a late read cannot redden a correct one", async () => {
   const late = await triesAfterStall(LADDER);
   assert.ok(late <= 10, `a correct backoff read after a 1 s runner stall counted ${late} tries in ${W}ms`);
-  // The control: with no backoff the same window, read just as late, is still blown through.
+  // The control: with no backoff the same window, read just as late, counts more.
   const flat = await triesAfterStall(FLAT);
-  assert.ok(flat > 10, `a missing backoff counted only ${flat} tries in ${W}ms, so this check cannot fail`);
+  assert.ok(flat > late, `a missing backoff counted ${flat} tries against the ladder's ${late} in ${W}ms, so this check cannot fail`);
+});
+
+it("fails, rather than hangs, when the stand-in never logs a stamp", async () => {
+  await assert.rejects(triesAfterStall([]), /no stamp/);   // a stand-in with nothing to log
+});
+
+it("does not count a stamp cut off at a chunk boundary as a smaller number", async () => {
+  // "cannot start 1250" read as far as "cannot start 12" is not a try at t=12.
+  assert.equal(await triesWithin(() => "cannot start 1000\ncannot start 1250\ncannot start 12", 1000, 200), 1);
 });

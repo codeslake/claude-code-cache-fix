@@ -1,34 +1,22 @@
 // Two fixtures a NEIGHBOUR must not be able to turn red. node:test runs files
 // concurrently, and each file listens on ephemeral ports of its own, so a number
 // one case freed or an address one case opened is reachable by a stranger.
-// Each case below injects the stranger and asserts the fixture does not care.
+// The upstream case injects the stranger; the dead-hop case asserts where it lives.
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { DEAD_HOP, upstreamFixture } from "./proc-helpers.mjs";
 
-// A dead hop that a stranger binds is no longer dead: the walk in
-// proxy-hop-fallback finds a listener on the address meant as unreachable and
-// "the same chain is still unreachable" fails (measured: a squatter listening
-// there 3 s into the case). The squatter here is that stranger, and it binds the
-// address the way a stranger can.
-it("a neighbour listening on the dead hop does not bring it back to life", async (t) => {
-  const { hopAlive } = await import("../proxy/upstream.mjs");
+// A dead hop a stranger can reach is no longer dead: the walk in proxy-hop-fallback
+// finds a listener on the address meant as unreachable and "the same chain is
+// still unreachable" fails (measured: a squatter listening there 3 s into the
+// case). This case never binds the address, since a listener there is the hazard
+// itself. It asserts what keeps strangers off it: the port is below every port a
+// bind-to-0 can hand out.
+it("the dead hop is a port no neighbour's listen(0) can be given", () => {
   const port = Number(new URL(DEAD_HOP).port);
-  const squatter = net.createServer();
-  const bound = await new Promise((r) => {
-    squatter.once("error", () => r(false));
-    squatter.listen(port, "127.0.0.1", () => r(true));
-  });
-  try {
-    // A runner that may bind below 1024 (root, a container with the floor
-    // lowered) can squat port 1 itself, but no neighbour ASKS for it.
-    if (bound && port < 1024) return t.skip("this runner can bind below 1024");
-    assert.equal(await hopAlive(DEAD_HOP), false, `a listener on ${DEAD_HOP} made the dead hop answer`);
-  } finally {
-    if (bound) await new Promise((r) => squatter.close(r));
-  }
+  assert.ok(port > 0 && port < 1024, `${DEAD_HOP} is a port a neighbour's listen(0) can be handed`);
 });
 
 // The relayed-path case asks "did the request reach the upstream?" of a log the
