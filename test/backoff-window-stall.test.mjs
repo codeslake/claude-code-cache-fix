@@ -49,7 +49,7 @@ it("judges a backoff by the stand-in's clock, so a late read cannot redden a cor
   assert.ok(flat > late, `a missing backoff counted ${flat} tries against the ladder's ${late} in ${W}ms, so this check cannot fail`);
 });
 
-it("fails, rather than hangs, when the stand-in never logs a stamp", async () => {
+it("a wait fails, rather than hangs, when its stamp never arrives", async () => {
   await assert.rejects(pollFor(() => null, 200, "no stamp"), /no stamp/);   // a 200 ms budget, not the 5 s one
 });
 
