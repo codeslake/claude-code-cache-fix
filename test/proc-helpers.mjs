@@ -133,7 +133,8 @@ export const onPort = (port) => [...new Set([...listeners(port), ...ours(port)])
 // ephemeral range, which starts at 32768 on Linux and 49152 on macOS and
 // Windows, and nothing in this suite binds a fixed low port. Nothing listens
 // there either, so a probe is refused at once (5 ms measured), as a closed
-// ephemeral port was.
+// ephemeral port was. (Measured: a case whose dead hop was bound hung where an
+// unoccupied one finishes in about four seconds.)
 export const DEAD_HOP = "http://127.0.0.1:1";
 
 // A local upstream (418, "teapot") that records into `trace` only a request whose
@@ -152,10 +153,10 @@ export const upstreamFixture = (mark, trace) => http.createServer((q, r) => {
 // (everything before it has been delivered) and count only inside it.
 export async function triesWithin(stderr, from, windowMs) {
   const end = from + windowMs, by = Date.now() + 8_000;
-  const stamps = () => [...stderr().matchAll(/cannot start (\d+)/g)].map((m) => Number(m[1]));
-  while (!stamps().some((t) => t >= end)) {
+  for (;;) {
+    const stamps = [...stderr().matchAll(/cannot start (\d+)/g)].map((m) => Number(m[1]));
+    if (stamps.some((t) => t >= end)) return stamps.filter((t) => t < end).length;
     if (Date.now() > by) throw new Error(`no try was logged after the ${windowMs}ms window within 8s: the stand-in stopped respawning`);
     await new Promise((r) => setTimeout(r, 50));
   }
-  return stamps().filter((t) => t < end).length;
 }

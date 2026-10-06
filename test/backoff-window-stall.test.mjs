@@ -18,7 +18,7 @@ const W = 300;
 const LADDER = [0, 16, 33, 67, 83, 83, 83, 83, 83, 83, 83, 83];   // the product ladder / 6
 const FLAT = Array(400).fill(3);                                   // no backoff at all
 
-async function triesAfter(delays, stallMs) {
+async function triesAfterStall(delays) {
   const child = spawn(process.execPath, ["-e",
     `(async () => { for (const d of ${JSON.stringify(delays)}) {
        await new Promise((r) => setTimeout(r, d));
@@ -29,7 +29,7 @@ async function triesAfter(delays, stallMs) {
     child.stderr.on("data", (d) => (err += d));
     while (!err.includes("\n")) await new Promise((r) => setTimeout(r, 5));   // the stand-in is up
     const from = Date.now();
-    if (stallMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, stallMs);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);   // the runner is blocked for 1 s
     return await triesWithin(() => err, from, W);
   } finally {
     child.kill("SIGKILL");
@@ -37,9 +37,9 @@ async function triesAfter(delays, stallMs) {
 }
 
 it("judges a backoff by the stand-in's clock, so a late read cannot redden a correct one", async () => {
-  const late = await triesAfter(LADDER, 1_000);
+  const late = await triesAfterStall(LADDER);
   assert.ok(late <= 10, `a correct backoff read after a 1 s runner stall counted ${late} tries in ${W}ms`);
-  // The control: with no backoff the same window is still blown through.
-  const flat = await triesAfter(FLAT, 0);
+  // The control: with no backoff the same window, read just as late, is still blown through.
+  const flat = await triesAfterStall(FLAT);
   assert.ok(flat > 10, `a missing backoff counted only ${flat} tries in ${W}ms, so this check cannot fail`);
 });

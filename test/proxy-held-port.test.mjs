@@ -602,11 +602,10 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
         held = await bound();
       }
       assert.equal(held, true, "the port was released while sessions were still wired to it");
-      // Backed off: an unbounded loop reaches ~40 in this window. COUNTED BY THE
-      // STAND-IN'S STAMPS, not by when this runner reads its stderr: neighbours'
-      // synchronous lsof calls stall the runner for seconds, and a read after the
-      // stall saw 0 tries (nothing drained yet) or 15 (everything since the
-      // kill). A stamp past the window proves the launcher kept retrying.
+      // Backed off: an unbounded loop reaches ~40 in this window. Counted by the
+      // stand-in's own stamps, not by when this runner reads its stderr: a read
+      // after a neighbour's lsof stall saw 0 tries (nothing drained yet) or 15
+      // (everything since the kill).
       const tries = await triesWithin(stderr, killedAt, 1_200);
       assert.ok(tries <= 10, `respawned ${tries} times in 1.2s — the backoff is not applied`);
     });
