@@ -156,7 +156,7 @@ it("holds the same default port the proxy would bind, and only when unset", () =
 // throwing so a caller can count failures instead of catching them — and the
 // body is what names which of /health's two 503 authors replied.
 async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: taken } = {}, tries = 3) {
-  const port = taken ?? await freePort();          // a real number: the holder owns the ADVERTISED port. `taken`: one the caller already holds and registered, to stage a neighbour on it.
+  const port = taken ?? await freePort();          // a real number: the holder owns the ADVERTISED port
   // Self-heal OFF by default. A proxy whose holder was SIGKILLed spawns a
   // REPLACEMENT holder about a second later, and nothing in a test tracks that
   // grandchild — measured, three leaked per run of this file, reparented to
@@ -289,7 +289,10 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: ta
       await new Promise((r) => setTimeout(r, 300));
     }
   }
-  if (busy) return withHeldPort(fn, { subcommand, extraEnv }, tries - 1);
+  if (busy) {
+    usedPorts.splice(usedPorts.indexOf(port), 1);   // a neighbour's now: not the after() sweep's
+    return withHeldPort(fn, { subcommand, extraEnv }, tries - 1);
+  }
 }
 
 // The launcher holds the advertised port and relays, so a proxy that dies
@@ -334,12 +337,11 @@ setInterval(() => {}, 1e9);
   }
 });
 
-// A PORT WITHHELDPORT GAVE UP ON IS NOT THE FILE'S TO SWEEP. The after() sweep
-// SIGHUPs every OURS process on a number in usedPorts with no parent filter, so a
-// number a neighbour took (the launcher exits EADDRINUSE and withHeldPort retries
-// on a fresh one) must leave the list, or the sweep kills the neighbour's live
-// launcher at the end of this file. Staged with a listener of our own on a
-// registered number: nothing is signalled, the list is what is read.
+// A PORT WITHHELDPORT GAVE UP ON IS NOT THE FILE'S TO SWEEP: after() SIGHUPs every
+// OURS process on a usedPorts number, no parent filter, so a number a neighbour
+// took (EADDRINUSE, retry on a fresh one) must leave the list or the neighbour's
+// launcher dies. Staged with a listener of our own on a registered number
+// (`port` is that seam): nothing is signalled, the list is what is read.
 it("drops a port a neighbour took from the sweep list when it retries on another", async () => {
   const squatter = net.createServer();
   await new Promise((r) => squatter.listen(0, "127.0.0.1", r));

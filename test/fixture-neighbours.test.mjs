@@ -72,10 +72,9 @@ it("the stdio-EPIPE child binds a port of its own, so a number a neighbour holds
 });
 
 // "answers 502 when the upstream refuses" needs an upstream that REFUSES. A
-// freePort() number is unowned the moment it is returned, so a neighbour that
-// takes it turns the refusal into a 200 (measured: a listener on it, 200 not 502).
-// The address is chosen inside the case, so this reads the case for the one hop a
-// neighbour cannot be handed.
+// freePort() number is unowned once returned, so a neighbour that takes it turns
+// the refusal into a 200. The address is chosen inside the case, so this reads the
+// case for the one hop a neighbour cannot be handed.
 it("the refusing-upstream case dials the dead hop, not a number freePort() let go", () => {
   const src = readFileSync(new URL("./proxy-server.test.mjs", import.meta.url), "utf8");
   const body = /it\("answers 502 when the upstream refuses[\s\S]*?\} finally/.exec(src)?.[0];
