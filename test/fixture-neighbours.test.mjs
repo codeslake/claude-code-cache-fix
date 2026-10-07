@@ -6,6 +6,8 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { DEAD_HOP, upstreamFixture } from "./proc-helpers.mjs";
 
 // A dead hop a stranger can reach is no longer dead: the walk in proxy-hop-fallback
@@ -40,5 +42,30 @@ it("an upstream fixture records the request that carries its marker, not every c
     assert.deepEqual(trace, ["UPSTREAM"], "control: a request carrying the marker was not recorded");
   } finally {
     up.close();
+  }
+});
+
+// The EPIPE case chose its proxy's port BEFORE the child started: freePort() binds
+// 0, reads the number and closes, so a neighbour can take it in between, and the
+// proxy's self-heal swallows the EADDRINUSE and exits 0 with nothing printed
+// ("child exited early, code=0"). The number a neighbour holds is handed to the
+// child here, and it must still come up, on a port it took at bind.
+it("the stdio-EPIPE child binds a port of its own, so a number a neighbour holds cannot stop it", async () => {
+  const squatter = net.createServer();
+  await new Promise((r) => squatter.listen(0, "127.0.0.1", r));
+  const taken = squatter.address().port;
+  const child = spawn(process.execPath,
+    [fileURLToPath(new URL("./fixtures/stdio-epipe-child.mjs", import.meta.url)), String(taken)],
+    { stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    const said = await new Promise((res, rej) => {
+      child.stdout.once("data", (d) => res(String(d)));
+      child.on("close", (c) => rej(new Error(`child exited before it listened, code=${c}`)));
+    });
+    const port = Number(/^listening (\d+)/.exec(said)?.[1]);
+    assert.ok(port > 0 && port !== taken, `the child announced ${JSON.stringify(said)}, not a port of its own`);
+  } finally {
+    child.kill("SIGKILL");
+    squatter.close();
   }
 });
