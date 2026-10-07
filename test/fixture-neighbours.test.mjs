@@ -169,11 +169,11 @@ setTimeout(() => {}, 60_000);
     // this case's orphan is taken: not a sibling's live child, not a sibling's detached
     // successor (70 starts with 7), not another runner's case 7, not our own child that
     // carries no case marker.
-    const cased = (n, lineage) => ({ ...process.env, CACHE_FIX_TEST_CASE: String(n), ...(lineage && { CACHE_FIX_TEST_LINEAGE: lineage }) });
+    const cased = (n) => ({ ...process.env, CACHE_FIX_TEST_CASE: String(n) });
     const own = await up("sh", ["-c", `${run} &`], cased(7));
     const sibling = await up(process.execPath, [holder], cased(8));
     const successor = await up("sh", ["-c", `${run} &`], cased(70));
-    const other = await up("sh", ["-c", `${run} &`], cased(7, `sweep-${process.pid + 1}`));
+    const other = await up("sh", ["-c", `${run} &`], { ...cased(7), CACHE_FIX_TEST_LINEAGE: `sweep-${process.pid + 1}` });
     const keyed = sweepTargets([own.port, sibling.port, successor.port, other.port, mine.port], 7).map(Number);
     assert.deepEqual(keyed, [own.pid],
       `case 7 selected ${keyed}; only its own orphan ${own.pid} belongs to it, not the sibling's child ${sibling.pid}, ` +
