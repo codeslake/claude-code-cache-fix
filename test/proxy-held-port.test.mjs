@@ -242,7 +242,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: ta
     for (;;) {
       const r = await Promise.race([get(), exited.then(() => null)]);
       if (r === null) {
-        await Promise.race([closed, new Promise((q) => setTimeout(q, 500))]);   // 'exit' can beat the last stderr chunk
+        await Promise.race([closed, new Promise((q) => setTimeout(q, 5_000))]);   // 'exit' can beat the last stderr chunk
         // A neighbour took the number freePort() let go: it is no longer ours to
         // sweep (the after() sweep SIGHUPs our own children and this runner's
         // lineage on a registered port, which a sibling case's launcher is), retried
@@ -1972,7 +1972,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       let err = "";
       p.stderr.on("data", (d) => { err += d; });
       const code = await Promise.race([
-        new Promise((r) => p.on("exit", (c) => r(c))),
+        new Promise((r) => p.on("close", (c) => r(c))),
         new Promise((r) => setTimeout(() => r("HUNG"), 25_000)),
       ]);
       try { p.kill("SIGKILL"); } catch {}
