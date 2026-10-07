@@ -12,9 +12,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { startProxy } from "../proxy/server.mjs";
-import { freePort } from "./proc-helpers.mjs";
 
 const SESSION_ID = "cse_01ABCDEFGHIJKLMNOPQRSTUV";
+// Dead upstream: port 1 is below every ephemeral range, so nothing listens there
+// and connect gets ECONNREFUSED. A bind-0-then-close port can be taken by a
+// neighbouring test file, whose listener then answers or resets instead.
+const DEAD_PORT = 1;
+// Foreign target must not share the upstream's authority: that origin is rewritten to
+// origin-form before routing, so the absolute-form scrub would never run.
+const FOREIGN_PORT = 2;
 
 function clientRequest(port, method, path, body) {
   return new Promise((resolve, reject) => {
@@ -51,10 +57,7 @@ describe("upstream connection failures are reported on stderr, not only debugLog
   before(async () => {
     for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
 
-    // Dead upstream: bind, read the port, close. Every forwardRequest to it
-    // fails ECONNREFUSED.
-    const deadPort = await freePort();
-    process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${deadPort}`;
+    process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${DEAD_PORT}`;
 
     // Forward-proxy mode so an origin-form request that is neither
     // /v1/messages nor /api/claude_cli/bootstrap reaches handlePassthrough
@@ -96,11 +99,10 @@ describe("upstream connection failures are reported on stderr, not only debugLog
 
   it("passthrough site, absolute-form foreign target: userinfo, host and query never reach stderr", async () => {
     delete process.env.CACHE_FIX_GATEWAY_ERROR_LOG;
-    const foreignPort = await freePort();
     const cap = captureStderr();
     let res;
     try {
-      res = await clientRequest(handle.port, "GET", `http://alice:s3cret@127.0.0.1:${foreignPort}/v1/code/sessions/${SESSION_ID}/x?token=T`);
+      res = await clientRequest(handle.port, "GET", `http://alice:s3cret@127.0.0.1:${FOREIGN_PORT}/v1/code/sessions/${SESSION_ID}/x?token=T`);
     } finally {
       cap.restore();
     }
