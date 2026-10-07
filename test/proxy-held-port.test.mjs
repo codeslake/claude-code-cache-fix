@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, sweepTargets, triesWithin } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, orphanTargets, sweepTargets, triesWithin } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -238,8 +238,9 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: ta
       if (r === null) {
         await Promise.race([closed, new Promise((q) => setTimeout(q, 500))]);   // 'exit' can beat the last stderr chunk
         // A neighbour took the number freePort() let go: it is no longer ours to
-        // sweep (the after() sweep SIGHUPs whatever OURS listens on a registered
-        // port), retried or not, so it leaves the list before anything throws.
+        // sweep (the after() sweep SIGHUPs our own children and this runner's
+        // lineage on a registered port, which a sibling case's launcher is), retried
+        // or not, so it leaves the list before anything throws.
         const inUse = /EADDRINUSE/.test(warned);
         const i = usedPorts.indexOf(port);
         if (inUse && i >= 0) usedPorts.splice(i, 1);
@@ -271,26 +272,15 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: ta
     // SIGHUP, not SIGTERM: SIGTERM is the signal that means "hand the socket on",
     // so it would breed the next successor and this loop would never drain.
     for (let i = 0; i < 5 && !process.env.CCF_TEST_NO_REAP; i++) {
-      const owners = listeners(port);
+      // THROUGH orphanTargets(): this runner's lineage, no live child. freePort()
+      // hands the same number out again once the OS recycles it, so "whoever
+      // listens on my port" can be a NEIGHBOUR's live launcher — measured: reaping
+      // by port alone killed the holder in "gives the port up when the proxy never
+      // starts" mid-run, and it went red having spawned 4 of the 5 proxies it
+      // counts.
+      const owners = orphanTargets([port]);
       if (!owners.length) break;
-      let signalled = 0;
-      for (const o of owners) {
-        const pid = Number(o);
-        if (!Number.isInteger(pid) || pid <= 1) continue;
-        // ONLY an orphan. freePort() hands the same number out again once the
-        // OS recycles it, so "whoever listens on my port" can be a NEIGHBOUR's
-        // live launcher — measured: reaping by port alone killed the holder in
-        // "gives the port up when the proxy never starts" mid-run, and it went
-        // red having spawned 4 of the 5 proxies it counts. A leaked successor is
-        // detached and always reparented to init; every live fixture's process
-        // still has the test runner above it.
-        let ppid = 0;
-        try { ppid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
-        catch { continue; }
-        if (ppid !== 1) continue;
-        try { process.kill(pid, "SIGHUP"); signalled++; } catch {}
-      }
-      if (!signalled) break;
+      for (const o of owners) { try { process.kill(Number(o), "SIGHUP"); } catch {} }
       await new Promise((r) => setTimeout(r, 300));
     }
   }
@@ -307,7 +297,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: ta
 // taking 3000 ephemeral ports collided on 855 of ~2400 distinct ones. node:test
 // runs FILES concurrently in their own processes, so the thing that took our
 // number can be another RUNNER, and several of them listen in-process. Every
-// caller of listeners() in this file turns its result into
+// sweep in this file starts from listeners() and turns what it keeps into
 // `process.kill(pid, "SIGHUP")` — and node's default action for SIGHUP is to
 // terminate, so the neighbour dies with `signal: 'SIGHUP'`, `error: 'test
 // failed'`, and NO CASE FAILING INSIDE IT. That is CI run 32087202771 exactly.
@@ -331,7 +321,7 @@ setInterval(() => {}, 1e9);
     await new Promise((r) => victim.stdout.once("data", r));
     assert.deepEqual(listeners(port), [],
       `listeners() handed back pid ${victim.pid} — a test-runner process that does ` +
-      `nothing but hold the number freePort() let go. Every caller here signals what ` +
+      `nothing but hold the number freePort() let go. Every sweep here starts from what ` +
       `this returns, so that is a whole neighbouring FILE killed by this one.`);
   } finally {
     try { victim.kill("SIGKILL"); } catch { }
@@ -339,11 +329,11 @@ setInterval(() => {}, 1e9);
   }
 });
 
-// A PORT WITHHELDPORT GAVE UP ON IS NOT THE FILE'S TO SWEEP: after() SIGHUPs every
-// OURS process on a usedPorts number, no parent filter, so a number a neighbour
-// took (EADDRINUSE, retry on a fresh one) must leave the list or the neighbour's
-// launcher dies. Staged with a listener of our own on a registered number
-// (`port` is that seam): nothing is signalled, the list is what is read.
+// A PORT WITHHELDPORT GAVE UP ON IS NOT THE FILE'S TO SWEEP: after() sweeps every
+// usedPorts number, so a number a neighbour took (EADDRINUSE, retry on a fresh
+// one) must leave the list or the sweep keeps reading the neighbour's launcher.
+// Staged with a listener of our own on a registered number (`port` is that seam):
+// nothing is signalled, the list is what is read.
 async function withNeighbour(fn) {
   const squatter = net.createServer();
   await new Promise((r) => squatter.listen(0, "127.0.0.1", r));
@@ -381,7 +371,7 @@ it("drops only the port it gave up on, never the last one registered", async () 
     let got;
     try { await withHeldPort(async ({ port }) => { got = port; }, { port: taken }); }
     finally { delete usedPorts.splice; }
-    assert.ok(got !== taken, "control: nothing was retried, so the give-up path never ran");
+    assert.ok(got && got !== taken, "control: nothing was retried, so the give-up path never ran");
     assert.deepEqual(starts.filter((s) => s < 0), [], "a splice started at -1: it dropped the last registered port");
   });
 });
@@ -583,7 +573,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
     // visible when it arms, which takes its poll plus its silence window —
     // measured, a single immediate pass left 14 of them alive across one run.
     for (let i = 0; i < 6; i++) {
-      const held = listeners(port);
+      const held = sweepTargets([port]);
       if (i && !held.length) break;
       for (const q of held) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
       await new Promise((r) => setTimeout(r, 600));
@@ -930,16 +920,17 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // So kill the holder FIRST and only then the listener: with the holder
         // gone there is nothing left to spawn another, and the sweep converges.
         for (let i = 0; i < 60; i++) {
-          const live = listeners(port);
+          const live = sweepTargets([port]);
           if (!live.length) { if (i > 10) break; }
           for (const pid of live) {
-            // The holder is the listener's parent when there is one; killing it
-            // first stops the ladder that would replace what we are about to
-            // kill.
+            // The holder is the listener's parent when it is itself one of `live`;
+            // killing it first stops the ladder that would replace what we are
+            // about to kill. A parent outside `live` is a stranger's launcher or
+            // this runner, and is not ours to signal.
             let parent = 0;
             try { parent = Number(execFileSync("ps", ["-p", pid, "-o", "ppid="],
                     { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch {}
-            if (parent > 1) { try { process.kill(parent, "SIGKILL"); } catch {} }
+            if (live.includes(String(parent))) { try { process.kill(parent, "SIGKILL"); } catch {} }
             try { process.kill(Number(pid), "SIGKILL"); } catch {}
           }
           await new Promise((r) => setTimeout(r, 200));
@@ -1034,11 +1025,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // has had time to create it.
         await new Promise((r) => setTimeout(r, 2_000));
         for (let i = 0; i < 3; i++) {
-          // THROUGH listeners(), which is where the ours-only predicate lives.
-          // Asking lsof here got the raw answer, and the walk below then sent
-          // SIGTERM to the listener's PARENT — for a stranger that is the node
-          // test runner, so this reached further than the SIGHUP sites did.
-          const owners = listeners(port);
+          // THROUGH sweepTargets(), which is where the lineage predicate lives.
+          // The walk below sends SIGTERM to the listener's PARENT, and only when
+          // that parent is itself one of `owners`: for a stranger it is the node
+          // test runner, so this reaches further than the SIGHUP sites do.
+          const owners = sweepTargets([port]);
           if (!owners.length) break;               // nobody of ours owns it: done
           for (const o of owners) {
             const pid = Number(o);
@@ -1048,7 +1039,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             let target = pid;
             try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
                                                { encoding: "utf8" }).trim()) || pid; } catch {}
-            if (target <= 1) target = pid;
+            if (!owners.includes(String(target))) target = pid;
             try { process.kill(target, "SIGTERM"); } catch {}
           }
           await new Promise((r) => setTimeout(r, 800));
@@ -1266,11 +1257,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // has had time to create it.
         await new Promise((r) => setTimeout(r, 2_000));
         for (let i = 0; i < 3; i++) {
-          // THROUGH listeners(), which is where the ours-only predicate lives.
-          // Asking lsof here got the raw answer, and the walk below then sent
-          // SIGTERM to the listener's PARENT — for a stranger that is the node
-          // test runner, so this reached further than the SIGHUP sites did.
-          const owners = listeners(port);
+          // THROUGH sweepTargets(), which is where the lineage predicate lives.
+          // The walk below sends SIGTERM to the listener's PARENT, and only when
+          // that parent is itself one of `owners`: for a stranger it is the node
+          // test runner, so this reaches further than the SIGHUP sites do.
+          const owners = sweepTargets([port]);
           if (!owners.length) break;               // nobody of ours owns it: done
           for (const o of owners) {
             const pid = Number(o);
@@ -1280,7 +1271,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             let target = pid;
             try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
                                                { encoding: "utf8" }).trim()) || pid; } catch {}
-            if (target <= 1) target = pid;
+            if (!owners.includes(String(target))) target = pid;
             try { process.kill(target, "SIGTERM"); } catch {}
           }
           await new Promise((r) => setTimeout(r, 800));

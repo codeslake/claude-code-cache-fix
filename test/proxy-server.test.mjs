@@ -11,7 +11,7 @@ import { join, dirname } from "node:path";
 import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
-import { DEAD_HOP, OURS, cmdOf, listeners } from "./proc-helpers.mjs";
+import { DEAD_HOP, OURS, cmdOf, orphanTargets } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
@@ -573,27 +573,11 @@ describe("zero-downtime reload", () => {
         /envInt\("CACHE_FIX_PROXY_PORT",\s*(\d+)\)/.exec(
           readFileSync(new URL("../proxy/config.mjs", import.meta.url), "utf8"))?.[1]) || 0;
       for (let i = 0; i < 5; i++) {
-        let owners = [];
-        for (const port of [PORT, defaultPort].filter(Boolean)) {
-          // THROUGH listeners(), which is where the ours-only predicate lives.
-          // The ppid check below is a different question — never a LIVE fixture
-          // of ours — and it does not answer this one: a stranger reparented to
-          // init passes it, and on the DEFAULT port that stranger is whatever
-          // else on the box happens to run a proxy on 9801.
-          owners = owners.concat(listeners(port));
-        }
+        // THROUGH orphanTargets(): this runner's lineage, never its live children and
+        // never whatever else on the box runs a proxy on 9801.
+        const owners = orphanTargets([PORT, defaultPort].filter(Boolean));
         if (!owners.length) break;
-        let signalled = 0;
-        for (const o of owners) {
-          const pid = Number(o);
-          if (!Number.isInteger(pid) || pid <= 1) continue;
-          let ppid = 0;
-          try { ppid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
-          catch { continue; }
-          if (ppid !== 1) continue;          // only an orphan; never a neighbour's live fixture
-          try { process.kill(pid, "SIGHUP"); signalled++; } catch {}
-        }
-        if (!signalled) break;
+        for (const o of owners) { try { process.kill(Number(o), "SIGHUP"); } catch {} }
         await new Promise((r) => setTimeout(r, 300));
       }
     }
