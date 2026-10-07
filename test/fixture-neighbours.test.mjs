@@ -7,9 +7,14 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { once } from "node:events";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEAD_HOP, upstreamFixture } from "./proc-helpers.mjs";
+import { DEAD_HOP, sweepTargets, upstreamFixture } from "./proc-helpers.mjs";
+
+const epipeChild = fileURLToPath(new URL("./fixtures/stdio-epipe-child.mjs", import.meta.url));
 
 // A dead hop a stranger can reach is no longer dead: the walk in proxy-hop-fallback
 // finds a listener on the address meant as unreachable and "the same chain is
@@ -55,9 +60,7 @@ it("the stdio-EPIPE child binds a port of its own, so a number a neighbour holds
   const squatter = net.createServer();
   await new Promise((r) => squatter.listen(0, "127.0.0.1", r));
   const taken = squatter.address().port;
-  const child = spawn(process.execPath,
-    [fileURLToPath(new URL("./fixtures/stdio-epipe-child.mjs", import.meta.url)), String(taken)],
-    { stdio: ["ignore", "pipe", "ignore"] });
+  const child = spawn(process.execPath, [epipeChild, String(taken)], { stdio: ["ignore", "pipe", "ignore"] });
   try {
     const said = await new Promise((res, rej) => {
       child.stdout.once("data", (d) => res(String(d)));
@@ -71,6 +74,22 @@ it("the stdio-EPIPE child binds a port of its own, so a number a neighbour holds
   }
 });
 
+// `node --test` collects every .mjs under test/, the EPIPE child included, and runs
+// it bare. Bare, its port argument was NaN, which the proxy's self-heal swallowed
+// and the file "passed" by exiting; a child that binds a port of its own would
+// listen on stdin for ever, which hangs the whole suite (measured: 24 minutes,
+// then killed). Run bare, as the collector does, it must do nothing and exit.
+it("the stdio-EPIPE child exits at once when node --test collects it as a test file", async () => {
+  const child = spawn(process.execPath, [epipeChild], { stdio: ["pipe", "ignore", "ignore"] });
+  try {
+    const exited = await Promise.race([once(child, "exit").then(() => true),
+                                       new Promise((r) => setTimeout(r, 3_000, false))]);
+    assert.ok(exited, "the bare fixture is still listening 3 s on: collected by node --test it never ends");
+  } finally {
+    child.kill("SIGKILL");
+  }
+});
+
 // "answers 502 when the upstream refuses" needs an upstream that REFUSES. A
 // freePort() number is unowned once returned, so a neighbour that takes it turns
 // the refusal into a 200. The address is chosen inside the case, so this reads the
@@ -81,4 +100,36 @@ it("the refusing-upstream case dials the dead hop, not a number freePort() let g
   assert.ok(body, "the 502 case moved, so this no longer guards anything");
   assert.match(body, /CACHE_FIX_PROXY_UPSTREAM = DEAD_HOP;/,
     "the case's upstream is a number freePort() let go, which a neighbour can listen on");
+});
+
+// A file's after() sweep SIGHUPs whatever sweepTargets() names on the ports it
+// registered, and a number it let go can later be a NEIGHBOUR's: that launcher
+// listens there and matches OURS. Three OURS-shaped holders, selected here and
+// signalled by nobody: our own child, a child of somebody else's live process (the
+// neighbour's shape), and an orphan (the leaked successor the sweep exists for).
+it("the after() sweep selects our own child and an orphan on a registered port, never a stranger's", { timeout: 30_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ccf-sweep-"));
+  mkdirSync(join(dir, "bin"));
+  const holder = join(dir, "bin", "holder.mjs");
+  writeFileSync(holder, `import net from "node:net";
+const s = net.createServer(() => {});
+s.listen(0, "127.0.0.1", () => process.stdout.write(s.address().port + " " + process.pid + "\\n"));
+s.unref();
+setTimeout(() => {}, 60_000);
+`);
+  const run = `${JSON.stringify(process.execPath)} ${JSON.stringify(holder)}`;
+  const pids = [];
+  const up = (cmd, args) => new Promise((res) => spawn(cmd, args, { stdio: ["ignore", "pipe", "ignore"] })
+    .stdout.once("data", (d) => { const [port, pid] = String(d).split(" ").map(Number); pids.push(pid); res({ port, pid }); }));
+  try {
+    const mine = await up(process.execPath, [holder]);
+    const stranger = await up("sh", ["-c", `${run}; true`]);
+    const orphan = await up("sh", ["-c", `${run} &`]);
+    const got = sweepTargets([mine.port, stranger.port, orphan.port]).map(Number).sort((a, b) => a - b);
+    assert.deepEqual(got, [mine.pid, orphan.pid].sort((a, b) => a - b),
+      `selected ${got}; own child ${mine.pid} and orphan ${orphan.pid} belong to the sweep, stranger's ${stranger.pid} does not`);
+  } finally {
+    for (const p of pids) try { process.kill(p, "SIGKILL"); } catch { }
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

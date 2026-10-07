@@ -126,6 +126,11 @@ export const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
 // ours() for the mechanism and the two markers it reads.
 export const onPort = (port) => [...new Set([...listeners(port), ...ours(port)])];
 
+// WHAT A FILE'S after() SWEEP MAY SIGNAL on the ports it registered. The pids on a
+// number are not all the file's: freePort() hands a released number to a
+// neighbouring file, whose live launcher then sits on it and matches OURS.
+export const sweepTargets = (ports) => ports.flatMap(onPort);
+
 // A HOP THAT STAYS DEAD. A freePort() number is only free until the next asker,
 // and a neighbouring file asks constantly, so a case that walks a chain for 2.5 s
 // can find a listener on the address it meant as unreachable. Port 1 is not a

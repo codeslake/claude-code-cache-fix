@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, triesWithin } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, sweepTargets, triesWithin } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -342,19 +342,46 @@ setInterval(() => {}, 1e9);
 // took (EADDRINUSE, retry on a fresh one) must leave the list or the neighbour's
 // launcher dies. Staged with a listener of our own on a registered number
 // (`port` is that seam): nothing is signalled, the list is what is read.
-it("drops a port a neighbour took from the sweep list when it retries on another", async () => {
+async function withNeighbour(fn) {
   const squatter = net.createServer();
   await new Promise((r) => squatter.listen(0, "127.0.0.1", r));
-  const taken = squatter.address().port;
-  usedPorts.push(taken);
-  try {
+  try { await fn(squatter.address().port); } finally { squatter.close(); }
+}
+
+it("drops a port a neighbour took from the sweep list when it retries on another", async () => {
+  await withNeighbour(async (taken) => {
+    usedPorts.push(taken);
     let got;
     await withHeldPort(async ({ port }) => { got = port; }, { port: taken });
     assert.ok(got && got !== taken, "control: the launcher came up on the number the neighbour held, so nothing was retried");
     assert.ok(!usedPorts.includes(taken), `${taken} was given up on but is still in the list the after() sweep SIGHUPs`);
-  } finally {
-    squatter.close();
-  }
+  });
+});
+
+// On the LAST try the same EADDRINUSE is not retried but thrown, and the number
+// is the neighbour's all the same.
+it("drops a port a neighbour took from the sweep list on the last try too", async () => {
+  await withNeighbour(async (taken) => {
+    usedPorts.push(taken);
+    await assert.rejects(withHeldPort(async () => {}, { port: taken }, 1), /exited before the held port came up/);
+    assert.ok(!usedPorts.includes(taken), `${taken} was given up on but is still in the list the after() sweep SIGHUPs`);
+  });
+});
+
+// splice(indexOf(x), 1) with x absent is splice(-1, 1): the LAST registered port,
+// some other case's, silently leaves the list. Read as the start index of every
+// splice, because the list itself is being pushed to by cases running beside this.
+it("drops only the port it gave up on, never the last one registered", async () => {
+  await withNeighbour(async (taken) => {
+    const splice = usedPorts.splice;
+    const starts = [];
+    usedPorts.splice = (start, ...rest) => { starts.push(start); return splice.call(usedPorts, start, ...rest); };
+    let got;
+    try { await withHeldPort(async ({ port }) => { got = port; }, { port: taken }); }
+    finally { delete usedPorts.splice; }
+    assert.ok(got !== taken, "control: nothing was retried, so the give-up path never ran");
+    assert.deepEqual(starts.filter((s) => s < 0), [], "a splice started at -1: it dropped the last registered port");
+  });
 });
 
 it("cuts nothing on the held port while the proxy restarts", async () => {
@@ -2415,10 +2442,8 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
 after(async () => {
   for (let i = 0; i < 6; i++) {
     let any = false;
-    for (const port of usedPorts) {
-      for (const q of onPort(port)) {
-        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
-      }
+    for (const q of sweepTargets(usedPorts)) {
+      try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
     }
     if (!any && i) break;
     await new Promise((r) => setTimeout(r, 700));
