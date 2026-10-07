@@ -11,19 +11,10 @@ import { join, dirname } from "node:path";
 import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
-import { DEAD_HOP, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { DEAD_HOP, OURS, cmdOf, listeners } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
-
-const usedPorts = [];
-// The shared allocator plus this file's own cleanup registry — the registry is
-// file-local (its after() hook sweeps it), the allocation is not.
-async function freePort() {
-  const p = await takePort();
-  usedPorts.push(p);
-  return p;
-}
 
 let handle;
 let proxyPort;
@@ -831,25 +822,6 @@ describe("zero-downtime reload", () => {
 
 });
 
-// ONE SWEEP FOR THE FILE, over the ports it handed out and nobody else's. A
-// standby relay outlives a holder that was killed rather than released — that
-// is the point of it — and while it has not armed yet it holds a socket nobody
-// listened on, so a case's own cleanup cannot see it. Reaping by process name
-// instead would reach into a neighbouring file's live fixture, since node runs
-// test files concurrently in their own processes.
-after(async () => {
-  for (let i = 0; i < 6; i++) {
-    let any = false;
-    for (const port of usedPorts) {
-      for (const q of onPort(port)) {
-        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
-      }
-    }
-    if (!any && i) break;
-    await new Promise((r) => setTimeout(r, 700));
-  }
-});
-
 // close() MUST RESOLVE AFTER shutdown() HAS ALREADY UNBOUND.
 //
 // shutdown() closes the server first — announcing the release while we still
@@ -1021,11 +993,10 @@ describe("client-abandon abort", () => {
 
   it("answers 502 when the upstream refuses, instead of hanging the client", async () => {
     const saved = save();
-    const dead = await freePort();               // nothing listening: instant ECONNREFUSED
     let h;
     try {
       for (const k of ENV) delete process.env[k];
-      process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${dead}`;
+      process.env.CACHE_FIX_PROXY_UPSTREAM = DEAD_HOP;   // nothing listening: instant ECONNREFUSED
       h = await startProxy({ port: 0, watch: false });
       const got = await new Promise((resolve) => {
         const r = http.request({ host: "127.0.0.1", port: h.port, method: "POST",
