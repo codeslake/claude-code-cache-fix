@@ -9,7 +9,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { armLineage, cmdOf, freePort as takePort, listeners, reapStamped } from "./proc-helpers.mjs";
+import { armLineage, cmdOf, freePort as takePort, listeners, reapStamped, sweepTargets } from "./proc-helpers.mjs";
 import { exitWithin, withDeadline } from "./child-deadline.mjs";
 
 // ITS OWN FILE, not tidiness: this case used to sit at the end of
@@ -156,10 +156,12 @@ const bootHolder = async (upstream, launcher, extraEnv = {}) => {
 // WHAT A HOLDER SIGKILL OR A RELOAD LEAVES BEHIND is nobody's child, so nothing
 // else reaps it. Holders FIRST, then the rest in the same pass: a proxy whose
 // holder just died spawns a replacement on its next tick, and this must outrun
-// it. Only what listens on OUR port, filtered by OURS (proc-helpers listeners()).
+// it. Only what is on OUR port and ours: this runner's own child or a process
+// carrying its lineage tag (proc-helpers sweepTargets()), never a neighbour's
+// launcher that was handed the same number after it was let go.
 const reapPort = async (port) => {
   for (let i = 0; i < 5; i++) {
-    const owners = listeners(port).sort((a, b) =>
+    const owners = sweepTargets([port]).sort((a, b) =>
       /run-service/.test(cmdOf(b)) - /run-service/.test(cmdOf(a)));
     if (!owners.length) break;
     for (const o of owners) { try { process.kill(Number(o), "SIGKILL"); } catch { } }
