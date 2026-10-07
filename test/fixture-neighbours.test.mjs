@@ -12,7 +12,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEAD_HOP, sweepTargets, upstreamFixture } from "./proc-helpers.mjs";
+import { DEAD_HOP, byEnv, orphanTargets, sweepTargets, upstreamFixture } from "./proc-helpers.mjs";
 
 const epipeChild = fileURLToPath(new URL("./fixtures/stdio-epipe-child.mjs", import.meta.url));
 
@@ -103,12 +103,35 @@ it("the refusing-upstream case dials the dead hop, not a number freePort() let g
     "the case's upstream is a number freePort() let go, which a neighbour can listen on");
 });
 
+// The hop-down handover case needs an address nobody listens on: a freePort()
+// number is unowned once returned, so a neighbour that takes it makes "down" a hop
+// that accepts and answers nothing.
+it("the hop-down handover case dials the dead hop, not a number freePort() let go", () => {
+  const src = readFileSync(new URL("./proxy-holder-handover.test.mjs", import.meta.url), "utf8");
+  assert.match(src, /env\.CACHE_FIX_FALLBACK_PROXIES = DEAD_HOP;/,
+    "the case's down hop is a number freePort() let go, which a neighbour can listen on");
+});
+
+// The forced-kill probe needs a port nobody listens on: a freePort() number is
+// unowned once returned, so a neighbour that takes it before the probe runs turns
+// the refusal it counts into whatever that neighbour answers.
+it("the forced-kill probe case dials the dead hop, not a number freePort() let go", () => {
+  const src = readFileSync(new URL("./proxy-held-port.test.mjs", import.meta.url), "utf8");
+  const body = /it\("hands classify only strings[\s\S]*?\} finally/.exec(src)?.[0];
+  assert.ok(body, "the forced-kill probe case moved, so this no longer guards anything");
+  assert.match(body, /new URL\(DEAD_HOP\)\.port/,
+    "the case's dead port is a number freePort() let go, which a neighbour can listen on");
+  assert.doesNotMatch(body, /freePort\(\)/, "the case still allocates its dead port through freePort()");
+});
+
 // A file's after() sweep SIGHUPs whatever sweepTargets() names on the ports it
 // registered, and a number it let go can later be a NEIGHBOUR's: that launcher
-// listens there and matches OURS. Three OURS-shaped holders, selected here and
-// signalled by nobody: our own child, a child of somebody else's live process (the
-// neighbour's shape), and an orphan (the leaked successor the sweep exists for).
-it("the after() sweep selects our own child and an orphan on a registered port, never a stranger's", { timeout: 30_000 }, async () => {
+// listens there and matches OURS. Selected here and signalled by nobody: our own
+// child, an orphan that carries this runner's lineage tag (the leaked successor
+// the sweep exists for), and the two strangers, a neighbour's live launcher and a
+// parentless process of nobody's lineage. ppid 1 alone cannot tell the second
+// stranger from the orphan: init adopts both.
+it("the after() sweep selects our own child and our orphan on a registered port, never a stranger's", { timeout: 30_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-sweep-"));
   mkdirSync(join(dir, "bin"));
   const holder = join(dir, "bin", "holder.mjs");
@@ -120,15 +143,32 @@ setTimeout(() => {}, 60_000);
 `);
   const run = `${JSON.stringify(process.execPath)} ${JSON.stringify(holder)}`;
   const pids = [];
-  const up = (cmd, args) => new Promise((res) => spawn(cmd, args, { stdio: ["ignore", "pipe", "ignore"] })
+  const tagged = (tag) => ({ ...process.env, CACHE_FIX_TEST_LINEAGE: tag });
+  const up = (cmd, args, env = process.env) => new Promise((res) => spawn(cmd, args, { env, stdio: ["ignore", "pipe", "ignore"] })
     .stdout.once("data", (d) => { const [port, pid] = String(d).split(" ").map(Number); pids.push(pid); res({ port, pid }); }));
   try {
     const mine = await up(process.execPath, [holder]);
-    const stranger = await up("sh", ["-c", `${run}; true`]);
+    const stranger = await up("sh", ["-c", `${run}; true`], tagged(`sweep-${process.pid + 1}`));
     const orphan = await up("sh", ["-c", `${run} &`]);
-    const got = new Set(sweepTargets([mine.port, stranger.port, orphan.port]).map(Number));
+    const foreign = await up("sh", ["-c", `${run} &`], tagged(undefined));
+    // A sibling case's live tree: a tagged launcher (our child) over its proxy, and one level deeper.
+    const nested = await up("sh", ["-c", `${run}; true`]);
+    const deep = await up("sh", ["-c", `sh -c '${run}; true'; true`]);
+    const got = new Set(sweepTargets([mine.port, stranger.port, orphan.port, foreign.port]).map(Number));
     assert.deepEqual(got, new Set([mine.pid, orphan.pid]),
-      `selected ${[...got]}; own child ${mine.pid} and orphan ${orphan.pid} belong to the sweep, stranger's ${stranger.pid} does not`);
+      `selected ${[...got]}; own child ${mine.pid} and our orphan ${orphan.pid} belong to the sweep, ` +
+      `neither the neighbour's ${stranger.pid} nor the untagged orphan ${foreign.pid} does`);
+    // The per-case cleanup runs while sibling cases are live: a sibling's launcher is a
+    // child of this runner that carries the tag, and its proxy sits under it. Only the
+    // orphan, whose parent is outside this lineage, is taken.
+    const per = orphanTargets([mine.port, orphan.port, nested.port, deep.port]).map(Number);
+    assert.deepEqual(per, [orphan.pid],
+      `per-case cleanup selected ${per}; live ${mine.pid}, ${nested.pid} and ${deep.pid} are a sibling case's launcher and its descendants`);
+    // AND THE ENVIRON IS READ ONLY FOR THE PIDS ASKED ABOUT. Scanning every process
+    // costs one ps per tagged OURS process on the box, and the tag is on all of this
+    // runner's launchers: measured, that starved the cases running beside a sweep.
+    assert.deepEqual(byEnv(/CACHE_FIX_TEST_LINEAGE=/, [String(mine.pid)]), [String(mine.pid)],
+      "byEnv answered for pids it was not asked about, so every sweep pays for the whole box");
   } finally {
     for (const p of pids) try { process.kill(p, "SIGKILL"); } catch { }
     rmSync(dir, { recursive: true, force: true });
@@ -136,12 +176,36 @@ setTimeout(() => {}, 60_000);
 });
 
 // Every other signal site reads its targets from the same place, so the row above
-// covers them only if they all go through sweepTargets(): a case that takes the
-// pids on a number straight from onPort signals a neighbour's live launcher once
-// the OS recycles the number. Static, because the selection is inline at each site.
-it("no test file takes signal targets straight from onPort, only through sweepTargets", () => {
+// covers them only if they all go through sweepTargets(): a pid taken from onPort
+// or listeners() in any test file signals a neighbour's live launcher once the OS
+// recycles the number. Static, because each site selects inline. Every process.kill
+// is walked back through the nearest earlier binding of each name it reads (a loop
+// variable, a parent read with ps) and must not arrive at either call. Straight-line
+// only: a name re-bound on a branch is followed through its last binding alone.
+const fromPort = (src, expr, at) =>
+  /\b(?:listeners|onPort)\(/.test(expr) ||
+  [...expr.matchAll(/(?<![.\w])[A-Za-z_]\w*/g)].some(([name]) => {
+    const last = [...src.slice(0, at).matchAll(new RegExp(`\\b${name}(?: = | of )([^;{]*)`, "g"))].pop();
+    return last !== undefined && fromPort(src, last[1], last.index);
+  });
+
+it("no test file takes signal targets straight from onPort or listeners(), only through sweepTargets", () => {
   const dir = fileURLToPath(new URL(".", import.meta.url));
-  const bad = readdirSync(dir).filter((f) => f.endsWith(".test.mjs") && f !== "fixture-neighbours.test.mjs"
-    && /\bonPort\b/.test(readFileSync(join(dir, f), "utf8")));
-  assert.deepEqual(bad, [], `these select pids on a port without the parent filter: ${bad}`);
+  const bad = [];
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".test.mjs") && f !== "fixture-neighbours.test.mjs")) {
+    const src = readFileSync(join(dir, f), "utf8").replace(/^[ \t]*\/\/.*$/gm, "");
+    for (const k of src.matchAll(/process\.kill\((?!\))([^,;]*)/g)) {
+      const before = src.slice(0, k.index);
+      if (fromPort(src, before.split(/[;{}]/).pop() + k[1], k.index)) bad.push(`${f}:${before.split("\n").length}`);
+    }
+  }
+  assert.deepEqual(bad, [], `these signal a pid selected on a port without the lineage filter: ${bad}`);
+});
+
+// The helper protects only the two per-case cleanups that select through it.
+it("the per-case cleanup sweeps select through orphanTargets, not sweepTargets", () => {
+  for (const f of ["proxy-held-port", "proxy-server"]) {
+    assert.ok(/const owners = orphanTargets\(/.test(readFileSync(new URL(`./${f}.test.mjs`, import.meta.url), "utf8")),
+      `${f}: its per-case cleanup selects with sweepTargets(), which also signals our own live children`);
+  }
 });

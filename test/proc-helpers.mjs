@@ -93,14 +93,18 @@ export const onPorts = (ports) => {
 //
 // Still filtered by OURS, for the same reason listeners() is: a port number is
 // not ownership, and freePort() hands the same number to neighbouring files.
-// EVERY PID WHOSE ENVIRON MATCHES `want`, filtered by OURS. Shared by ours()
-// (keyed on a registered port) and stamped() (keyed on a lineage marker) —
-// same two platforms, same two markers to read, only the regex differs.
-function byEnv(want) {
+// EVERY PID WHOSE ENVIRON MATCHES `want`, filtered by OURS, among `pids` when given.
+// Shared by ours() (keyed on a registered port), stamped() (keyed on a lineage
+// marker) and the sweep's runner tag (keyed on this runner's tag, asked of the pids
+// on a port only: a marker on most of the box's fixtures must not be asked of every
+// process, each match costs a ps) -- same two platforms, same two markers to read,
+// only the regex differs.
+export function byEnv(want, pids) {
   const out = [];
   try {
     // Linux: /proc is authoritative and needs no shell-out.
-    for (const pid of readdirSync("/proc")) {
+    const all = readdirSync("/proc");
+    for (const pid of pids ?? all) {
       if (!/^\d+$/.test(pid)) continue;
       let env = "";
       try { env = readFileSync(`/proc/${pid}/environ`, "utf8").replace(/\0/g, " "); } catch { continue; }
@@ -114,7 +118,7 @@ function byEnv(want) {
                               { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     for (const line of rows.split("\n")) {
       const m = /^\s*(\d+)\s+(.*)$/.exec(line);
-      if (m && want.test(m[2]) && OURS.test(m[2])) out.push(m[1]);
+      if (m && (!pids || pids.includes(m[1])) && want.test(m[2]) && OURS.test(m[2])) out.push(m[1]);
     }
   } catch { /* no ps either: the caller falls back to listeners() */ }
   return out;
@@ -257,17 +261,36 @@ export const verdict = (r, ms) => new Promise((res) => {
   r.on("error", (e) => res(e.code || "ERR"));
 });
 
-// WHAT A FILE'S after() SWEEP MAY SIGNAL on the ports it registered: an orphan (a
-// leaked successor is detached, so init has it) or our own child. The pids on a
-// number are not all the file's: freePort() hands a released number to a
-// neighbouring file, whose live launcher then sits on it, matches OURS, and has
-// its own runner above it.
+// WHAT A FILE'S after() SWEEP MAY SIGNAL on the ports it registered: our own child,
+// or anything carrying this runner's lineage tag. freePort() hands a released
+// number to a neighbouring file, whose live launcher matches OURS too, and ppid 1
+// cannot tell a leaked successor from a neighbour's orphan (init, or a subreaper,
+// adopts both). The tag is set at load, so any env that spreads process.env carries
+// it down the tree, and it ends in the runner's pid: `sweep-<pid>`, the
+// `<name>-<pid>` shape a lineage tag takes wherever else it is set.
+process.env.CACHE_FIX_TEST_LINEAGE = `sweep-${process.pid}`;
 const ppidOf = (pid) => {
   try { return Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
   catch { return 0; }
 };
-export const sweepTargets = (ports) =>
-  onPorts(ports).filter((pid) => [1, process.pid].includes(ppidOf(pid)));
+const lineage = new RegExp(`CACHE_FIX_TEST_LINEAGE=\\S*-${process.pid}(?:\\s|$)`);
+export const sweepTargets = (ports) => {
+  const held = onPorts(ports);
+  const mine = new Set(byEnv(lineage, held));
+  return held.filter((pid) => mine.has(pid) || ppidOf(pid) === process.pid);
+};
+
+// THE PER-CASE CLEANUP'S TARGETS: the sweep's orphans, a pid whose parent is outside this
+// runner's lineage. A sibling case's live tree is inside it: its launcher is our child,
+// its proxy and standby sit under that launcher.
+// ponytail: a sibling's detached successor whose parent has exited is adopted by init, as
+// ours are, and still passes; tag per case, `case<n>-<runner pid>`.
+export const orphanTargets = (ports) => {
+  const held = sweepTargets(ports);
+  const ppids = held.map((pid) => String(ppidOf(pid)));
+  const live = new Set([String(process.pid), ...byEnv(lineage, ppids)]);
+  return held.filter((_, i) => !live.has(ppids[i]));
+};
 
 // A HOP THAT STAYS DEAD. A freePort() number is only free until the next asker,
 // and a neighbouring file asks constantly, so a case that walks a chain for 2.5 s
