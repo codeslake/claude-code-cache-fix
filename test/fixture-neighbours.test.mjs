@@ -8,7 +8,7 @@ import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -133,4 +133,15 @@ setTimeout(() => {}, 60_000);
     for (const p of pids) try { process.kill(p, "SIGKILL"); } catch { }
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// Every other signal site reads its targets from the same place, so the row above
+// covers them only if they all go through sweepTargets(): a case that takes the
+// pids on a number straight from onPort signals a neighbour's live launcher once
+// the OS recycles the number. Static, because the selection is inline at each site.
+it("no test file takes signal targets straight from onPort, only through sweepTargets", () => {
+  const dir = fileURLToPath(new URL(".", import.meta.url));
+  const bad = readdirSync(dir).filter((f) => f.endsWith(".test.mjs") && f !== "fixture-neighbours.test.mjs"
+    && /\bonPort\b/.test(readFileSync(join(dir, f), "utf8")));
+  assert.deepEqual(bad, [], `these select pids on a port without the parent filter: ${bad}`);
 });
