@@ -51,7 +51,7 @@ const get = (port, path) => new Promise((resolve) => {
 
 describe("stdio EPIPE", () => {
   it("keeps serving after its stdout/stderr reader goes away", async () => {
-    const env = { ...process.env };
+    const env = { ...process.env, STDIO_EPIPE_CHILD: "1" };
     // An ambient proxy would send this test's own request somewhere real.
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"]) delete env[k];

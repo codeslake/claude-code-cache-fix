@@ -237,8 +237,13 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: ta
       const r = await Promise.race([get(), exited.then(() => null)]);
       if (r === null) {
         await Promise.race([closed, new Promise((q) => setTimeout(q, 500))]);   // 'exit' can beat the last stderr chunk
-        // A neighbour took the number freePort() let go: take another.
-        busy = tries > 1 && /EADDRINUSE/.test(warned);
+        // A neighbour took the number freePort() let go: it is no longer ours to
+        // sweep (the after() sweep SIGHUPs whatever OURS listens on a registered
+        // port), retried or not, so it leaves the list before anything throws.
+        const inUse = /EADDRINUSE/.test(warned);
+        const i = usedPorts.indexOf(port);
+        if (inUse && i >= 0) usedPorts.splice(i, 1);
+        busy = tries > 1 && inUse;
         assert.ok(busy, `the launcher exited before the held port came up. stdout: ${said} stderr: ${warned}`);
         break;
       }
@@ -289,10 +294,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: ta
       await new Promise((r) => setTimeout(r, 300));
     }
   }
-  if (busy) {
-    usedPorts.splice(usedPorts.indexOf(port), 1);   // a neighbour's now: not the after() sweep's
-    return withHeldPort(fn, { subcommand, extraEnv }, tries - 1);
-  }
+  if (busy) return withHeldPort(fn, { subcommand, extraEnv }, tries - 1);
 }
 
 // The launcher holds the advertised port and relays, so a proxy that dies

@@ -60,7 +60,8 @@ it("the stdio-EPIPE child binds a port of its own, so a number a neighbour holds
   const squatter = net.createServer();
   await new Promise((r) => squatter.listen(0, "127.0.0.1", r));
   const taken = squatter.address().port;
-  const child = spawn(process.execPath, [epipeChild, String(taken)], { stdio: ["ignore", "pipe", "ignore"] });
+  const child = spawn(process.execPath, [epipeChild, String(taken)],
+    { env: { ...process.env, STDIO_EPIPE_CHILD: "1" }, stdio: ["ignore", "pipe", "ignore"] });
   try {
     const said = await new Promise((res, rej) => {
       child.stdout.once("data", (d) => res(String(d)));
@@ -125,9 +126,9 @@ setTimeout(() => {}, 60_000);
     const mine = await up(process.execPath, [holder]);
     const stranger = await up("sh", ["-c", `${run}; true`]);
     const orphan = await up("sh", ["-c", `${run} &`]);
-    const got = sweepTargets([mine.port, stranger.port, orphan.port]).map(Number).sort((a, b) => a - b);
-    assert.deepEqual(got, [mine.pid, orphan.pid].sort((a, b) => a - b),
-      `selected ${got}; own child ${mine.pid} and orphan ${orphan.pid} belong to the sweep, stranger's ${stranger.pid} does not`);
+    const got = new Set(sweepTargets([mine.port, stranger.port, orphan.port]).map(Number));
+    assert.deepEqual(got, new Set([mine.pid, orphan.pid]),
+      `selected ${[...got]}; own child ${mine.pid} and orphan ${orphan.pid} belong to the sweep, stranger's ${stranger.pid} does not`);
   } finally {
     for (const p of pids) try { process.kill(p, "SIGKILL"); } catch { }
     rmSync(dir, { recursive: true, force: true });

@@ -9,6 +9,11 @@
 // the stderr pipe FIRST. A race here would make the test pass for the wrong
 // reason: a throw that lands while stderr is still readable never reaches the
 // defect.
+//
+// `node --test` collects every .mjs under test/, this one included, and runs it
+// bare. Only a spawner that sets STDIO_EPIPE_CHILD gets a proxy; a bare run
+// would listen on stdin for ever and hang the suite.
+if (!process.env.STDIO_EPIPE_CHILD) process.exit(0);
 process.env.CACHE_FIX_FORWARD_PROXY = "on";
 
 // The port is taken at bind (0) and announced, never chosen beforehand: a number

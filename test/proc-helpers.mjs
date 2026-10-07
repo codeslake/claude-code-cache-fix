@@ -126,10 +126,17 @@ export const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
 // ours() for the mechanism and the two markers it reads.
 export const onPort = (port) => [...new Set([...listeners(port), ...ours(port)])];
 
-// WHAT A FILE'S after() SWEEP MAY SIGNAL on the ports it registered. The pids on a
+// WHAT A FILE'S after() SWEEP MAY SIGNAL on the ports it registered: an orphan (a
+// leaked successor is detached, so init has it) or our own child. The pids on a
 // number are not all the file's: freePort() hands a released number to a
-// neighbouring file, whose live launcher then sits on it and matches OURS.
-export const sweepTargets = (ports) => ports.flatMap(onPort);
+// neighbouring file, whose live launcher then sits on it, matches OURS, and has
+// its own runner above it.
+const ppidOf = (pid) => {
+  try { return Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
+  catch { return 0; }
+};
+export const sweepTargets = (ports) =>
+  ports.flatMap(onPort).filter((pid) => [1, process.pid].includes(ppidOf(pid)));
 
 // A HOP THAT STAYS DEAD. A freePort() number is only free until the next asker,
 // and a neighbouring file asks constantly, so a case that walks a chain for 2.5 s
