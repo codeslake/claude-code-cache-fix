@@ -131,7 +131,7 @@ it("the forced-kill probe case dials the dead hop, not a number freePort() let g
 // the sweep exists for), and the two strangers, a neighbour's live launcher and a
 // parentless process of nobody's lineage. ppid 1 alone cannot tell the second
 // stranger from the orphan: init adopts both.
-it("the after() sweep selects our own child and our orphan on a registered port, never a stranger's", { timeout: 30_000 }, async () => {
+it("the sweeps select our own child and our orphan on a registered port, never a stranger's, and a case's only its own", { timeout: 30_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-sweep-"));
   mkdirSync(join(dir, "bin"));
   const holder = join(dir, "bin", "holder.mjs");
@@ -164,6 +164,20 @@ setTimeout(() => {}, 60_000);
     const per = orphanTargets([mine.port, orphan.port, nested.port, deep.port]).map(Number);
     assert.deepEqual(per, [orphan.pid],
       `per-case cleanup selected ${per}; live ${mine.pid}, ${nested.pid} and ${deep.pid} are a sibling case's launcher and its descendants`);
+    // A CASE'S OWN SWEEP IS KEYED BY ITS CASE MARKER: every case of one file shares the
+    // runner's lineage, so a sibling's launcher, live or detached, is inside it. Only
+    // this case's orphan is taken: not a sibling's live child, not a sibling's detached
+    // successor (70 starts with 7), not another runner's case 7, not our own child that
+    // carries no case marker.
+    const cased = (n) => ({ ...process.env, CACHE_FIX_TEST_CASE: String(n) });
+    const own = await up("sh", ["-c", `${run} &`], cased(7));
+    const sibling = await up(process.execPath, [holder], cased(8));
+    const successor = await up("sh", ["-c", `${run} &`], cased(70));
+    const other = await up("sh", ["-c", `${run} &`], { ...cased(7), CACHE_FIX_TEST_LINEAGE: `sweep-${process.pid + 1}` });
+    const keyed = sweepTargets([own.port, sibling.port, successor.port, other.port, mine.port], 7).map(Number);
+    assert.deepEqual(keyed, [own.pid],
+      `case 7 selected ${keyed}; only its own orphan ${own.pid} belongs to it, not the sibling's child ${sibling.pid}, ` +
+      `its detached successor ${successor.pid}, another runner's case 7 ${other.pid}, or the unmarked ${mine.pid}`);
     // AND THE ENVIRON IS READ ONLY FOR THE PIDS ASKED ABOUT. Scanning every process
     // costs one ps per tagged OURS process on the box, and the tag is on all of this
     // runner's launchers: measured, that starved the cases running beside a sweep.
@@ -202,10 +216,15 @@ it("no test file takes signal targets straight from onPort or listeners(), only 
   assert.deepEqual(bad, [], `these signal a pid selected on a port without the lineage filter: ${bad}`);
 });
 
-// The helper protects only the two per-case cleanups that select through it.
-it("the per-case cleanup sweeps select through orphanTargets, not sweepTargets", () => {
-  for (const f of ["proxy-held-port", "proxy-server"]) {
-    assert.ok(/const owners = orphanTargets\(/.test(readFileSync(new URL(`./${f}.test.mjs`, import.meta.url), "utf8")),
-      `${f}: its per-case cleanup selects with sweepTargets(), which also signals our own live children`);
-  }
+// The helper protects only the per-case cleanups that select through it. proxy-server's
+// takes orphans; proxy-held-port's cases run side by side in one runner, so each signals
+// only what carries its own case tag (the file's after() sweeps every port it handed out).
+it("the per-case cleanup sweeps select through orphanTargets, or through their case tag", () => {
+  assert.ok(/const owners = orphanTargets\(/.test(readFileSync(new URL("./proxy-server.test.mjs", import.meta.url), "utf8")),
+    "proxy-server: its per-case cleanup selects with sweepTargets(), which also signals our own live children");
+  const src = readFileSync(new URL("./proxy-held-port.test.mjs", import.meta.url), "utf8").replace(/^[ \t]*\/\/.*$/gm, "");
+  const bad = [...src.matchAll(/\b(?:sweepTargets|orphanTargets)\(([^)]*)\)/g)]
+    .filter(([, args]) => args !== "usedPorts" && args !== "[port], caseId")
+    .map((m) => `:${src.slice(0, m.index).split("\n").length}`);
+  assert.deepEqual(bad, [], `proxy-held-port sweeps with no case tag, so they can signal a sibling case's launcher: ${bad}`);
 });

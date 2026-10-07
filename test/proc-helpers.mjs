@@ -274,8 +274,19 @@ const ppidOf = (pid) => {
   catch { return 0; }
 };
 const lineage = new RegExp(`CACHE_FIX_TEST_LINEAGE=\\S*-${process.pid}(?:\\s|$)`);
-export const sweepTargets = (ports) => {
+
+// A CASE THAT RUNS BESIDE SIBLINGS passes its caseId: the lineage is the runner's, shared
+// by every case of the file, so it cannot tell this case's launcher from a sibling's that
+// was handed a number this case freed. The caseId is set in the case's own fixtures
+// (CACHE_FIX_TEST_CASE, a variable of its own: the lineage tag is matched by name and by
+// its `-<pid>` suffix elsewhere) and must match exactly, beside the lineage. The marker
+// proves the process is this case's, so no parentage clause: a detached successor of a
+// sibling is excluded and this case's own, adopted by init, is not.
+export const sweepTargets = (ports, caseId) => {
   const held = onPorts(ports);
+  if (caseId !== undefined) {
+    return byEnv(new RegExp(`^(?=[\\s\\S]*${lineage.source})(?=[\\s\\S]*CACHE_FIX_TEST_CASE=${caseId}(?:\\s|$))`), held);
+  }
   const mine = new Set(byEnv(lineage, held));
   return held.filter((pid) => mine.has(pid) || ppidOf(pid) === process.pid);
 };
@@ -284,7 +295,8 @@ export const sweepTargets = (ports) => {
 // runner's lineage. A sibling case's live tree is inside it: its launcher is our child,
 // its proxy and standby sit under that launcher.
 // ponytail: a sibling's detached successor whose parent has exited is adopted by init, as
-// ours are, and still passes; tag per case, `case<n>-<runner pid>`.
+// ours are, and still passes; the caller that runs beside siblings passes a caseId to
+// sweepTargets instead.
 export const orphanTargets = (ports) => {
   const held = sweepTargets(ports);
   const ppids = held.map((pid) => String(ppidOf(pid)));
