@@ -67,6 +67,22 @@ test("prices Claude Sonnet 5.5 as its own row, not as Claude Sonnet 5's", () => 
   assert.equal(rates["claude-sonnet-5"].input, 3);
 });
 
+test("Claude Haiku 5.5: a flat row prices to the shipped entry, the live tiered row is not read", () => {
+  // The live page tiers Haiku 5.5 (a "for prompts up to 100,000 tokens" price cell, then a nameless
+  // continuation row for the over-100K tier), so the parser sees no row and update-rates keeps the
+  // hand-written rates.json entry. A flat row (the page dropping the tier) must price identically.
+  const row = (...c) => `<tr>${c.map((x) => `<td>${x}</td>`).join("")}</tr>`;
+  const prices = ["$0.125 / MTok", "$0.20 / MTok", "$0.01 / MTok", "$0.50 / MTok"];
+  const flat = `<table>${HEAD}${row("Claude Haiku 5.5", "$0.10 / MTok", ...prices)}</table>`;
+  const tiered = `<table>${HEAD}${row("Claude Haiku 5.5", "$0.10 / MTok for prompts up to 100,000 tokens", ...prices)}` +
+    `${row("$0.50 / MTok for prompts over 100,000 tokens", "$0.625 / MTok", "$1 / MTok", "$0.05 / MTok", "$2.50 / MTok")}</table>`;
+  const shipped = JSON.parse(readFileSync(join(__dirname, "..", "tools", "rates.json"), "utf8")).models["claude-haiku-5-5"];
+  assert.equal(JSON.stringify(parsePricing(flat, AUG).rates["claude-haiku-5-5"]), JSON.stringify(shipped));
+  const { rates, errors } = parsePricing(tiered, AUG);
+  assert.equal(rates["claude-haiku-5-5"], undefined, "a tiered price is not the flat price");
+  assert.ok(!errors.some((e) => /haiku-5-5/.test(e)), JSON.stringify(errors));
+});
+
 // --- column order comes from the header, not from a fixed position ---
 
 test("the two-header-row page of 2026-09-28 parses every required model with no errors", () => {

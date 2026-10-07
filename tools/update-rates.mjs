@@ -57,6 +57,8 @@ const NAME_TO_WIRE = {
   "Claude Sonnet 4.6": ["claude-sonnet-4-6"],
   "Claude Sonnet 4.5": ["claude-sonnet-4-5-20250929"],
   "Claude Sonnet 4": ["claude-sonnet-4-20250514"],
+  // Tiered on the live page, so no row parses and rates.json's lower-tier entry is hand-written; this only fires if the tier is dropped.
+  "Claude Haiku 5.5": ["claude-haiku-5-5"],
   "Claude Haiku 4.5": ["claude-haiku-4-5", "claude-haiku-4-5-20251001"],
   "Claude Haiku 3.5": ["claude-haiku-3-5-20241022"],
   "Claude 3 Opus": ["claude-3-opus-20240229"],
