@@ -15,7 +15,7 @@ import { join, dirname } from "node:path";
 import { onPorts } from "./proc-helpers.mjs";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, hit, listeners, onPort, reapStamped, stamped, triesWithin, verdict, waitForHolder } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, hit, listeners, reapStamped, stamped, sweepTargets, triesWithin, verdict, waitForHolder } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -90,7 +90,7 @@ async function freePort() {
 
 // EVENT #348. usedPorts only ever catches a port a case HANDED OUT — the
 // "asked for an ephemeral one" case below gets its port back from the kernel
-// via CACHE_FIX_PROXY_PORT=0 and never registers it, so onPort() at the bottom
+// via CACHE_FIX_PROXY_PORT=0 and never registers it, so sweepTargets() at the bottom
 // of this file was never even asked about it, and a survivor there (measured:
 // one `bin/gap-relay.mjs` standby, ppid 1, 10s after the runner exited) went
 // unreaped. Stamped by env instead: every spawn in this tree forwards
@@ -285,8 +285,8 @@ it("holds the same default port the proxy would bind, and only when unset", () =
 // held-port tests need all three; `get` answers "ERR:<code> <body>" rather than
 // throwing so a caller can count failures instead of catching them — and the
 // body is what names which of /health's two 503 authors replied.
-async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}, tries = 3) {
-  const port = await freePort();          // a real number: the holder owns the ADVERTISED port
+async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: taken } = {}, tries = 3) {
+  const port = taken ?? await freePort();          // a real number: the holder owns the ADVERTISED port
   // Self-heal OFF by default. A proxy whose holder was SIGKILLed spawns a
   // REPLACEMENT holder about a second later, and nothing in a test tracks that
   // grandchild — measured, three leaked per run of this file, reparented to
@@ -375,8 +375,13 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}, t
       const r = await Promise.race([get(), exited.then(() => null)]);
       if (r === null) {
         await Promise.race([closed, new Promise((q) => setTimeout(q, 500))]);   // 'exit' can beat the last stderr chunk
-        // A neighbour took the number freePort() let go: take another.
-        busy = tries > 1 && /EADDRINUSE/.test(warned);
+        // A neighbour took the number freePort() let go: it is no longer ours to
+        // sweep (the after() sweep SIGHUPs whatever OURS listens on a registered
+        // port), retried or not, so it leaves the list before anything throws.
+        const inUse = /EADDRINUSE/.test(warned);
+        const i = usedPorts.indexOf(port);
+        if (inUse && i >= 0) usedPorts.splice(i, 1);
+        busy = tries > 1 && inUse;
         assert.ok(busy, `the launcher exited before the held port came up. stdout: ${said} stderr: ${warned}`);
         break;
       }
@@ -524,8 +529,55 @@ it("leaves a listener that is not ours alone and fails naming it", async () => {
   } finally {
     try { p?.kill("SIGKILL"); } catch { }
     try { fg.kill("SIGKILL"); } catch { }
-    for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+    for (const q of sweepTargets([port])) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
   }
+});
+
+// A PORT WITHHELDPORT GAVE UP ON IS NOT THE FILE'S TO SWEEP: after() SIGHUPs every
+// OURS process on a usedPorts number, no parent filter, so a number a neighbour
+// took (EADDRINUSE, retry on a fresh one) must leave the list or the neighbour's
+// launcher dies. Staged with a listener of our own on a registered number
+// (`port` is that seam): nothing is signalled, the list is what is read.
+async function withNeighbour(fn) {
+  const squatter = net.createServer();
+  await new Promise((r) => squatter.listen(0, "127.0.0.1", r));
+  try { await fn(squatter.address().port); } finally { squatter.close(); }
+}
+
+it("drops a port a neighbour took from the sweep list when it retries on another", async () => {
+  await withNeighbour(async (taken) => {
+    usedPorts.push(taken);
+    let got;
+    await withHeldPort(async ({ port }) => { got = port; }, { port: taken });
+    assert.ok(got && got !== taken, "control: the launcher came up on the number the neighbour held, so nothing was retried");
+    assert.ok(!usedPorts.includes(taken), `${taken} was given up on but is still in the list the after() sweep SIGHUPs`);
+  });
+});
+
+// On the LAST try the same EADDRINUSE is not retried but thrown, and the number
+// is the neighbour's all the same.
+it("drops a port a neighbour took from the sweep list on the last try too", async () => {
+  await withNeighbour(async (taken) => {
+    usedPorts.push(taken);
+    await assert.rejects(withHeldPort(async () => {}, { port: taken }, 1), /exited before the held port came up/);
+    assert.ok(!usedPorts.includes(taken), `${taken} was given up on but is still in the list the after() sweep SIGHUPs`);
+  });
+});
+
+// splice(indexOf(x), 1) with x absent is splice(-1, 1): the LAST registered port,
+// some other case's, silently leaves the list. Read as the start index of every
+// splice, because the list itself is being pushed to by cases running beside this.
+it("drops only the port it gave up on, never the last one registered", async () => {
+  await withNeighbour(async (taken) => {
+    const splice = usedPorts.splice;
+    const starts = [];
+    usedPorts.splice = (start, ...rest) => { starts.push(start); return splice.call(usedPorts, start, ...rest); };
+    let got;
+    try { await withHeldPort(async ({ port }) => { got = port; }, { port: taken }); }
+    finally { delete usedPorts.splice; }
+    assert.ok(got !== taken, "control: nothing was retried, so the give-up path never ran");
+    assert.deepEqual(starts.filter((s) => s < 0), [], "a splice started at -1: it dropped the last registered port");
+  });
 });
 
 it("cuts nothing on the held port while the proxy restarts", async () => {
@@ -866,7 +918,7 @@ it("gives the port up when the proxy never starts", async () => {
       // AND THE ADDRESS STILL RETIRES, which is the other half of the same
       // harm: a standby that ignored the release word would hold every port a
       // failed launcher ever touched, forever.
-      for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+      for (const q of sweepTargets([port])) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
       const gone = Date.now() + 5_000;
       while (await bound() && Date.now() < gone) await new Promise((r) => setTimeout(r, 100));
       assert.equal(await bound(), false, "the port survived SIGHUP, so it can never be reclaimed");
@@ -1348,7 +1400,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // holder's standby is armed and holds this socket, and a second armed
         // acceptor is the 60-of-125-reset shape, so the heal has to retire it.
         const census = () => {
-          const cmds = onPort(port).map(cmdOf);
+          const cmds = onPorts([port]).map(cmdOf);
           const n = (re) => cmds.filter((c) => re.test(c)).length;
           return { holders: n(/run-service/), proxies: n(/server\.mjs/), relays: n(/gap-relay/) };
         };
@@ -2552,8 +2604,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         try { p.kill("SIGKILL"); } catch { }
         // The SIGKILL arms the holder's standby, which then carries [::1]:port until
         // this file exits. listeners() asks lsof for 127.0.0.1 and cannot see it;
-        // onPort() finds it by the port in its environment.
-        for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+        // sweepTargets() finds it by the port in its environment.
+        for (const q of sweepTargets([port])) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
       }
     });
 
@@ -2993,7 +3045,7 @@ it("leaves a standby for the file-level sweep to find, on a port it never regist
 after(async () => {
   for (let i = 0; i < 6; i++) {
     let any = false;
-    for (const q of onPorts(usedPorts)) {
+    for (const q of sweepTargets(usedPorts)) {
       try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
     }
     if (!any && i) break;
@@ -3002,7 +3054,7 @@ after(async () => {
 
   // A SECOND SWEEP, BY LINEAGE RATHER THAN BY PORT. EVENT #348: the "asked for
   // an ephemeral one" case gets its bound port back from the kernel and never
-  // registers it in usedPorts, so the loop above never asks onPort() about it
+  // registers it in usedPorts, so the loop above never asks sweepTargets() about it
   // and a standby it left behind (measured: one, ppid 1, 10s after this file's
   // runner exited) was never swept. stamped() finds the whole lineage this
   // file caused by env marker instead, whatever port it landed on.

@@ -7,7 +7,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, w
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { HOP_ENV, cmdOf, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, cmdOf, sweepTargets } from "./proc-helpers.mjs";
 
 // A HOLDER THAT ADOPTS ITS PREDECESSOR'S SOCKET, started the way a handover
 // starts one: the listening socket on fd 3 and the two handover variables. It
@@ -28,7 +28,7 @@ const spawned = [], ports = new Set();
 const track = (p) => { spawned.push(p); return p; };
 process.on("exit", () => {
   for (const p of spawned) if (p.exitCode === null && p.signalCode === null) { try { p.kill("SIGKILL"); } catch { } }
-  for (const port of ports) for (const p of onPort(port)) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
+  for (const port of ports) for (const p of sweepTargets([port])) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
 });
 
 // `script` is a symlink to the launcher, so the command line the scan reads is
@@ -59,7 +59,7 @@ async function adopt(script, { env: extra = {}, alongside = [] } = {}) {
 async function reap({ holder, port, others }) {
   for (const p of [holder, ...others]) { try { p.kill("SIGKILL"); } catch { } }
   for (let i = 0; i < 3; i++) {
-    const left = onPort(port);
+    const left = sweepTargets([port]);
     if (!left.length) break;
     for (const p of left) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
     await sleep(300);

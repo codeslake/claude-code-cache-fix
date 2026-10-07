@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { HOP_ENV, armLineage, freePort, onPort, reapStamped } from "./proc-helpers.mjs";
+import { HOP_ENV, armLineage, freePort, reapStamped, sweepTargets } from "./proc-helpers.mjs";
 
 const LAUNCHER = fileURLToPath(new URL("../bin/claude-via-proxy.mjs", import.meta.url));
 const SRC = readFileSync(LAUNCHER, "utf-8");
@@ -105,12 +105,12 @@ test("a record whose port still has a listener is kept however old it is", async
 });
 
 // Port 0 is the value `port` carries before freePort() assigns it, and the
-// finally below sweeps whatever onPort() returns. The marker ours() reads is
+// finally below sweeps whatever sweepTargets() returns. The marker ours() reads is
 // CACHE_FIX_PROXY_PORT, which a proxy child legitimately carries as 0 when it
 // inherits the holder's listening fd -- so a throw above the assignment aims
 // the sweep at the operator's live proxy. Measured on this host: 7 processes,
 // one of them the deployed ~/.local/share/cache-fix-fork/proxy/server.mjs.
-test("onPort(0) selects nothing, and still selects on a real port", async () => {
+test("sweepTargets([0]) selects nothing, and still selects on a real port", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-onport0-"));
   const kids = [];
   try {
@@ -129,13 +129,13 @@ test("onPort(0) selects nothing, and still selects on a real port", async () => 
     const named = spawnStub(real);
     for (const c of [zero, named]) await new Promise((r) => setTimeout(r, 50));
 
-    // THE CONTROL. Without it an empty onPort(0) proves nothing: a host with no
+    // THE CONTROL. Without it an empty sweepTargets([0]) proves nothing: a host with no
     // proxy at all answers [] either way.
-    assert.ok(onPort(real).includes(String(named.pid)),
+    assert.ok(sweepTargets([real]).includes(String(named.pid)),
       `the instrument cannot see a stub on its own port ${real} -- the case below is vacuous`);
 
-    assert.ok(!onPort(0).includes(String(zero.pid)),
-      "onPort(0) selected a process carrying CACHE_FIX_PROXY_PORT=0; the sweep would SIGKILL the live proxy");
+    assert.ok(!sweepTargets([0]).includes(String(zero.pid)),
+      "sweepTargets([0]) selected a process carrying CACHE_FIX_PROXY_PORT=0; the sweep would SIGKILL the live proxy");
   } finally {
     for (const c of kids) { try { c.kill("SIGKILL"); } catch { /* gone */ } }
     rmSync(dir, { recursive: true, force: true });
@@ -215,7 +215,7 @@ test("a launcher that binds reaps on the way up", { timeout: 30_000 }, async () 
     // measured, one per run. Holder first, then whatever is left on the port,
     // the order proxy-held-port's own sweep documents.
     if (child) { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
-    for (const p of onPort(port)) { try { process.kill(Number(p), "SIGKILL"); } catch { /* gone */ } }
+    for (const p of sweepTargets([port])) { try { process.kill(Number(p), "SIGKILL"); } catch { /* gone */ } }
     rmSync(dir, { recursive: true, force: true });
   }
 });

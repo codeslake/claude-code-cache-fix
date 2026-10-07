@@ -294,7 +294,7 @@ test("the lineage predicate rejects code with no reap, and no half of a pairing 
 //
 // Swept over every file rather than named, because the guard above went blind
 // the moment a second file learned the same debt. Any spelling of the sweep
-// counts: onPort(), listeners(), or a raw lsof -iTCP. A file that kills a
+// counts: sweepTargets(), listeners(), or a raw lsof -iTCP. A file that kills a
 // launcher and genuinely has nothing to sweep says so with NO-STANDBY: and why
 // — proxy-probe-bounded blocks in a probe before it binds, measured at three
 // deadlines.
@@ -305,7 +305,7 @@ test("every test that SIGKILLs a launcher sweeps the port or says why not", () =
     const src = readFileSync(join(testDir, f), "utf8");
     if (!/claude-via-proxy\.mjs|launcherPath/.test(src)) continue;
     if (!/SIGKILL/.test(src)) continue;
-    if (/onPort\(|listeners\(|process\.kill\(-|reapStamped\(/.test(src)) continue;
+    if (/sweepTargets\(|listeners\(|process\.kill\(-|reapStamped\(/.test(src)) continue;
     if (/NO-STANDBY:/.test(src)) continue;
     offenders.push(f);
   }

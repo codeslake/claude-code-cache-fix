@@ -47,7 +47,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { OURS, armLineage, cmdOf, freePort as takePort, listeners, onPort, probeHealth as probe, reapStamped, waitForHolder } from "./proc-helpers.mjs";
+import { OURS, armLineage, cmdOf, freePort as takePort, listeners, probeHealth as probe, reapStamped, sweepTargets, waitForHolder } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 // EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
@@ -126,10 +126,8 @@ describe("holder handover (SIGUSR2)", () => {
   after(async () => {
     for (let i = 0; i < 6; i++) {
       let any = false;
-      for (const port of usedPorts) {
-        for (const q of onPort(port)) {
-          try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
-        }
+      for (const q of sweepTargets(usedPorts)) {
+        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
       }
       if (!any && i) break;
       await new Promise((r) => setTimeout(r, 700));
@@ -774,9 +772,9 @@ describe("holder handover (SIGUSR2)", () => {
       assert.match(reply, /^HTTP\/1\.1 200 /, `the hop's answer never came back: ${reply}`);
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
-      for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+      for (const q of sweepTargets([port])) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
       await new Promise((r) => setTimeout(r, 300));
-      for (const q of onPort(port)) { try { process.kill(Number(q), "SIGKILL"); } catch { } }
+      for (const q of sweepTargets([port])) { try { process.kill(Number(q), "SIGKILL"); } catch { } }
       await new Promise((r) => hop.close(r));
     }
   });
