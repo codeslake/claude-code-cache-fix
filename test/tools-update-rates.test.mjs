@@ -77,7 +77,9 @@ test("Claude Haiku 5.5: a flat row prices to the shipped entry, the live tiered 
   const tiered = `<table>${HEAD}${row("Claude Haiku 5.5", "$0.10 / MTok for prompts up to 100,000 tokens", ...prices)}` +
     `${row("$0.50 / MTok for prompts over 100,000 tokens", "$0.625 / MTok", "$1 / MTok", "$0.05 / MTok", "$2.50 / MTok")}</table>`;
   const shipped = JSON.parse(readFileSync(join(__dirname, "..", "tools", "rates.json"), "utf8")).models["claude-haiku-5-5"];
-  assert.equal(JSON.stringify(parsePricing(flat, AUG).rates["claude-haiku-5-5"]), JSON.stringify(shipped));
+  const want = JSON.stringify({ input: 0.1, output: 0.5, cache_read: 0.01, cache_write_5m: 0.125, cache_write_1h: 0.2 });
+  assert.equal(JSON.stringify(parsePricing(flat, AUG).rates["claude-haiku-5-5"]), want);
+  assert.equal(JSON.stringify(shipped), want, "rates.json carries the hand-written lower-tier entry");
   const { rates, errors } = parsePricing(tiered, AUG);
   assert.equal(rates["claude-haiku-5-5"], undefined, "a tiered price is not the flat price");
   assert.ok(!errors.some((e) => /haiku-5-5/.test(e)), JSON.stringify(errors));
