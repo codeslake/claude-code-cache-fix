@@ -11,11 +11,13 @@
 // defect.
 process.env.CACHE_FIX_FORWARD_PROXY = "on";
 
-const port = Number(process.argv[2]);
+// The port is taken at bind (0) and announced, never chosen beforehand: a number
+// picked by the parent is unowned until the child binds it, and a neighbour that
+// takes it makes the proxy's self-heal swallow the EADDRINUSE and exit 0.
 const { startProxy } = await import("../../proxy/server.mjs");
-await startProxy({ port, bind: "127.0.0.1", watch: false });
+const handle = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
 
-process.stdout.write(`listening ${port}\n`);
+process.stdout.write(`listening ${handle.port}\n`);
 
 process.stdin.on("data", () => {
   setImmediate(() => { throw new Error("stdio-epipe probe"); });
