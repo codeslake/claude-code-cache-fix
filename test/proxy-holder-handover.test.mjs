@@ -256,7 +256,15 @@ describe("holder handover (SIGUSR2)", () => {
       assert.ok(ok,
         "the port is served but nothing supervises it — a handover successor skipped the " +
         "self-heal, so this lineage can never put a holder back and the next crash is an outage");
-      assert.equal(await probe(port), "ok", "the port did not survive losing its holder");
+      // supervised() turns true when the new holder BINDS; until its proxy takes
+      // the port the gap relay answers 503 on purpose, so wait for the 200.
+      const until = Date.now() + 15_000;
+      let after = await probe(port);
+      while (after !== "ok" && Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 200));
+        after = await probe(port);
+      }
+      assert.equal(after, "ok", "the port did not survive losing its holder");
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
       for (let i = 0; i < 6; i++) {
