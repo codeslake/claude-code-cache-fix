@@ -112,6 +112,18 @@ it("the hop-down handover case dials the dead hop, not a number freePort() let g
     "the case's down hop is a number freePort() let go, which a neighbour can listen on");
 });
 
+// The forced-kill probe needs a port nobody listens on: a freePort() number is
+// unowned once returned, so a neighbour that takes it before the probe runs turns
+// the refusal it counts into whatever that neighbour answers.
+it("the forced-kill probe case dials the dead hop, not a number freePort() let go", () => {
+  const src = readFileSync(new URL("./proxy-held-port.test.mjs", import.meta.url), "utf8");
+  const body = /it\("hands classify only strings[\s\S]*?\} finally/.exec(src)?.[0];
+  assert.ok(body, "the forced-kill probe case moved, so this no longer guards anything");
+  assert.match(body, /new URL\(DEAD_HOP\)\.port/,
+    "the case's dead port is a number freePort() let go, which a neighbour can listen on");
+  assert.doesNotMatch(body, /freePort\(\)/, "the case still allocates its dead port through freePort()");
+});
+
 // A file's after() sweep SIGHUPs whatever sweepTargets() names on the ports it
 // registered, and a number it let go can later be a NEIGHBOUR's: that launcher
 // listens there and matches OURS. Selected here and signalled by nobody: our own
