@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DEAD_HOP, upstreamFixture } from "./proc-helpers.mjs";
 
@@ -68,4 +69,17 @@ it("the stdio-EPIPE child binds a port of its own, so a number a neighbour holds
     child.kill("SIGKILL");
     squatter.close();
   }
+});
+
+// "answers 502 when the upstream refuses" needs an upstream that REFUSES. A
+// freePort() number is unowned the moment it is returned, so a neighbour that
+// takes it turns the refusal into a 200 (measured: a listener on it, 200 not 502).
+// The address is chosen inside the case, so this reads the case for the one hop a
+// neighbour cannot be handed.
+it("the refusing-upstream case dials the dead hop, not a number freePort() let go", () => {
+  const src = readFileSync(new URL("./proxy-server.test.mjs", import.meta.url), "utf8");
+  const body = /it\("answers 502 when the upstream refuses[\s\S]*?\} finally/.exec(src)?.[0];
+  assert.ok(body, "the 502 case moved, so this no longer guards anything");
+  assert.match(body, /CACHE_FIX_PROXY_UPSTREAM = DEAD_HOP;/,
+    "the case's upstream is a number freePort() let go, which a neighbour can listen on");
 });
