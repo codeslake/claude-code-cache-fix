@@ -155,8 +155,8 @@ it("holds the same default port the proxy would bind, and only when unset", () =
 // held-port tests need all three; `get` answers "ERR:<code> <body>" rather than
 // throwing so a caller can count failures instead of catching them — and the
 // body is what names which of /health's two 503 authors replied.
-async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}, tries = 3) {
-  const port = await freePort();          // a real number: the holder owns the ADVERTISED port
+async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: taken } = {}, tries = 3) {
+  const port = taken ?? await freePort();          // a real number: the holder owns the ADVERTISED port. `taken`: one the caller already holds and registered, to stage a neighbour on it.
   // Self-heal OFF by default. A proxy whose holder was SIGKILLed spawns a
   // REPLACEMENT holder about a second later, and nothing in a test tracks that
   // grandchild — measured, three leaked per run of this file, reparented to
@@ -331,6 +331,27 @@ setInterval(() => {}, 1e9);
   } finally {
     try { victim.kill("SIGKILL"); } catch { }
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A PORT WITHHELDPORT GAVE UP ON IS NOT THE FILE'S TO SWEEP. The after() sweep
+// SIGHUPs every OURS process on a number in usedPorts with no parent filter, so a
+// number a neighbour took (the launcher exits EADDRINUSE and withHeldPort retries
+// on a fresh one) must leave the list, or the sweep kills the neighbour's live
+// launcher at the end of this file. Staged with a listener of our own on a
+// registered number: nothing is signalled, the list is what is read.
+it("drops a port a neighbour took from the sweep list when it retries on another", async () => {
+  const squatter = net.createServer();
+  await new Promise((r) => squatter.listen(0, "127.0.0.1", r));
+  const taken = squatter.address().port;
+  usedPorts.push(taken);
+  try {
+    let got;
+    await withHeldPort(async ({ port }) => { got = port; }, { port: taken });
+    assert.ok(got && got !== taken, "control: the launcher came up on the number the neighbour held, so nothing was retried");
+    assert.ok(!usedPorts.includes(taken), `${taken} was given up on but is still in the list the after() sweep SIGHUPs`);
+  } finally {
+    squatter.close();
   }
 });
 
