@@ -376,6 +376,30 @@ it("drops only the port it gave up on, never the last one registered", async () 
   });
 });
 
+// The forced-kill case's probe. classify() takes strings only: "ok", else
+// "ERR:<status> <body>" or "ERR:<code>", as every other sampler here builds.
+const healthGet = (port) => new Promise((res) => {
+  http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
+    let b = ""; r.on("data", (d) => (b += d));
+    r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
+  }).on("error", (e) => res(`ERR:${e.code}`));
+});
+
+it("hands classify only strings, and counts a refusal, from the forced-kill probe", async () => {
+  const answer = (status, body) => new Promise((res) => {
+    const srv = http.createServer((q, r) => { r.statusCode = status; r.end(body); });
+    srv.listen(0, "127.0.0.1", () => res(srv));
+  });
+  const gap = await answer(503, '{"carrying":"gap-relay"}');
+  const bad = await answer(502, "bad gateway");
+  const dead = await freePort();    // allocated, nothing listens: ECONNREFUSED
+  try {
+    assert.equal(await healthGet(dead).then(classify), OUTAGE.REFUSED, "an unowned port is a refusal");
+    assert.equal(await healthGet(gap.address().port).then(classify), null, "a carrying gap is not an outage");
+    assert.equal(await healthGet(bad.address().port).then(classify), OUTAGE.RESET, "a 502 is a cut");
+  } finally { gap.close(); bad.close(); }
+});
+
 it("cuts nothing on the held port while the proxy restarts", async () => {
   await withHeldPort(async ({ get, killProxy }) => {
     killProxy();
@@ -1315,14 +1339,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         'if (fd === null) { process.stderr.write("no LISTEN_FDS\\n"); process.exit(1); }\n' +
         's.listen({ fd }, () => process.stdout.write("proxy listening on 127.0.0.1:0\\n"));\n',
         async ({ launcher, port }) => {
-          const get = () => new Promise((res) => {
-            http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
-              r.resume(); r.on("end", () => res(r.statusCode));
-            }).on("error", (e) => res(e.code));
-          });
+          const get = () => healthGet(port);
           const up = Date.now() + 10_000;
-          while (Date.now() < up && (await get()) !== 200) await new Promise((r) => setTimeout(r, 50));
-          assert.equal(await get(), 200, "the stand-in never came up behind the holder");
+          while (Date.now() < up && (await get()) !== "ok") await new Promise((r) => setTimeout(r, 50));
+          assert.equal(await get(), "ok", "the stand-in never came up behind the holder");
 
           const seen = [];
           const hammer = (async () => {
@@ -1356,7 +1376,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           }, 250);
           await hammer;
 
-          const cut = seen.filter((c) => c !== 200);
+          // A carrying gap (classify() null) is not a cut.
+          const cut = seen.filter((c) => c !== "ok" && classify(c));
           // A REFUSAL means the address had no owner, and a session that baked
           // HTTPS_PROXY at exec is stranded. The holder exists to make that
           // rare — but on a FORCED kill it cannot make it zero, and asserting
