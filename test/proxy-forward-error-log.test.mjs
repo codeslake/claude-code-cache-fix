@@ -18,6 +18,9 @@ const SESSION_ID = "cse_01ABCDEFGHIJKLMNOPQRSTUV";
 // and connect gets ECONNREFUSED. A bind-0-then-close port can be taken by a
 // neighbouring test file, whose listener then answers or resets instead.
 const DEAD_PORT = 1;
+// Foreign target must not share the upstream's authority: that origin is rewritten to
+// origin-form before routing, so the absolute-form scrub would never run.
+const FOREIGN_PORT = 2;
 
 function clientRequest(port, method, path, body) {
   return new Promise((resolve, reject) => {
@@ -99,7 +102,7 @@ describe("upstream connection failures are reported on stderr, not only debugLog
     const cap = captureStderr();
     let res;
     try {
-      res = await clientRequest(handle.port, "GET", `http://alice:s3cret@127.0.0.1:${DEAD_PORT}/v1/code/sessions/${SESSION_ID}/x?token=T`);
+      res = await clientRequest(handle.port, "GET", `http://alice:s3cret@127.0.0.1:${FOREIGN_PORT}/v1/code/sessions/${SESSION_ID}/x?token=T`);
     } finally {
       cap.restore();
     }
