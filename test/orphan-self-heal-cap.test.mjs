@@ -23,11 +23,12 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { HOP_ENV, armLineage, freePort, reapStamped } from "./proc-helpers.mjs";
+import { HOP_ENV, armLineage, cmdOf, freePort, reapStamped } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -100,4 +101,71 @@ it("announces a self-heal respawn at most once per orphan", async () => {
     if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
     await reapStamped(lineage);
   }
+});
+
+// ONE HOLDER DEATH, ONE RESPAWN, EVEN MID-DEPLOY. The deploy watcher SIGTERMs the
+// proxy child directly (bin/claude-via-proxy.mjs, not through forward()), so the
+// predecessor DRAINS under a live holder. A held request keeps the drain open
+// past the 50ms tick. `freeze` SIGSTOPs the holder first, so it never reads the
+// release line and never places a successor. Returns the respawns announced.
+async function holderDiesMidDeploy({ freeze }) {
+  const port = await freePort();
+  const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
+                CACHE_FIX_SELF_HEAL_MS: "50", CACHE_FIX_TEST_LINEAGE: lineage };
+  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_SELF_HEAL", "CACHE_FIX_WATCH_DEPLOY_MS"])
+    delete env[k];
+  const holder = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  holder.stderr.on("data", (d) => { stderr += d; });
+  const proxyKids = () => {
+    try {
+      return execFileSync("pgrep", ["-P", String(holder.pid)]).toString().trim().split("\n")
+        .map(Number).filter((p) => /server\.mjs/.test(cmdOf(p)));
+    } catch { return []; }
+  };
+  let kid = 0, held;
+  try {
+    const up = Date.now() + 15_000;
+    while (Date.now() < up) {
+      const body = await get(port);
+      if (!body.startsWith("ERR:")) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    [kid] = proxyKids();
+    assert.ok(kid > 1, "the holder never spawned a proxy, so this measures nothing");
+
+    // An unfinished request body: accepted, never answered, so the drain stays open.
+    held = net.connect({ host: "127.0.0.1", port });
+    await new Promise((r) => held.on("connect", r));
+    held.on("error", () => {});
+    held.write("POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n{");
+    await new Promise((r) => setTimeout(r, 200));
+
+    if (freeze) holder.kill("SIGSTOP");
+    process.kill(kid, "SIGTERM");   // what the deploy watcher does
+    if (!freeze) {
+      const until = Date.now() + 5_000;
+      while (!proxyKids().some((p) => p !== kid) && Date.now() < until) await new Promise((r) => setTimeout(r, 20));
+      assert.ok(proxyKids().some((p) => p !== kid), "the holder never started a successor, so this measures nothing");
+    }
+    holder.kill("SIGKILL");
+    await new Promise((r) => setTimeout(r, 3_000));
+    return { n: (stderr.match(/holder died; started a new one/g) || []).length, stderr };
+  } finally {
+    held?.destroy();
+    try { holder.kill("SIGKILL"); } catch {}
+    if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
+    await reapStamped(lineage);
+  }
+}
+
+it("announces one self-heal respawn when the holder dies with a successor up", async () => {
+  const { n, stderr } = await holderDiesMidDeploy({ freeze: false });
+  assert.equal(n, 1, `expected one announcement (the successor's), saw ${n}: the draining ` +
+    `predecessor also resurrected a holder\nstderr:\n${stderr}`);
+});
+
+it("still heals when the holder dies with no successor placed yet", async () => {
+  const { n, stderr } = await holderDiesMidDeploy({ freeze: true });
+  assert.equal(n, 1, `expected the draining predecessor, the only orphan, to heal; saw ${n}\nstderr:\n${stderr}`);
 });

@@ -1017,6 +1017,9 @@ let releasingPort = false;
 // the port on" and "the supervisor is stopping us", and those want opposite
 // budgets.
 let handoverRelease = false;
+// Draining under a LIVE holder: it places our successor, which heals for itself,
+// so once that is serving we must not heal too (one death, two respawns).
+let drainingUnderHolder = false;
 
 function inheritedFd() {
   if (!(HANDED_DOWN.fds >= 1)) return null;
@@ -1703,6 +1706,8 @@ function exitWithParent(getActive) {
     // at its old indentation so the lines it wraps stay as they were.
     setImmediate(() => {
     if (releasingPort) return;
+    // Before our successor is up we are the only orphan and carry on.
+    if (drainingUnderHolder && successorServing(advertised)) { clearInterval(healTick); return; }
     // The holder is gone and every session on this box has HTTPS_PROXY baked at
     // exec — they cannot be re-pointed, so the address must get an owner back.
     // Measured on <linux-host>: the holder died, nothing revived it, and every session
@@ -1935,6 +1940,7 @@ if (invokedAsScript) {
     // next child on the descriptor it never let go of.
     const heldByLiveHolder = !!process.env.CACHE_FIX_HELD_BY
       && process.env.CACHE_FIX_HELD_BY === String(process.ppid);
+    drainingUnderHolder = heldByLiveHolder;
     const askForSuccessor = active.inheritedSocket && !releasing && !heldByLiveHolder;
     // WHETHER ONE ACTUALLY STARTED, which is not the same question as whether we
     // wanted one. The announcement below used to be keyed on the WANT, so a
