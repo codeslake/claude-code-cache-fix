@@ -316,7 +316,6 @@ export async function writeRecord(record, path) {
 // --- Retention ---
 
 const DAY_MS = 86_400_000;
-const FLUSH_CHARS = 1 << 20;
 let _lastPruneMs = 0;
 
 // Read at prune time, like logPath(). Any value that is not a positive integer
@@ -356,13 +355,15 @@ function pidAlive(pid) {
 
 // Append the rows of `setAside` that are inside the window back to `path`, then
 // delete it. A row that cannot be dated is kept. shortcut: a crash part-way
-// re-copies the whole file on recovery, so rows can repeat but never get lost.
+// re-copies the whole file on recovery, so rows can repeat but never get lost;
+// and a row a writer appended meanwhile now precedes the folded-back older ones,
+// so the first-row skip can defer the next prune by up to one retention window.
 async function foldBack(setAside, path, cutoff) {
   let buf = "";
   for await (const line of linesOf(setAside)) {
     if (rowMs(line) < cutoff) continue;
     buf += line + "\n";
-    if (buf.length >= FLUSH_CHARS) {
+    if (buf.length >= 1 << 20) {
       await appendFile(path, buf);
       buf = "";
     }
