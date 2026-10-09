@@ -355,9 +355,7 @@ function pidAlive(pid) {
 
 // Append the rows of `setAside` that are inside the window back to `path`, then
 // delete it. A row that cannot be dated is kept. shortcut: a crash part-way
-// re-copies the whole file on recovery, so rows can repeat but never get lost;
-// and a row a writer appended meanwhile now precedes the folded-back older ones,
-// so the first-row skip can defer the next prune by up to one retention window.
+// re-copies the whole file on recovery, so rows can repeat but never get lost.
 async function foldBack(setAside, path, cutoff) {
   let buf = "";
   for await (const line of linesOf(setAside)) {
@@ -389,13 +387,17 @@ export async function pruneUsageLog(path, nowMs, days, afterRename) {
     await foldBack(join(dir, name), path, cutoff);
   }
 
-  // Oldest row first: if it is inside the window there is nothing to drop.
-  let first = "";
+  // Rows appended during a prune precede the folded-back older ones, so test
+  // the oldest of the first 1000. shortcut: a race longer than 1000 rows only
+  // delays trimming, never loses rows.
+  let oldest = Infinity;
+  let n = 0;
   for await (const line of linesOf(path)) {
-    first = line;
-    break;
+    const ms = rowMs(line);
+    if (ms < oldest) oldest = ms; // false for NaN: undatable lines do not count
+    if (++n === 1000) break;
   }
-  if (rowMs(first) >= cutoff) return;
+  if (oldest >= cutoff) return;
 
   const setAside = `${path}.prune-${process.pid}`;
   await rename(path, setAside);

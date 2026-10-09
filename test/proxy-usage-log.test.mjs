@@ -1174,14 +1174,27 @@ test("retention: a row appended while a prune is in progress survives", async ()
   });
 });
 
-test("retention: first row inside the window leaves the file untouched", async () => {
+test("retention: the first 1000 rows inside the window leave the file untouched", async () => {
   await withLog(async (mod, path) => {
     const now = Date.now();
-    for (const d of [1, 40]) await writeRecord({ v: 1, ts: isoAgo(now, d) }, path);
+    const rows = Array.from({ length: 999 }, (_, i) => JSON.stringify({ v: 1, ts: isoAgo(now, i / 1000) }));
+    rows.unshift("not json {"); // an undatable line in the sample does not trigger a prune
+    rows.push(JSON.stringify({ v: 1, ts: isoAgo(now, 40) }));
+    await writeFile(path, rows.join("\n") + "\n");
     const before = { ino: (await stat(path)).ino, text: await readFile(path, "utf8") };
     await mod.pruneUsageLog(path, now, 30);
     assert.equal((await stat(path)).ino, before.ino);
-    assert.equal(await readFile(path, "utf8"), before.text, "the 40d row below the first row is not examined");
+    assert.equal(await readFile(path, "utf8"), before.text, "row 1001 is not examined");
+  });
+});
+
+test("retention: a fresh first row does not hide an older row behind it", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    // The shape a prune race leaves: rows appended meanwhile precede the folded-back older ones.
+    for (const d of [0, 40, 1]) await writeRecord({ v: 1, ts: isoAgo(now, d) }, path);
+    await mod.pruneUsageLog(path, now, 30);
+    assert.deepEqual(await tsOf(path), [isoAgo(now, 0), isoAgo(now, 1)]);
   });
 });
 
