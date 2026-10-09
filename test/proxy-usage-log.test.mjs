@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -1132,4 +1133,125 @@ test("extended gate-on + onResponseStart never fired → duration_ms OMITTED (ho
     delete process.env.CACHE_FIX_USAGE_LOG_EXTENDED;
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// --- Retention: pruneUsageLog / CACHE_FIX_USAGE_LOG_RETENTION_DAYS ---
+
+const DAY = 86_400_000;
+const isoAgo = (now, days) => new Date(now - days * DAY).toISOString();
+const rowsOf = async (path) => (await readFile(path, "utf8")).split("\n").filter(Boolean);
+const tsOf = async (path) => (await rowsOf(path)).map((l) => JSON.parse(l).ts);
+
+async function withLog(fn) {
+  const mod = await freshExt();
+  const dir = await newTmp();
+  const path = join(dir, "usage.jsonl");
+  process.env.CACHE_FIX_USAGE_LOG = path;
+  try {
+    await fn(mod, path);
+  } finally {
+    delete process.env.CACHE_FIX_USAGE_LOG;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("retention: rows older than the window are dropped, rows inside it stay", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    for (const d of [40, 31, 1, 0]) await writeRecord({ v: 1, ts: isoAgo(now, d) }, path);
+    await mod.pruneUsageLog(path, now, 30);
+    assert.deepEqual(await tsOf(path), [isoAgo(now, 1), isoAgo(now, 0)]);
+  });
+});
+
+test("retention: a row appended while a prune is in progress survives", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    for (const d of [40, 1]) await writeRecord({ v: 1, ts: isoAgo(now, d) }, path);
+    const during = { v: 1, ts: isoAgo(now, 0) };
+    await mod.pruneUsageLog(path, now, 30, () => writeRecord(during, path));
+    assert.deepEqual((await tsOf(path)).sort(), [isoAgo(now, 1), during.ts].sort());
+  });
+});
+
+test("retention: first row inside the window leaves the file untouched", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    for (const d of [1, 40]) await writeRecord({ v: 1, ts: isoAgo(now, d) }, path);
+    const before = { ino: (await stat(path)).ino, text: await readFile(path, "utf8") };
+    await mod.pruneUsageLog(path, now, 30);
+    assert.equal((await stat(path)).ino, before.ino);
+    assert.equal(await readFile(path, "utf8"), before.text, "the 40d row below the first row is not examined");
+  });
+});
+
+test("retention: CACHE_FIX_USAGE_LOG_RETENTION_DAYS parses like the session-mirror one", async () => {
+  const mod = await freshExt();
+  try {
+    for (const [raw, want] of [[undefined, 30], ["abc", 30], ["0", 30], ["-5", 30], ["", 30], ["90", 90]]) {
+      if (raw === undefined) delete process.env.CACHE_FIX_USAGE_LOG_RETENTION_DAYS;
+      else process.env.CACHE_FIX_USAGE_LOG_RETENTION_DAYS = raw;
+      assert.equal(mod.retentionDays(), want, `raw=${raw}`);
+    }
+  } finally {
+    delete process.env.CACHE_FIX_USAGE_LOG_RETENTION_DAYS;
+  }
+});
+
+test("retention: lines that do not parse or carry no ts are kept", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    const lines = [
+      JSON.stringify({ v: 1, ts: isoAgo(now, 40) }),
+      "not json {",
+      JSON.stringify({ v: 1, note: "no ts" }),
+      "null",
+      JSON.stringify({ v: 1, ts: isoAgo(now, 2) }),
+    ];
+    await writeFile(path, lines.join("\n") + "\n");
+    await mod.pruneUsageLog(path, now, 30);
+    assert.deepEqual(await rowsOf(path), lines.slice(1));
+  });
+});
+
+test("retention: a leftover set-aside file of a dead pid is folded back", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    const leftover = `${path}.prune-2147483647`;
+    await writeFile(leftover, [40, 3].map((d) => JSON.stringify({ v: 1, ts: isoAgo(now, d) })).join("\n") + "\n");
+    await writeRecord({ v: 1, ts: isoAgo(now, 0) }, path);
+    await mod.pruneUsageLog(path, now, 30);
+    assert.deepEqual((await tsOf(path)).sort(), [isoAgo(now, 3), isoAgo(now, 0)].sort());
+    await assert.rejects(stat(leftover), { code: "ENOENT" });
+  });
+});
+
+test("retention: onStreamEvent prunes once per process, without awaiting it", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    const seed = () => writeFile(path, JSON.stringify({ v: 1, ts: isoAgo(now, 40) }) + "\n");
+    const emit = async () => {
+      const ctx = { meta: {}, event: mkMessageStart(), telemetry: {}, responseHeaders: mkHeaders() };
+      await mod.default.onStreamEvent(ctx);
+      ctx.event = { type: "message_delta", usage: { output_tokens: 1 } };
+      await mod.default.onStreamEvent(ctx);
+    };
+    // Sync read: no I/O callback can run between onStreamEvent returning and this read.
+    const state = () => {
+      try {
+        return readFileSync(path, "utf8").includes(isoAgo(now, 40)) ? "old" : "pruned";
+      } catch {
+        return "busy"; // set aside, not yet written back
+      }
+    };
+    await seed();
+    await emit();
+    assert.equal(state(), "old", "the prune is still pending when onStreamEvent returns");
+    for (let i = 0; i < 100 && state() !== "pruned"; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(state(), "pruned", "the first write triggers a prune");
+    await seed();
+    await emit();
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(state(), "old", "a second write inside 24 h does not prune again");
+  });
 });

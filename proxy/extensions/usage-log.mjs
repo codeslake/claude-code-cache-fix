@@ -37,6 +37,10 @@
 // CACHE_FIX_USAGE_LOG=<path> overrides the destination path only — it is NOT
 // an enable flag and never has been.
 //
+// Retention: rows older than CACHE_FIX_USAGE_LOG_RETENTION_DAYS (whole days,
+// default 30) are pruned from the file, at most once per 24 h per proxy
+// process. See pruneUsageLog.
+//
 // The `request_id` field (sourced from the upstream `request-id` response
 // header) is emitted by default in v4.2.0. v4.1.0 shipped it default-off
 // via CACHE_FIX_USAGE_LOG_REQID=on while claude-meter <v0.7.0 still
@@ -51,8 +55,10 @@
 //
 // See `docs/directives/proxy-claude-meter-compat.md` for full design.
 
-import { appendFile, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { appendFile, mkdir, readdir, rename, unlink } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
+import { basename, dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import { claudeHome } from "../claude-home.mjs";
 
@@ -307,6 +313,95 @@ export async function writeRecord(record, path) {
   await appendFile(path, JSON.stringify(record) + "\n");
 }
 
+// --- Retention ---
+
+const DAY_MS = 86_400_000;
+const FLUSH_CHARS = 1 << 20;
+let _lastPruneMs = 0;
+
+// Read at prune time, like logPath(). Any value that is not a positive integer
+// gives the default (same parse as CACHE_FIX_SESSION_MIRROR_RETENTION_DAYS).
+export function retentionDays() {
+  const raw = parseInt(process.env.CACHE_FIX_USAGE_LOG_RETENTION_DAYS, 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 30;
+}
+
+// The file can be GBs: stream it, never readFile it.
+async function* linesOf(path) {
+  const input = createReadStream(path);
+  try {
+    yield* createInterface({ input, crlfDelay: Infinity });
+  } finally {
+    input.destroy();
+  }
+}
+
+// NaN when the line does not parse or carries no usable ts.
+function rowMs(line) {
+  try {
+    return Date.parse(JSON.parse(line).ts);
+  } catch {
+    return NaN;
+  }
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM"; // alive, owned by another user
+  }
+}
+
+// Append the rows of `setAside` that are inside the window back to `path`, then
+// delete it. A row that cannot be dated is kept. shortcut: a crash part-way
+// re-copies the whole file on recovery, so rows can repeat but never get lost.
+async function foldBack(setAside, path, cutoff) {
+  let buf = "";
+  for await (const line of linesOf(setAside)) {
+    if (rowMs(line) < cutoff) continue;
+    buf += line + "\n";
+    if (buf.length >= FLUSH_CHARS) {
+      await appendFile(path, buf);
+      buf = "";
+    }
+  }
+  if (buf) await appendFile(path, buf);
+  await unlink(setAside);
+}
+
+// Drop rows older than `days` from the usage log. No lock exists and, during a
+// handover drain, two proxy processes append to the same path, so the live file
+// is renamed away (atomic) instead of rewritten in place: both writers' next
+// appendFile creates a fresh file and nothing appended meanwhile is lost.
+// `afterRename` is a test seam that runs between the rename and the copy-back.
+export async function pruneUsageLog(path, nowMs, days, afterRename) {
+  const cutoff = nowMs - days * DAY_MS;
+  const dir = dirname(path);
+  const prefix = `${basename(path)}.prune-`;
+  // Crash recovery: finish a set-aside file whose process is gone. Our own pid
+  // counts as gone (a restarted process can reuse it, and a prune never overlaps itself).
+  for (const name of await readdir(dir)) {
+    const pid = name.startsWith(prefix) ? name.slice(prefix.length) : "";
+    if (!/^\d+$/.test(pid) || (+pid !== process.pid && pidAlive(+pid))) continue;
+    await foldBack(join(dir, name), path, cutoff);
+  }
+
+  // Oldest row first: if it is inside the window there is nothing to drop.
+  let first = "";
+  for await (const line of linesOf(path)) {
+    first = line;
+    break;
+  }
+  if (rowMs(first) >= cutoff) return;
+
+  const setAside = `${path}.prune-${process.pid}`;
+  await rename(path, setAside);
+  await afterRename?.();
+  await foldBack(setAside, path, cutoff);
+}
+
 // Test helper: reset module-scope delta state.
 export function _resetDeltaStateForTest() {
   _lastQ5h = null;
@@ -398,6 +493,14 @@ export default {
       _lastQ7d = quota.q7d;
 
       await appendJsonl(record, logPath());
+
+      // Not awaited: the pipeline awaits this hook, and pruning a multi-GB file
+      // must not hold up the response stream.
+      const nowMs = Date.now();
+      if (nowMs - _lastPruneMs >= DAY_MS) {
+        _lastPruneMs = nowMs;
+        pruneUsageLog(logPath(), nowMs, retentionDays()).catch(() => {});
+      }
     } catch {
       // Fail-open: never throw to the pipeline.
     }
