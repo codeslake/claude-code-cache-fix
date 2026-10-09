@@ -1,6 +1,7 @@
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import fsp, { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -1263,16 +1264,28 @@ test("retention: a leftover set-aside file of a dead pid is folded back", async 
   });
 });
 
-test("retention: a leftover set-aside file of a live pid, our own included, is left alone", async () => {
+test("retention: a leftover set-aside file of another live pid is left alone", async () => {
   await withLog(async (mod, path) => {
     const now = Date.now();
-    const leftover = `${path}.prune-${process.pid}-0badc0de`;
+    const leftover = `${path}.prune-${process.ppid}-0badc0de`; // our parent: alive, not us
     const text = JSON.stringify({ v: 1, ts: isoAgo(now, 3) }) + "\n";
     await writeFile(leftover, text);
     await writeRecord({ v: 1, ts: isoAgo(now, 0) }, path);
     await mod.pruneUsageLog(path, now, 30);
     assert.equal(await readFile(leftover, "utf8"), text);
     assert.deepEqual(await tsOf(path), [isoAgo(now, 0)]);
+  });
+});
+
+test("retention: a leftover set-aside file of our own pid that no prune here is folding is folded back", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    const leftover = `${path}.prune-${process.pid}-0badc0de`; // a restarted container is pid 1 again
+    await writeFile(leftover, [40, 3].map((d) => JSON.stringify({ v: 1, ts: isoAgo(now, d) })).join("\n") + "\n");
+    await writeRecord({ v: 1, ts: isoAgo(now, 0) }, path);
+    await mod.pruneUsageLog(path, now, 30);
+    assert.deepEqual((await tsOf(path)).sort(), [isoAgo(now, 3), isoAgo(now, 0)].sort());
+    await assert.rejects(stat(leftover), { code: "ENOENT" });
   });
 });
 
@@ -1300,6 +1313,42 @@ test("retention: an error while folding back keeps the set-aside file", async ()
     const kept = (await readdir(dirname(path))).filter((n) => n.startsWith("usage.jsonl.prune-"));
     assert.equal(kept.length, 1);
     assert.equal(await readFile(join(dirname(path), kept[0]), "utf8"), text);
+  });
+});
+
+test("retention: the next prune of the same process recovers a fold-back that failed part-way", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    await writeFile(path, [40, 3].map((d) => JSON.stringify({ v: 1, ts: isoAgo(now, d) })).join("\n") + "\n");
+    await assert.rejects(mod.pruneUsageLog(path, now, 30, () => mkdir(path)), { code: "EISDIR" });
+    await rm(path, { recursive: true }); // the cause is gone
+    await mod.pruneUsageLog(path, now, 30);
+    assert.deepEqual(await tsOf(path), [isoAgo(now, 3)]);
+    assert.deepEqual((await readdir(dirname(path))).filter((n) => n.startsWith("usage.jsonl.prune-")), []);
+  });
+});
+
+test("retention: a fold-back flushes before a line would cross the bound and writes a big line alone", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    const small = JSON.stringify({ v: 1, ts: isoAgo(now, 1), pad: "x".repeat(900) });
+    const big = "y".repeat(300_000); // undatable, so kept
+    await writeFile(path, [JSON.stringify({ v: 1, ts: isoAgo(now, 40) }), ...Array(30).fill(small), big, small].join("\n") + "\n");
+    const writes = [];
+    const real = fsp.appendFile;
+    mock.method(fsp, "appendFile", (p, data, ...rest) => {
+      if (p === path) writes.push(data);
+      return real(p, data, ...rest);
+    });
+    syncBuiltinESMExports();
+    try {
+      await mod.pruneUsageLog(path, now, 30);
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+    assert.ok(writes.length >= 3, `fold-back wrote ${writes.length} times`);
+    for (const w of writes) assert.ok(w.length <= 1 << 16 || w === big + "\n", `a ${w.length}-unit write mixes the big line with others`);
   });
 });
 

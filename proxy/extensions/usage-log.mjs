@@ -344,6 +344,20 @@ function rowMs(line) {
   }
 }
 
+// Names of the set-asides this process is folding back right now. On globalThis
+// so a hot-reloaded module instance (same process, fresh module scope) sees it;
+// a restart clears it, which is what makes a same-pid leftover an orphan.
+const folding = (globalThis[Symbol.for("cache-fix.usage-log.pruning")] ??= new Set());
+
+async function whileFolding(name, fn) {
+  folding.add(name);
+  try {
+    await fn();
+  } finally {
+    folding.delete(name);
+  }
+}
+
 function pidAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -360,14 +374,17 @@ async function foldBack(setAside, path, cutoff) {
   let buf = "";
   for await (const line of linesOf(setAside)) {
     if (rowMs(line) < cutoff) continue;
-    buf += line + "\n";
+    const row = line + "\n";
     // One flush must be one write(): fs/promises splits a buffer past 512 KiB into
     // chunks, and a concurrent append could land between them and splice a row.
-    // 64 Ki UTF-16 units are at most 3 bytes each in UTF-8, so under 512 KiB.
-    if (buf.length >= 1 << 16) {
+    // Flush before a row would take the buffer past 64 Ki UTF-16 units (at most 3
+    // bytes each in UTF-8, so under 512 KiB); a bigger row goes out alone.
+    // shortcut: a single line over 512 KiB still splits; no real row nears that.
+    if (buf && buf.length + row.length > 1 << 16) {
       await appendFile(path, buf);
       buf = "";
     }
+    buf += row;
   }
   if (buf) await appendFile(path, buf);
   await unlink(setAside);
@@ -382,13 +399,14 @@ export async function pruneUsageLog(path, nowMs, days, afterRename) {
   const cutoff = nowMs - days * DAY_MS;
   const dir = dirname(path);
   const prefix = `${basename(path)}.prune-`;
-  // Crash recovery: finish a set-aside file whose process is gone. A live pid,
-  // our own included, may be mid-prune (a hot-reloaded instance shares it), so a
-  // same-pid leftover is folded back only after a restart.
+  // Crash recovery: finish a set-aside file nobody is working on. One this process
+  // is folding back (a hot-reloaded instance shares it) or one of another live
+  // pid is skipped; a dead pid's, or our own pid's after a failed fold-back or a
+  // restart (a container's node is pid 1 again), is folded back.
   for (const name of await readdir(dir)) {
     const pid = name.startsWith(prefix) && /^(\d+)-[0-9a-f]+$/.exec(name.slice(prefix.length))?.[1];
-    if (!pid || pidAlive(+pid)) continue;
-    await foldBack(join(dir, name), path, cutoff);
+    if (!pid || folding.has(name) || (+pid !== process.pid && pidAlive(+pid))) continue;
+    await whileFolding(name, () => foldBack(join(dir, name), path, cutoff));
   }
 
   // Rows appended during a prune precede the folded-back older ones, so test
@@ -403,10 +421,13 @@ export async function pruneUsageLog(path, nowMs, days, afterRename) {
   }
   if (oldest >= cutoff) return;
 
-  const setAside = `${path}.prune-${process.pid}-${randomBytes(4).toString("hex")}`;
-  await rename(path, setAside);
-  await afterRename?.();
-  await foldBack(setAside, path, cutoff);
+  const name = `${prefix}${process.pid}-${randomBytes(4).toString("hex")}`;
+  const setAside = join(dir, name);
+  await whileFolding(name, async () => {
+    await rename(path, setAside);
+    await afterRename?.();
+    await foldBack(setAside, path, cutoff);
+  });
 }
 
 // Test helper: reset module-scope delta state.
