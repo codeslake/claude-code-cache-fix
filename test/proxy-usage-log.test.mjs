@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import ext, {
   generateSid,
@@ -1211,6 +1211,30 @@ test("retention: CACHE_FIX_USAGE_LOG_RETENTION_DAYS parses like the session-mirr
   }
 });
 
+test("retention: a row appended during a multi-MiB fold-back is not spliced into a folded row", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    const pad = "x".repeat(1000);
+    const rows = Array.from({ length: 8000 }, (_, n) => JSON.stringify({ v: 1, ts: isoAgo(now, 1), n, pad }));
+    await writeFile(path, JSON.stringify({ v: 1, ts: isoAgo(now, 40), pad }) + "\n" + rows.join("\n") + "\n");
+    // A writer that never pauses: some append lands between two write() calls of a fold-back flush.
+    let appended = 0;
+    let stop = false;
+    let appender;
+    await mod.pruneUsageLog(path, now, 30, () => {
+      appender = (async () => {
+        while (!stop) await writeRecord({ v: 1, ts: isoAgo(now, 0), a: appended++ }, path);
+      })();
+    });
+    stop = true;
+    await appender;
+    const parsed = (await rowsOf(path)).map((l) => JSON.parse(l)); // a spliced line throws here
+    assert.deepEqual(parsed.filter((r) => "n" in r).map((r) => r.n).sort((a, b) => a - b), rows.map((_, n) => n));
+    assert.equal(parsed.filter((r) => "a" in r).length, appended);
+    assert.ok(appended > 0);
+  });
+});
+
 test("retention: lines that do not parse or carry no ts are kept", async () => {
   await withLog(async (mod, path) => {
     const now = Date.now();
@@ -1230,12 +1254,52 @@ test("retention: lines that do not parse or carry no ts are kept", async () => {
 test("retention: a leftover set-aside file of a dead pid is folded back", async () => {
   await withLog(async (mod, path) => {
     const now = Date.now();
-    const leftover = `${path}.prune-2147483647`;
+    const leftover = `${path}.prune-2147483647-0badc0de`;
     await writeFile(leftover, [40, 3].map((d) => JSON.stringify({ v: 1, ts: isoAgo(now, d) })).join("\n") + "\n");
     await writeRecord({ v: 1, ts: isoAgo(now, 0) }, path);
     await mod.pruneUsageLog(path, now, 30);
     assert.deepEqual((await tsOf(path)).sort(), [isoAgo(now, 3), isoAgo(now, 0)].sort());
     await assert.rejects(stat(leftover), { code: "ENOENT" });
+  });
+});
+
+test("retention: a leftover set-aside file of a live pid, our own included, is left alone", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    const leftover = `${path}.prune-${process.pid}-0badc0de`;
+    const text = JSON.stringify({ v: 1, ts: isoAgo(now, 3) }) + "\n";
+    await writeFile(leftover, text);
+    await writeRecord({ v: 1, ts: isoAgo(now, 0) }, path);
+    await mod.pruneUsageLog(path, now, 30);
+    assert.equal(await readFile(leftover, "utf8"), text);
+    assert.deepEqual(await tsOf(path), [isoAgo(now, 0)]);
+  });
+});
+
+test("retention: a prune started inside another prune of the same pid neither overwrites nor folds back its set-aside", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    const keep = { v: 1, ts: isoAgo(now, 1) };
+    for (const r of [{ v: 1, ts: isoAgo(now, 40) }, keep]) await writeRecord(r, path);
+    // The shape of a hot reload: a second module instance, same pid, throttle reset.
+    await mod.pruneUsageLog(path, now, 30, async () => {
+      await writeRecord({ v: 1, ts: isoAgo(now, 40) }, path);
+      await mod.pruneUsageLog(path, now, 30);
+    });
+    assert.deepEqual(await tsOf(path), [keep.ts]);
+  });
+});
+
+test("retention: an error while folding back keeps the set-aside file", async () => {
+  await withLog(async (mod, path) => {
+    const now = Date.now();
+    const text = [40, 3].map((d) => JSON.stringify({ v: 1, ts: isoAgo(now, d) })).join("\n") + "\n";
+    await writeFile(path, text);
+    // A directory where the log should be: the append of the surviving row fails.
+    await assert.rejects(mod.pruneUsageLog(path, now, 30, () => mkdir(path)), { code: "EISDIR" });
+    const kept = (await readdir(dirname(path))).filter((n) => n.startsWith("usage.jsonl.prune-"));
+    assert.equal(kept.length, 1);
+    assert.equal(await readFile(join(dirname(path), kept[0]), "utf8"), text);
   });
 });
 

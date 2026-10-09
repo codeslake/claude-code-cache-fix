@@ -59,7 +59,7 @@ import { appendFile, mkdir, readdir, rename, unlink } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { basename, dirname, join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { claudeHome } from "../claude-home.mjs";
 
 // Resolve live per call so CACHE_FIX_USAGE_LOG and CLAUDE_CONFIG_DIR (via
@@ -361,7 +361,10 @@ async function foldBack(setAside, path, cutoff) {
   for await (const line of linesOf(setAside)) {
     if (rowMs(line) < cutoff) continue;
     buf += line + "\n";
-    if (buf.length >= 1 << 20) {
+    // One flush must be one write(): fs/promises splits a buffer past 512 KiB into
+    // chunks, and a concurrent append could land between them and splice a row.
+    // 64 Ki UTF-16 units are at most 3 bytes each in UTF-8, so under 512 KiB.
+    if (buf.length >= 1 << 16) {
       await appendFile(path, buf);
       buf = "";
     }
@@ -379,11 +382,12 @@ export async function pruneUsageLog(path, nowMs, days, afterRename) {
   const cutoff = nowMs - days * DAY_MS;
   const dir = dirname(path);
   const prefix = `${basename(path)}.prune-`;
-  // Crash recovery: finish a set-aside file whose process is gone. Our own pid
-  // counts as gone (a restarted process can reuse it, and a prune never overlaps itself).
+  // Crash recovery: finish a set-aside file whose process is gone. A live pid,
+  // our own included, may be mid-prune (a hot-reloaded instance shares it), so a
+  // same-pid leftover is folded back only after a restart.
   for (const name of await readdir(dir)) {
-    const pid = name.startsWith(prefix) ? name.slice(prefix.length) : "";
-    if (!/^\d+$/.test(pid) || (+pid !== process.pid && pidAlive(+pid))) continue;
+    const pid = name.startsWith(prefix) && /^(\d+)-[0-9a-f]+$/.exec(name.slice(prefix.length))?.[1];
+    if (!pid || pidAlive(+pid)) continue;
     await foldBack(join(dir, name), path, cutoff);
   }
 
@@ -399,7 +403,7 @@ export async function pruneUsageLog(path, nowMs, days, afterRename) {
   }
   if (oldest >= cutoff) return;
 
-  const setAside = `${path}.prune-${process.pid}`;
+  const setAside = `${path}.prune-${process.pid}-${randomBytes(4).toString("hex")}`;
   await rename(path, setAside);
   await afterRename?.();
   await foldBack(setAside, path, cutoff);
