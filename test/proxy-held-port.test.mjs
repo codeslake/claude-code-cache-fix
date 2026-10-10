@@ -1895,7 +1895,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       let err = "";
       p.stderr.on("data", (d) => { err += d; });
       const code = await Promise.race([
-        new Promise((r) => p.on("exit", (c) => r(c))),
+        // "close", not "exit": "exit" can fire before the stderr pipe is drained,
+        // which read the message as absent (measured: errlen=0 at exit, 56 at
+        // close 6 ms later).
+        new Promise((r) => p.on("close", (c) => r(c))),
         new Promise((r) => setTimeout(() => r("HUNG"), 25_000)),
       ]);
       try { p.kill("SIGKILL"); } catch {}
