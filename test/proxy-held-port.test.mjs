@@ -1764,15 +1764,16 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // Capturing the pair as one block means the next helper added beside them
       // arrives here automatically instead of via a ReferenceError.
       const bindFn = /const bindAddr = [\s\S]*?const lsofAddr = [^\n]*\n/.exec(src)?.[0];
-      const envLit = /env: \{ \.\.\.process\.env, CACHE_FIX_PROXY_PORT[\s\S]*?LISTEN_FDS: "1" \}/.exec(src)?.[0];
+      const envLit = /env: \{ \.\.\.handoverEnv\(process\.env\), CACHE_FIX_PROXY_PORT[\s\S]*?LISTEN_FDS: "1" \}/.exec(src)?.[0];
       assert.ok(bindFn && envLit,
         "the holder's child-spawn env literal moved — this no longer tests what the child is told");
 
       const childEnv = (bind) => {
         const proc = { env: bind === null ? {} : { CACHE_FIX_PROXY_BIND: bind }, pid: 4242 };
         // eslint-disable-next-line no-new-func
-        return Function("process", "holder", "port", "HOLDER_TREE",
-          `${bindFn}\nreturn (${envLit.slice("env: ".length)});`)(proc, { _port: 9901 }, 9901, "tree");
+        // The handover file is stubbed out: this reads what the holder pins, not the file.
+        return Function("process", "holder", "port", "HOLDER_TREE", "handoverEnv", "handoverEnvPath",
+          `${bindFn}\nreturn (${envLit.slice("env: ".length)});`)(proc, { _port: 9901 }, 9901, "tree", (b) => b, () => "");
       };
 
       // The default is the whole safety argument for this change: unset means

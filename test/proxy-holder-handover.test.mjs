@@ -593,8 +593,11 @@ describe("holder handover (SIGUSR2)", () => {
     await new Promise((r) => origin.listen(0, "127.0.0.1", r));
     const originPort = origin.address().port;
     const port = await freePort();
+    // The operator's handover file is read at every proxy spawn: unpinned, its
+    // CACHE_FIX_REQUIRE_HOP=1 refuses this hop-less CONNECT.
     const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
-                  CACHE_FIX_FORWARD_PROXY: "on" };
+                  CACHE_FIX_FORWARD_PROXY: "on",
+                  CACHE_FIX_HANDOVER_ENV: join(tmpdir(), "ccf-no-such-handover.env") };
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",

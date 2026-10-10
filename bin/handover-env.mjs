@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { claudeHome } from "../proxy/claude-home.mjs";
 
+// Read at every proxy spawn (watch swap, restart) and at a SIGUSR2 handover.
 // A handover keeps the port alive and, until this existed, kept the CONFIG the
 // outgoing holder booted with too — so a switch added afterwards could not reach
 // the fleet without dropping the address, and dropping it cuts whatever streams

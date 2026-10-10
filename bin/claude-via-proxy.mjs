@@ -1330,7 +1330,10 @@ function holdPort(rest) {
         // holder's own lsof probes (which DO honour bindAddr) could not see it
         // either. config.bind also feeds /health's upstream_is_self, so the
         // loop check was answering about an address we do not serve.
-        env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: bindAddr(),
+        // The handover file is re-read at EVERY proxy spawn (watch swap, restart), not only
+        // at a SIGUSR2. Its pins repeat the successor's: a self-healed holder inherits this env.
+        env: { ...handoverEnv(process.env), CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: bindAddr(),
+               CACHE_FIX_HANDOVER_ENV: handoverEnvPath(), CACHE_FIX_STANDBY: undefined,
                CACHE_FIX_HELD_PORT: String(holder._port || port), CACHE_FIX_HELD_BY: String(process.pid),
                // OUR OWN BYTES, so the holder's version is observable instead of
                // inferred. The proxy already publishes proxy_tree and a checker
