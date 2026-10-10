@@ -1090,6 +1090,31 @@ test("no test file asks lsof who holds a port", () => {
     `filters the pid before it reaches process.kill():\n  ${bad.join("\n  ")}`);
 });
 
+// A STUB lsof MUST NAME PIDS THAT CANNOT EXIST.
+//
+// The launcher SIGHUPs whatever lsof names as the incumbent, every 500 ms. The
+// "ps never returns" row answered the literal pids 4241 4242, so the signal
+// went to whichever LIVE process had pid 4241: on CI the proxy-held-port runner
+// (exit 129, and the launcher looped to its 20 s deadline); on a dev box any
+// unrelated process. Measured locally: a live victim at that pid took 8 SIGHUPs
+// and the run failed after 31 s; dead pids ended it in 9 s.
+test("no lsof stub names a pid that can exist", () => {
+  const PID_MAX = 4194304;   // Linux's ceiling; macOS stops at 99998
+  const live = [];
+  let seen = 0;
+  for (const f of readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"))) {
+    const src = stripComments(readFileSync(join(testDir, f), "utf8"));
+    for (const m of src.matchAll(/\blsof\s*:\s*"(#!\/bin\/sh[^"]*)"/g)) {
+      seen++;
+      for (const [n] of m[1].matchAll(/\b\d{2,}\b/g)) if (Number(n) <= PID_MAX) live.push(`${f}: ${n}`);
+    }
+  }
+  assert.ok(seen > 0, "no lsof stub found: either they moved or this detector broke");
+  assert.deepEqual(live, [],
+    `these lsof stubs print a pid at or below pid_max, which the launcher then SIGHUPs ` +
+    `on whatever live process holds it:\n  ${live.join("\n  ")}`);
+});
+
 test("the suite derives its parallelism from the machine", () => {
   const script = JSON.parse(readFileSync(join(testDir, "..", "package.json"), "utf8")).scripts?.test ?? "";
   // Premise. A renamed or rewritten script must not let the assertion below
