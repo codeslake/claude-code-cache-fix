@@ -9,10 +9,11 @@
 // The drift was already starting: `listeners` was byte-identical in three files
 // and an arrow function in a fourth, and freePort had three different shapes.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import net from "node:net";
 import { constants as osConstants } from "node:os";
+import { fileURLToPath } from "node:url";
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
 // and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
@@ -136,6 +137,12 @@ export async function reapStamped(marker) {
   for (const p of stamped(marker)) { try { process.kill(Number(p), "SIGKILL"); } catch { /* gone already */ } }
 }
 
+export function killStamped(marker) {
+  for (const p of stamped(marker)) {
+    try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
+  }
+}
+
 // ARM A FILE'S LINEAGE, ONE CALL. `=`, not `||=`: nothing calls this with
 // CACHE_FIX_TEST_LINEAGE already set in ITS OWN env (a harness passes a
 // marker back through LEAK_PROBE_FILE, never through env), so `||=` here
@@ -147,11 +154,16 @@ export async function reapStamped(marker) {
 // caller can also `await reapStamped(marker)` from its own async teardown.
 export function armLineage(name) {
   const marker = process.env.CACHE_FIX_TEST_LINEAGE = `${name}-${process.pid}`;
-  process.on("exit", () => {
-    for (const p of stamped(marker)) {
-      try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
-    }
-  });
+  process.on("exit", () => killStamped(marker));
+  // The backstops here run INSIDE this process, so a SIGKILL right behind a
+  // group SIGTERM cancels them (bound_wait does that; a standby relay and a
+  // successor holder outlived it). The watchdog is its own session, sees the
+  // pipe to this process close however it dies, and sweeps then.
+  const dog = spawn(process.execPath,
+    [fileURLToPath(new URL("./fixtures/lineage-watchdog.mjs", import.meta.url)), marker],
+    { detached: true, stdio: ["pipe", "ignore", "ignore"] });
+  dog.unref();
+  dog.stdin.unref();
   // SIGTERM/SIGINT/SIGHUP have a fatal DEFAULT disposition with no listener
   // attached: the process is torn down by the kernel and the "exit" backstop
   // above never fires. Turning the signal into a normal exit is what lets

@@ -152,3 +152,46 @@ it("armLineage()'s exit backstop reaps a lineage its own process leaves behind o
 
 it("armLineage()'s exit backstop reaps a lineage its own process leaves behind on SIGHUP",
   () => driverSurvivesSignal("SIGHUP"));
+
+// The backstops above run INSIDE the dying file process, so a SIGKILL that
+// lands while they run cancels them. bound_wait does that: SIGTERM to the
+// process GROUP, then SIGKILL to it the moment the runner is gone. Reproduced
+// with a real `node --test` runner in its own group, whose file child armed a
+// lineage and spawned a stamped child in ANOTHER session.
+it("armLineage() reaps a lineage whose process is SIGKILLed right behind the group SIGTERM", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lineage-kill-"));
+  const reportFile = join(dir, "report");
+  const childEnv = { ...process.env, LINEAGE_SIGTERM_DRIVE: "1", LINEAGE_REPORT_FILE: reportFile };
+  delete childEnv.NODE_TEST_CONTEXT;
+  for (const k of HOP_ENV) delete childEnv[k];
+  const runner = spawn(process.execPath, ["--test", driverPath], {
+    cwd: repoRoot, env: childEnv, detached: true, stdio: "ignore",
+  });
+  const killGroup = (sig) => { try { process.kill(-runner.pid, sig); } catch { } };
+  let marker;
+  try {
+    let m;
+    for (let t = Date.now(); !m && Date.now() - t < 15_000; await new Promise((r) => setTimeout(r, 50))) {
+      try { m = /MARKER:(\S+)\nPID:(\d+)/.exec(readFileSync(reportFile, "utf8")); } catch { }
+    }
+    assert.ok(m, "the driver never reported its grandchild");
+    marker = m[1];
+    assert.ok(stamped(marker).includes(m[2]),
+      `setup did not produce a live OURS-matching process carrying ${marker} — this test measures nothing`);
+
+    runner.once("exit", () => killGroup("SIGKILL"));
+    killGroup("SIGTERM");
+    await exitWithin(runner, 10_000, "the runner never exited after SIGTERM");
+
+    let left = stamped(marker);
+    for (let t = Date.now(); left.length && Date.now() - t < 5000; left = stamped(marker)) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.deepEqual(left, [],
+      `${left.length} process(es) carrying ${marker} outlived the SIGTERM+SIGKILL of their file's group`);
+  } finally {
+    killGroup("SIGKILL");
+    if (marker) await reapStamped(marker);
+    try { rmSync(dir, { recursive: true, force: true }); } catch { }
+  }
+});
