@@ -1090,14 +1090,9 @@ test("no test file asks lsof who holds a port", () => {
     `filters the pid before it reaches process.kill():\n  ${bad.join("\n  ")}`);
 });
 
-// A STUB lsof MUST NAME PIDS THAT CANNOT EXIST.
-//
-// The launcher SIGHUPs whatever lsof names as the incumbent, every 500 ms. The
-// "ps never returns" row answered the literal pids 4241 4242, so the signal
-// went to whichever LIVE process had pid 4241: on CI the proxy-held-port runner
-// (exit 129, and the launcher looped to its 20 s deadline); on a dev box any
-// unrelated process. Measured locally: a live victim at that pid took 8 SIGHUPs
-// and the run failed after 31 s; dead pids ended it in 9 s.
+// A STUB lsof MUST NAME PIDS THAT CANNOT EXIST. The launcher SIGHUPs whatever
+// lsof names, every 500 ms; the literal 4241 4242 hit a live neighbour (CI: the
+// proxy-held-port runner, exit 129) and the launcher looped to its 20 s deadline.
 test("no lsof stub names a pid that can exist", () => {
   const PID_MAX = 4194304;   // Linux's ceiling; macOS stops at 99998
   const live = [];
