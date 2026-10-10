@@ -12,6 +12,12 @@
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// A holder reads the operator's cache-fix-handover.env at every proxy spawn, which can
+// re-add keys a fixture deleted (HOP_ENV). Fixtures spread process.env, so pin it here.
+process.env.CACHE_FIX_HANDOVER_ENV = join(tmpdir(), "ccf-no-such-handover.env");
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
 // and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs

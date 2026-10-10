@@ -1764,16 +1764,16 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // Capturing the pair as one block means the next helper added beside them
       // arrives here automatically instead of via a ReferenceError.
       const bindFn = /const bindAddr = [\s\S]*?const lsofAddr = [^\n]*\n/.exec(src)?.[0];
-      const envLit = /env: \{ \.\.\.handoverEnv\(process\.env\), CACHE_FIX_PROXY_PORT[\s\S]*?LISTEN_FDS: "1" \}/.exec(src)?.[0];
+      const envLit = /env: \{ \.\.\.fileEnv, CACHE_FIX_PROXY_PORT[\s\S]*?LISTEN_FDS: "1" \}/.exec(src)?.[0];
       assert.ok(bindFn && envLit,
         "the holder's child-spawn env literal moved — this no longer tests what the child is told");
 
-      const childEnv = (bind) => {
+      const childEnv = (bind, file = {}) => {
         const proc = { env: bind === null ? {} : { CACHE_FIX_PROXY_BIND: bind }, pid: 4242 };
         // eslint-disable-next-line no-new-func
-        // The handover file is stubbed out: this reads what the holder pins, not the file.
-        return Function("process", "holder", "port", "HOLDER_TREE", "handoverEnv", "handoverEnvPath",
-          `${bindFn}\nreturn (${envLit.slice("env: ".length)});`)(proc, { _port: 9901 }, 9901, "tree", (b) => b, () => "");
+        // The handover file is stubbed to `file`: this reads what the holder pins, not the file.
+        return Function("process", "holder", "port", "HOLDER_TREE", "fileEnv", "handoverEnvPath",
+          `${bindFn}\nreturn (${envLit.slice("env: ".length)});`)(proc, { _port: 9901 }, 9901, "tree", { ...proc.env, ...file }, () => "");
       };
 
       // The default is the whole safety argument for this change: unset means
@@ -1793,6 +1793,16 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // the other.
       assert.equal(childEnv("::1").CACHE_FIX_PROXY_PORT, "0");
       assert.equal(childEnv("::1").CACHE_FIX_HELD_PORT, "9901");
+      // The successor forces CACHE_FIX_EXIT_WITH_PARENT off; the child keeps THIS holder's own
+      // value, so a file line cannot arm a self-healed holder's orphan check. The control
+      // proves the stubbed file reaches the child at all.
+      assert.equal(childEnv(null, { CACHE_FIX_PREFIXDIFF: "1" }).CACHE_FIX_PREFIXDIFF, "1");
+      assert.equal(childEnv(null, { CACHE_FIX_EXIT_WITH_PARENT: "1" }).CACHE_FIX_EXIT_WITH_PARENT, undefined,
+        "a handover-file line armed the orphan check of the holder's proxy child");
+      // The file read is synchronous; it must not sit in the no-accept window closeGap() opens.
+      const swap = src.slice(src.indexOf("bootedHash = spawningHash;"));
+      const [read, close] = ["handoverEnv(process.env)", "holder.closeGap()"].map((k) => swap.indexOf(k));
+      assert.ok(read >= 0 && read < close, "the child's handover-file read is not before holder.closeGap()");
     });
 
     it("takes the port from a holder running an older deploy", async () => {

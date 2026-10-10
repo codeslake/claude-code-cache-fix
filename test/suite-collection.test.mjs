@@ -162,6 +162,21 @@ test("every hop-bearing env the relay reads is scrubbed by the fixtures", () => 
     "a fixture still scrubs a hand-written proxy list instead of ...HOP_ENV");
 });
 
+// A HOLDER THIS SUITE BOOTS READS THE OPERATOR'S handover file at every proxy spawn;
+// proc-helpers pins it for each file that imports it. Static, because a box with no
+// such file runs green either way.
+test("every file that boots a holder pins the handover file", () => {
+  const helpers = readFileSync(join(testDir, "proc-helpers.mjs"), "utf8");
+  assert.ok(/^process\.env\.CACHE_FIX_HANDOVER_ENV = /m.test(helpers),
+    "proc-helpers no longer pins CACHE_FIX_HANDOVER_ENV, so every holder the suite boots reads the operator's file");
+  const unpinned = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs")).filter((f) => {
+    const src = readFileSync(join(testDir, f), "utf8");
+    return /"run-service"|CACHE_FIX_HOLD_PORT: "on"/.test(src) && !/proc-helpers\.mjs|CACHE_FIX_HANDOVER_ENV/.test(src);
+  });
+  assert.deepEqual(unpinned, [],
+    `these files boot a holder without importing proc-helpers.mjs or setting CACHE_FIX_HANDOVER_ENV: ${unpinned.join(", ")}`);
+});
+
 // A PROBE THAT DROPS THE STATUS BODY COSTS AN INVESTIGATION. /health has two
 // 503 authors — the relay carrying an address with no proxy behind it, and a
 // proxy reporting failed extensions — and the code alone names neither. CI run
