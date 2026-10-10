@@ -9,12 +9,13 @@
 // The drift was already starting: `listeners` was byte-identical in three files
 // and an arrow function in a fourth, and freePort had three different shapes.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // A holder reads the operator's cache-fix-handover.env at every proxy spawn, which can
 // re-add keys a fixture deleted (HOP_ENV). Fixtures spread process.env, so pin it here.
@@ -161,7 +162,16 @@ export async function reapStamped(marker) {
     for (const p of survivors) { try { process.kill(Number(p), "SIGHUP"); } catch { /* gone already */ } }
     await new Promise((r) => setTimeout(r, 700));
   }
-  for (const p of stamped(marker)) { try { process.kill(Number(p), "SIGKILL"); } catch { /* gone already */ } }
+  killStamped(marker);
+}
+
+// Not ourselves: on macOS byEnv() matches OURS against command + env, so the
+// calling process (the watchdog, say) can be in its own list.
+export function killStamped(marker) {
+  for (const p of stamped(marker)) {
+    if (Number(p) === process.pid) continue;
+    try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
+  }
 }
 
 // ARM A FILE'S LINEAGE, ONE CALL. `=`, not `||=`: nothing calls this with
@@ -175,11 +185,19 @@ export async function reapStamped(marker) {
 // caller can also `await reapStamped(marker)` from its own async teardown.
 export function armLineage(name) {
   const marker = process.env.CACHE_FIX_TEST_LINEAGE = `${name}-${process.pid}`;
-  process.on("exit", () => {
-    for (const p of stamped(marker)) {
-      try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
-    }
-  });
+  process.on("exit", () => killStamped(marker));
+  // The backstops here run INSIDE this process, so a SIGKILL right behind a
+  // group SIGTERM cancels them (bound_wait does that; a standby relay and a
+  // successor holder outlived it). The watchdog is its own session, sees the
+  // pipe to this process close however it dies, and sweeps then.
+  const dog = spawn(process.execPath,
+    [fileURLToPath(new URL("./fixtures/lineage-watchdog.mjs", import.meta.url)), marker],
+    { detached: true, stdio: ["pipe", "ignore", "ignore"] });
+  // EMFILE leaves dog.stdin undefined, EAGAIN emits an async "error": a missing
+  // watchdog must not take the importing test file down.
+  dog.on("error", () => {});
+  dog.unref();
+  dog.stdin?.unref();
   // SIGTERM/SIGINT/SIGHUP have a fatal DEFAULT disposition with no listener
   // attached: the process is torn down by the kernel and the "exit" backstop
   // above never fires. Turning the signal into a normal exit is what lets

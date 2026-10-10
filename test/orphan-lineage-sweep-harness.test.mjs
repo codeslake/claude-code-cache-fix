@@ -118,10 +118,14 @@ function readyPid(driver, ms) {
   return withDeadline(ready, ms, driver, "the driver never reported readiness");
 }
 
-async function driverSurvivesSignal(signal) {
+// `alone` turns the out-of-process watchdog off (LINEAGE_NO_WATCHDOG, read by
+// fixtures/lineage-watchdog.mjs), so a reaped lineage is the IN-PROCESS
+// backstop's doing. Without it the watchdog sweeps the same lineage on the
+// same signal and a case that deleted the in-process handlers would still pass.
+async function driverSurvivesSignal(signal, { alone = false } = {}) {
   const driver = spawn(process.execPath, [driverPath], {
     cwd: repoRoot,
-    env: { ...process.env, LINEAGE_SIGTERM_DRIVE: "1" },
+    env: { ...process.env, LINEAGE_SIGTERM_DRIVE: "1", ...(alone && { LINEAGE_NO_WATCHDOG: "1" }) },
     stdio: ["ignore", "pipe", "ignore"],
   });
   const marker = `lineage-sigterm-child-${driver.pid}`;
@@ -137,10 +141,14 @@ async function driverSurvivesSignal(signal) {
     driver.kill(signal);
     await exitWithin(driver, 5000, `the driver never exited after ${signal}`);
 
-    const survivors = stamped(marker);
+    // Polled: the watchdog sweeps after the driver is already gone.
+    let survivors = stamped(marker);
+    for (let t = Date.now(); survivors.length && Date.now() - t < 5000; survivors = stamped(marker)) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
     assert.equal(survivors.length, 0,
       `${survivors.length} process(es) carrying ${marker} survived the driver's ${signal} — ` +
-      "armLineage()'s exit backstop did not run");
+      "its lineage backstop did not run");
   } finally {
     await reapStamped(marker);
     try { driver.kill("SIGKILL"); } catch { }
@@ -148,7 +156,26 @@ async function driverSurvivesSignal(signal) {
 }
 
 it("armLineage()'s exit backstop reaps a lineage its own process leaves behind on SIGTERM",
-  () => driverSurvivesSignal("SIGTERM"));
+  () => driverSurvivesSignal("SIGTERM", { alone: true }));
 
 it("armLineage()'s exit backstop reaps a lineage its own process leaves behind on SIGHUP",
-  () => driverSurvivesSignal("SIGHUP"));
+  () => driverSurvivesSignal("SIGHUP", { alone: true }));
+
+// SIGKILL runs nothing in the dying process, so no in-process backstop can reap
+// the lineage — bound_wait's SIGKILL right behind its group SIGTERM cancels
+// them the same way (a standby relay and a successor holder outlived it). Only
+// the watchdog, a separate session that sees the pipe close, can.
+it("armLineage() reaps a lineage whose process is SIGKILLed",
+  () => driverSurvivesSignal("SIGKILL"));
+
+// A process whose own command line is OURS and carries the marker is in its own
+// stamped() list.
+it("killStamped() does not kill the process that calls it", () => {
+  const marker = `killstamped-self-${process.pid}-${Date.now()}`;
+  const r = spawnSync(process.execPath, ["-e",
+    `import(${JSON.stringify(new URL("./proc-helpers.mjs", import.meta.url).href)})` +
+    `.then((m) => { m.killStamped(${JSON.stringify(marker)}); console.log("alive"); })`,
+    "proxy/self.mjs"],
+    { env: { ...process.env, CACHE_FIX_TEST_LINEAGE: marker }, encoding: "utf8", timeout: 10_000, killSignal: "SIGKILL" });
+  assert.equal(r.stdout.trim(), "alive", `killStamped() killed its own caller (status=${r.status} signal=${r.signal})`);
+});

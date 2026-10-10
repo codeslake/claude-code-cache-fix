@@ -61,8 +61,9 @@ describe("probe bounding", () => {
     // sites; hanging there is what this case is for. lsof stays bounded by the
     // sibling case below, which is the one that hangs it.
     const answers = {
-      // A pid list, so execution reaches the `ps` sites below it.
-      lsof: "#!/bin/sh\nprintf '%s\\n' 4241 4242\n",
+      // A pid list, so execution reaches the `ps` sites below it. Above pid_max
+      // (Linux 4194304, macOS 99998): the launcher SIGHUPs these, so no live process may own one.
+      lsof: "#!/bin/sh\nprintf '%s\\n' 2147483646 2147483645\n",
       // Reached ONLY in the `ps` row, where lsof answers and ps hangs. In the
       // `lsof` row this is never executed: holderPidOn's `probe("lsof", …)` is
       // inside a try whose catch returns, so a timing-out lsof ends the call
