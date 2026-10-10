@@ -419,6 +419,47 @@ describe("a holder stop with a reply in flight", () => {
   });
 });
 
+// THE HANDOVER FILE IS READ AT EVERY PROXY SPAWN, not only at a SIGUSR2: a setting a
+// deploy writes there must land when the deploy watcher swaps the proxy first (the
+// reload then finds the trees equal and sends nothing). /proc, so linux only.
+describe("a proxy the holder spawns itself", () => {
+  it("takes its CACHE_FIX_* settings from the handover file on a watch swap", { skip: !existsSync("/proc") }, async () => {
+    const upstream = await numberedOrigin(1);
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    let pkg, holder;
+    try {
+      pkg = mkdtempSync(join(tmpdir(), "ccf-handover-env-"));
+      for (const d of ["bin", "proxy"]) cpSync(join(root, d), join(pkg, d), { recursive: true });
+      symlinkSync(createRequire(import.meta.url).resolve.paths("hpagent").find((d) => existsSync(join(d, "hpagent"))),
+                  join(pkg, "node_modules"));
+      const file = join(pkg, "handover.env");
+      holder = await bootHolder(upstream, join(pkg, "bin", "claude-via-proxy.mjs"),
+        { CACHE_FIX_WATCH_DEPLOY_MS: "200", CACHE_FIX_HANDOVER_ENV: file });
+      const serving = (...not) => listeners(holder.port).find((q) => /server\.mjs/.test(cmdOf(q)) && !not.includes(q));
+      const has = (pid, kv) => readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(kv);
+      const first = serving();
+      assert.ok(first, "no proxy is serving, so there is nothing to swap");
+
+      // The file cannot move itself or arm the standby branch: a self-healed holder inherits this env.
+      writeFileSync(file, "CACHE_FIX_CAPTURE_MAX_MB=256\nCACHE_FIX_STANDBY=1\nCACHE_FIX_HANDOVER_ENV=/elsewhere.env\n");
+      assert.ok(!has(first, "CACHE_FIX_CAPTURE_MAX_MB=256"), "premise: the setting reached the proxy booted before it was written");
+      appendFileSync(join(pkg, "proxy", "helpers.mjs"), "\n// a deploy\n");
+      const second = await until(() => serving(first), 25_000);
+      assert.ok(second, `the watcher never swapped the proxy: ${holder.log.slice(-300)}`);
+      assert.ok(has(second, "CACHE_FIX_CAPTURE_MAX_MB=256"),
+        "the proxy the watch swap spawned runs without the setting the handover file holds: it was started " +
+        "from the holder's boot environment, so a deploy that lost the race to the watcher never lands it");
+      assert.ok(has(second, `CACHE_FIX_HANDOVER_ENV=${file}`) && !has(second, "CACHE_FIX_STANDBY=1"),
+        "the file moved its own path or set CACHE_FIX_STANDBY for the proxy, and a self-healed holder inherits both");
+    } finally {
+      upstream.close();
+      try { holder?.kill("SIGKILL"); } catch { }
+      if (holder) await reapPort(holder.port);
+      if (pkg) rmSync(pkg, { recursive: true, force: true });
+    }
+  });
+});
+
 // A PID THIS FILE ONCE SPAWNED CAN BE A LIVE HOLDER'S BY THE TIME THE SWEEP RUNS,
 // and that holder's standby names it as its parent exactly as ours did. What tells
 // them apart is the port this file gave the holder, which the relay carries in its

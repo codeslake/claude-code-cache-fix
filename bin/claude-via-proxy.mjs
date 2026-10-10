@@ -1398,6 +1398,9 @@ function holdPort(rest) {
           `${spawningHash.slice(0, 12)}); this restart picks it up\n`);
       }
       bootedHash = spawningHash;
+      // Re-read at EVERY proxy spawn (watch swap, restart), not only at a SIGUSR2, and
+      // before closeGap(): a slow read must not sit in the window with nothing accepting.
+      const fileEnv = handoverEnv(process.env);
       // The gap listener must let go before the child can listen on the
       // inherited fd: two handles may BIND one port, but only one may LISTEN —
       // measured, holding it across the spawn gave "socket handover refused
@@ -1436,7 +1439,11 @@ function holdPort(rest) {
         // holder's own lsof probes (which DO honour bindAddr) could not see it
         // either. config.bind also feeds /health's upstream_is_self, so the
         // loop check was answering about an address we do not serve.
-        env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: bindAddr(),
+        // The file's pins repeat the successor's (a self-healed holder inherits this env),
+        // except EXIT_WITH_PARENT: the child keeps this holder's own, never a file's.
+        env: { ...fileEnv, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: bindAddr(),
+               CACHE_FIX_HANDOVER_ENV: handoverEnvPath(), CACHE_FIX_STANDBY: undefined,
+               CACHE_FIX_EXIT_WITH_PARENT: process.env.CACHE_FIX_EXIT_WITH_PARENT,
                CACHE_FIX_HELD_PORT: String(holder._port || port), CACHE_FIX_HELD_BY: String(process.pid),
                // OUR OWN BYTES, so the holder's version is observable instead of
                // inferred. The proxy already publishes proxy_tree and a checker
