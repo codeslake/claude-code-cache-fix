@@ -134,11 +134,14 @@ export async function reapStamped(marker) {
     for (const p of survivors) { try { process.kill(Number(p), "SIGHUP"); } catch { /* gone already */ } }
     await new Promise((r) => setTimeout(r, 700));
   }
-  for (const p of stamped(marker)) { try { process.kill(Number(p), "SIGKILL"); } catch { /* gone already */ } }
+  killStamped(marker);
 }
 
+// Not ourselves: on macOS byEnv() matches OURS against command + env, so the
+// calling process (the watchdog, say) can be in its own list.
 export function killStamped(marker) {
   for (const p of stamped(marker)) {
+    if (Number(p) === process.pid) continue;
     try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
   }
 }
@@ -162,8 +165,11 @@ export function armLineage(name) {
   const dog = spawn(process.execPath,
     [fileURLToPath(new URL("./fixtures/lineage-watchdog.mjs", import.meta.url)), marker],
     { detached: true, stdio: ["pipe", "ignore", "ignore"] });
+  // EMFILE leaves dog.stdin undefined, EAGAIN emits an async "error": a missing
+  // watchdog must not take the importing test file down.
+  dog.on("error", () => {});
   dog.unref();
-  dog.stdin.unref();
+  dog.stdin?.unref();
   // SIGTERM/SIGINT/SIGHUP have a fatal DEFAULT disposition with no listener
   // attached: the process is torn down by the kernel and the "exit" backstop
   // above never fires. Turning the signal into a normal exit is what lets

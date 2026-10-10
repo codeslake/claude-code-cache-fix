@@ -4,7 +4,6 @@
 // can SIGTERM it — the shape the file children in shutdown-exit-code.test.mjs
 // and proxy-integration.test.mjs actually run under.
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
 import { HOP_ENV, armLineage, stamped } from "../proc-helpers.mjs";
 
 // Bare `node --test` (no path arguments, what `npm test` runs) auto-discovers
@@ -20,11 +19,8 @@ const marker = armLineage("lineage-sigterm-child");
 
 const env = { ...process.env, CACHE_FIX_PROXY_PORT: "0" };
 for (const k of HOP_ENV) delete env[k];
-// Detached, like a SIGUSR2 successor holder: its own session, so a group
-// signal aimed at this file cannot reach it.
 const grandchild = spawn(process.execPath, ["proxy/server.mjs"], {
   env,
-  detached: true,
   stdio: ["ignore", "ignore", "ignore"],
 });
 
@@ -37,10 +33,7 @@ while (Date.now() < deadline) {
   await new Promise((r) => setTimeout(r, 25));
 }
 
-const report = `MARKER:${marker}\nPID:${grandchild.pid}\n`;
-process.stdout.write(report);
-// Under `node --test` this file's stdout belongs to the runner.
-if (process.env.LINEAGE_REPORT_FILE) writeFileSync(process.env.LINEAGE_REPORT_FILE, report);
+process.stdout.write(`MARKER:${marker}\nPID:${grandchild.pid}\n`);
 
 // Idle until the parent's SIGTERM arrives; armLineage()'s own backstop is
 // what is under test.
