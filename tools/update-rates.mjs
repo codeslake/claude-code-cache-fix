@@ -112,7 +112,10 @@ const MULTIPLIER_EPSILON = 0.011;
 // reads at 0.05x input, per the pricing page's footnote). Only the named field
 // on the named wire id is affected; every other row and every other field
 // still goes through the standard MULTIPLIERS check above.
-const CACHE_READ_MULTIPLIER_OVERRIDES = { "claude-opus-5-5": 0.05 };
+const CACHE_READ_MULTIPLIER_OVERRIDES = { "claude-opus-5-5": 0.05, "claude-sonnet-5-5": 0.05 };
+// Sonnet 5.5's cache-read cut ($0.20 → $0.10, Claude Code 2.1.296) is first seen on the
+// 2026-10-10 page. A page dated before that is still read at the standard 0.1x.
+const CACHE_READ_OVERRIDE_SINCE = { "claude-sonnet-5-5": Date.UTC(2026, 9, 10) };
 
 const MONTHS = {
   january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
@@ -240,13 +243,14 @@ function namesModel(nameCell, display) {
 
 // Validate one row's numbers before it can reach rates.json. Returns an error
 // string (fail closed) or null when the row is trustworthy.
-function validateRates(wireId, r) {
+function validateRates(wireId, r, atMs) {
   for (const [field, v] of Object.entries(r)) {
     if (typeof v !== "number" || !Number.isFinite(v)) return `${wireId}.${field} is not a finite number`;
     if (v < MIN_PRICE || v > MAX_PRICE) return `${wireId}.${field}=${v} outside sane range $${MIN_PRICE}–$${MAX_PRICE}`;
   }
   for (const [field, mult] of Object.entries(MULTIPLIERS)) {
-    const effectiveMult = field === "cache_read" && wireId in CACHE_READ_MULTIPLIER_OVERRIDES
+    const effectiveMult = field === "cache_read" && wireId in CACHE_READ_MULTIPLIER_OVERRIDES &&
+      atMs >= (CACHE_READ_OVERRIDE_SINCE[wireId] ?? 0)
       ? CACHE_READ_MULTIPLIER_OVERRIDES[wireId]
       : mult;
     const expected = r.input * effectiveMult;
@@ -317,7 +321,7 @@ export function parsePricing(html, atMs = Date.now()) {
 
     const { name, ...r } = chosen;
     for (const id of wireIds) {
-      const err = validateRates(id, r);
+      const err = validateRates(id, r, atMs);
       if (err) { errors.push(err); continue; }
       rates[id] = { ...r };
     }

@@ -11,9 +11,10 @@ import { dirname, join } from "node:path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(__dirname, "..", "tools", "cost-report.mjs");
 
-test("prices a claude-opus-5-5 call from the bundled rates.json", () => {
+// Cost of 1M input + 1M output + 1M cache-read tokens on `model`, from the bundled rates.json.
+function costOf(model) {
   const usage = JSON.stringify({
-    model: "claude-opus-5-5",
+    model,
     input_tokens: 1_000_000,
     output_tokens: 1_000_000,
     cache_read_input_tokens: 1_000_000,
@@ -25,7 +26,15 @@ test("prices a claude-opus-5-5 call from the bundled rates.json", () => {
   });
 
   assert.equal(result.status, 0, `cost-report exited ${result.status}: ${result.stderr}`);
-  const report = JSON.parse(result.stdout);
-  assert.equal(report.calls[0].cost, 24.2,
+  return JSON.parse(result.stdout).calls[0].cost;
+}
+
+test("prices a claude-opus-5-5 call from the bundled rates.json", () => {
+  assert.equal(costOf("claude-opus-5-5"), 24.2,
     "1M input + 1M output + 1M cache-read at Opus 5.5's own rates (4/20/0.2 $ per MTok)");
+});
+
+test("prices a claude-sonnet-5-5 call from the bundled rates.json", () => {
+  assert.equal(costOf("claude-sonnet-5-5"), 12.1,
+    "1M input + 1M output + 1M cache-read at Sonnet 5.5's own rates (2/10/0.1 $ per MTok)");
 });

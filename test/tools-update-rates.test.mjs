@@ -18,10 +18,19 @@ import { parsePricing } from "../tools/update-rates.mjs";
 // every other block dropped. It has TWO header rows and a different column
 // order from the 2026-07-27 page (Output right after Input, before the cache
 // columns).
+//
+// pricing-page-2026-10-10.html is the model-pricing <table> of the live page as
+// of 2026-10-10, fetched through the proxy (1135336 bytes, sha256
+// 919f8fcf0e1d280c2a0df977ab7319c0b71d7e110cf9f01f1c2cb074e7e3fa6e) with every
+// other block dropped. It is the newest page, so the checked-in rates.json is
+// compared against it. The older fixtures keep what their pages said: Sonnet
+// 5.5 cache reads at $0.20/MTok there, $0.10/MTok here.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = readFileSync(join(__dirname, "fixtures", "pricing-page-2026-07-27.html"), "utf8");
 const LIVE_0928 = readFileSync(join(__dirname, "fixtures", "pricing-page-2026-09-28.html"), "utf8");
+const LIVE_1010 = readFileSync(join(__dirname, "fixtures", "pricing-page-2026-10-10.html"), "utf8");
+const D1010 = Date.parse("2026-10-10T12:00:00Z");
 
 // Prices are read in the column order the table's own header names, so every
 // inline table below carries a header row (a table without one yields no rows).
@@ -93,13 +102,15 @@ test("the two-header-row page of 2026-09-28 parses every required model with no 
   // Output follows Input on this page; read by position it landed in cache_write_5m.
   assert.deepEqual(rates["claude-opus-5-5"],
     { input: 4, output: 20, cache_read: 0.2, cache_write_5m: 5, cache_write_1h: 8 });
-  const shipped = JSON.parse(readFileSync(join(__dirname, "..", "tools", "rates.json"), "utf8")).models;
-  for (const id of ["claude-fable-5", "claude-opus-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-7",
-                    "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-4-5"]) {
-    const { note, ...s } = shipped[id];
-    // Compared as JSON so key order counts: an unchanged page must stay a byte-identical no-op.
-    assert.equal(JSON.stringify(rates[id]), JSON.stringify(s), `${id} disagrees with the 2026-09-28 table`);
-  }
+});
+
+test("the 2026-10-10 page prices Claude Sonnet 5.5 cache reads at $0.10, 0.05x input, with no errors", () => {
+  const { rates, errors } = parsePricing(LIVE_1010, D1010);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(rates["claude-sonnet-5-5"],
+    { input: 2, output: 10, cache_read: 0.1, cache_write_5m: 2.5, cache_write_1h: 4 });
+  // From that date the 2026-09-28 page's $0.20 is a stale price, not a 0.1x row to accept.
+  assert.ok(parsePricing(LIVE_0928, D1010).errors.some((e) => /claude-sonnet-5-5\.cache_read=0\.2 /.test(e)));
 });
 
 test("a header that does not name each price column once is refused, not read by position", () => {
@@ -275,14 +286,15 @@ test("parsing is deterministic for a fixed input and date", () => {
 
 // --- the shipped file matches the parser ---
 
-test("checked-in rates.json agrees with the fixture parse for required models", () => {
+test("checked-in rates.json agrees with the newest page's parse for required models", () => {
   const shipped = JSON.parse(readFileSync(join(__dirname, "..", "tools", "rates.json"), "utf8")).models;
-  const { rates } = parsePricing(FIXTURE, Date.parse("2026-07-27T12:00:00Z"));
+  const { rates } = parsePricing(LIVE_1010, D1010);
   for (const id of ["claude-fable-5", "claude-opus-5", "claude-opus-5-5", "claude-opus-4-8", "claude-opus-4-7",
                     "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-4-5"]) {
     assert.ok(shipped[id], `rates.json is missing ${id} — the cost lever prices it at zero`);
     const { note, ...s } = shipped[id];
-    assert.deepEqual(s, rates[id], `rates.json ${id} disagrees with the published table`);
+    // Compared as JSON so key order counts: an unchanged page must stay a byte-identical no-op.
+    assert.equal(JSON.stringify(rates[id]), JSON.stringify(s), `rates.json ${id} disagrees with the 2026-10-10 table`);
   }
 });
 
