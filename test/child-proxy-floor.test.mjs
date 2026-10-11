@@ -421,23 +421,21 @@ test("a PATH that has no bash or zsh still finds one in the usual directories", 
 // first argument that does not start with a dash as the command string unless
 // `--` ends the options. A leading dash in the command must not change that.
 const FLOOR_Q = `http://u'ser@h.example.test:1`;   // a quote in the floor must stay one value
+// [command, what it prints given the proxy the child sees]
 const commands = [
-  ["a leading dash", `-e 2>/dev/null; printf '[%s]' "$HTTPS_PROXY"`],
-  ["quotes and substitution", `printf '[%s]' 'a'"'"'b' "$(echo sub)" "$HTTPS_PROXY"`],
-  ["a newline", `printf one\nprintf '[%s]' "$HTTPS_PROXY"`],
+  [`-e 2>/dev/null; printf '[%s]' "$HTTPS_PROXY"`, (seen) => `[${seen}]`],                       // a leading dash
+  [`printf '[%s]' 'a'"'"'b' "$(echo sub)" "$HTTPS_PROXY"`, (seen) => `[a'b][sub][${seen}]`],    // quotes, substitution
+  [`printf one\nprintf '[%s]' "$HTTPS_PROXY"`, (seen) => `one[${seen}]`],                       // a newline
 ];
 for (const [name, shell] of Object.entries(shells)) {
-  for (const [what, cmd] of commands) {
-    test(`${name}: ${what} reaches the shell intact, with and without a floor`, { skip: shell ? false : `${name} not installed` }, async () => {
-      for (const floor of [FLOOR_Q, undefined]) {
-        const seen = floor ?? CCF;
-        const want = { "a leading dash": `[${seen}]`, "quotes and substitution": `[a'b][sub][${seen}]`, "a newline": `one[${seen}]` }[what];
+  test(`${name}: a leading dash, quotes, substitution and a newline reach the shell intact, with and without a floor`,
+    { skip: !shell && `${name} not installed` }, async () => {
+      for (const [cmd, want] of commands) for (const floor of [FLOOR_Q, undefined]) {
         const { out, code } = await prefix(cmd, session(9801, floor), { shell });
-        assert.equal(out, want, `floor=${floor}`);
+        assert.equal(out, want(floor ?? CCF), `${cmd} (floor=${floor})`);
         assert.equal(code, 0);
       }
     });
-  }
 }
 
 // The two halves agree on the file's name and directory: what the proxy wrote is
