@@ -9,7 +9,6 @@ Independent of the proxy. Hooks run client-side via CC's hooks contract; they do
 | Script | Event | Purpose | Docs |
 |---|---|---|---|
 | `examples/worktree-edit-guard.py` | `PreToolUse` | Block `Edit`/`Write`/`MultiEdit`/`NotebookEdit` calls whose target path falls outside the active git worktree root. Addresses [CC#59628](https://github.com/anthropics/claude-code/issues/59628). | [`docs/hooks/worktree-edit-guard.md`](../docs/hooks/worktree-edit-guard.md) |
-| `examples/proxy-floor.mjs` | `SessionStart` | In forward-proxy mode, give Bash-tool commands cache-fix's own upstream instead of cache-fix, so bulk transfers (`aws`, `git`, `pip`, `curl`) stay off it. | [`docs/hooks/proxy-floor.md`](../docs/hooks/proxy-floor.md) |
 
 ## Installing a hook
 
