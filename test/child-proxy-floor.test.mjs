@@ -49,14 +49,19 @@ const read = (home, port) => readFileSync(join(home, "proxy-floor", String(port)
 // What is published under a config dir; [] when nothing ever created the directory.
 const ls = (home) => { try { return readdirSync(join(home, "proxy-floor")); } catch { return []; } };
 
-test("listen publishes the configured hop before anything has dialled", async () => {
+// The first candidate is a guess: it may be the hop that is down. Publishing it at
+// listen sent every child to a dead port until something else rewrote the file.
+test("listen publishes no guess: fallback #1 down and #2 up, the file names #2 after the walk, never #1", async () => {
+  const down = `http://127.0.0.1:${await freePort()}`;
   const hop = net.createServer();
-  const hopPort = await listenOn(hop);
+  const up = `http://127.0.0.1:${await listenOn(hop)}`;
   const w = await wire();
-  process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${hopPort}`;
+  process.env.CACHE_FIX_FALLBACK_PROXIES = `${down},${up}`;
   const p = await startProxy({ port: await freePort(), watch: false });
   try {
-    assert.equal(read(w.home, p.port), `http://127.0.0.1:${hopPort}`);
+    assert.deepEqual(ls(w.home), [], "the configured candidate was published before any walk");
+    assert.equal(await resolveHop(true), up);
+    assert.equal(read(w.home, p.port), up);
   } finally { await p.close(); hop.close(); w.restore(); }
 });
 
@@ -87,16 +92,31 @@ test("no hop is an EMPTY file (direct), and the file follows the hop as it chang
 
 // An empty file says "I dial direct", which is only true of a proxy with nothing
 // to dial through. One whose chain is configured and wholly refused is between
-// hops, and its next request may well go through one: the answer is unknown.
-test("a configured chain with no reachable hop is UNKNOWN (no file), not direct", async () => {
+// hops, and its next request may well go through one: the answer is unknown. A
+// predecessor's file (a handover) is not overwritten by a guess while the walk
+// is out, and is retired when the walk lands on nothing.
+test("a configured chain with no reachable hop is UNKNOWN (no file), not direct; a predecessor's file stays until the walk lands", async () => {
   const w = await wire();
-  const dead = `http://127.0.0.1:${await freePort()}`;
-  process.env.CACHE_FIX_FALLBACK_PROXIES = dead;
-  const p = await startProxy({ port: await freePort(), watch: false });
+  process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${await freePort()}`;
+  const port = await freePort();
+  publish(w.home, port, "http://predecessor.example.test:1");
+  const p = await startProxy({ port, watch: false });
   try {
-    assert.equal(read(w.home, p.port), dead, "the configured candidate is published until something dials");
+    assert.equal(read(w.home, p.port), "http://predecessor.example.test:1", "listen overwrote the predecessor's file with a guess");
     assert.equal(await resolveHop(true), "", "every hop refused: the walk falls through");
     assert.deepEqual(ls(w.home), [], "a chain that is configured but unreachable must not publish direct");
+  } finally { await p.close(); w.restore(); }
+});
+
+// The temp file is named for the pid and is the proxy's own: a rename that fails
+// must not leave it behind.
+test("a failed rename removes its temp file", async () => {
+  const w = await wire();
+  const port = await freePort();
+  mkdirSync(join(w.home, "proxy-floor", String(port), "occupied"), { recursive: true });   // a directory where the file goes
+  const p = await startProxy({ port, watch: false });
+  try {
+    assert.deepEqual(ls(w.home), [String(port)], "the failed write left a temp file behind");
   } finally { await p.close(); w.restore(); }
 });
 
@@ -330,6 +350,12 @@ test("the command string and its exit status pass through", async () => {
   assert.equal((await prefix(`exit 5`, session(9801, undefined))).code, 5);
 });
 
+// What Claude Code hands the prefix. Its Bash tool sources a shell snapshot first,
+// and the snapshot's file name says which shell the command is written for. A
+// command hook, a stdio MCP server and the statusLine pass the bare command.
+const snapshot = (kind) => `/home/u/.claude/shell-snapshots/snapshot-${kind}-1700000000000-abc123.sh`;
+const bashTool = (kind, cmd) => `source '${snapshot(kind)}' 2>/dev/null || true && ${cmd}`;
+
 // THE DECISIVE CASE. A shell started with -c reads its own startup file first
 // (zsh: .zshenv, every time; bash: $BASH_ENV), and one that exports the proxy
 // again would undo a floor set BEFORE the shell started. The script sets the
@@ -343,27 +369,28 @@ test("zsh: a .zshenv that re-exports the CCF port does not win", { skip: needs("
   const zdot = tmp("floor-zdot-");
   writeFileSync(join(zdot, ".zshenv"), reexport);
   const shell = shellPath("zsh");
-  const { out } = await prefix(probe, session(9801, FLOOR, { ZDOTDIR: zdot, HOME: zdot }), { shell });
+  const { out } = await prefix(bashTool("zsh", probe), session(9801, FLOOR, { ZDOTDIR: zdot, HOME: zdot }), { shell });
   assert.ok(!out.includes("9801"), `the child saw the CCF port: ${out}`);
   assert.match(out, /hop\.example\.test:3128/);
-  const direct = await prefix(probe, session(9801, "", { ZDOTDIR: zdot, HOME: zdot }), { shell });
+  const direct = await prefix(bashTool("zsh", probe), session(9801, "", { ZDOTDIR: zdot, HOME: zdot }), { shell });
   assert.equal(direct.out.trim(), "[]", "an empty floor must leave getproxies() empty although .zshenv exports the CCF port");
 });
 
 test("bash: a BASH_ENV that re-exports the CCF port does not win", { skip: needs("bash") }, async () => {
   const f = join(tmp("floor-bashenv-"), "env.sh");
   writeFileSync(f, reexport);
-  const { out } = await prefix(probe, session(9801, FLOOR, { BASH_ENV: f }), { shell: shellPath("bash") });
+  const { out } = await prefix(bashTool("bash", probe), session(9801, FLOOR, { BASH_ENV: f }), { shell: shellPath("bash") });
   assert.ok(!out.includes("9801"), `the child saw the CCF port: ${out}`);
   assert.match(out, /hop\.example\.test:3128/);
 });
 
 // ---- which shell runs the command ------------------------------------------
 //
-// Claude Code resolves the shell itself: CLAUDE_CODE_SHELL, then SHELL, each only
-// if it names bash or zsh and is executable; else zsh, then bash, from PATH and
-// the usual directories. Execing $SHELL as given would run a user's fish, or no
-// shell at all when SHELL is unset, where Claude Code would have run bash or zsh.
+// Claude Code runs its Bash tool under bash or zsh, and the snapshot it sources
+// names which. Everything else it starts through a shell (command hooks, stdio MCP
+// servers, the statusLine) runs under /bin/sh -c, with or without the prefix, and
+// must with it: bash and zsh differ from sh in how an unquoted $VAR splits and in
+// what a glob that matches nothing does, so a hook written for sh would change.
 const dashAsBash = () => {
   const dash = shellPath("dash");
   if (!dash) return null;
@@ -372,71 +399,107 @@ const dashAsBash = () => {
   return link;
 };
 const shells = { bash: shellPath("bash"), zsh: shellPath("zsh"), dash: dashAsBash() };
+const installed = ["bash", "zsh"].filter((k) => shells[k]);
 const which = `printf '%s' "\${BASH_VERSION:+bash}\${ZSH_VERSION:+zsh}"`;
-// An executable that is not a shell: it prints its own name, so a case can tell
-// which candidate the script picked without bash or zsh being installed.
-function fakeBin(dir, name) {
+// An executable that is not a shell: it prints `says`, so a case can tell which
+// candidate the script picked without bash or zsh being installed.
+function fakeBin(dir, name, says = `fake-${name}`) {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, name), `#!/bin/sh\nprintf '%s' fake-${name}\n`);
+  writeFileSync(join(dir, name), `#!/bin/sh\nprintf '%s' ${says}\n`);
   chmodSync(join(dir, name), 0o755);
 }
 const withPath = (dir) => ({ PATH: `${dir}:${process.env.PATH}` });
+// The Bash tool ends every command with this, snapshot or not.
+const cwdTail = () => `pwd -P >| '${join(tmp("floor-cwd-"), "cwd")}'`;
 
-test("SHELL that is not bash or zsh (fish, sh, a path that does not exist, unset) still runs bash or zsh", { skip: !(shells.bash || shells.zsh) && "neither bash nor zsh installed" }, async () => {
-  for (const shell of ["/usr/bin/fish", "/bin/sh", null]) {
-    const { out, code } = await prefix(which, session(9801, FLOOR), { shell });
+test("a hook, MCP or statusLine command runs under /bin/sh, never under SHELL", async () => {
+  for (const shell of [shells.bash, shells.zsh, "/usr/bin/fish", null].filter((s) => s !== "")) {
+    const { out, code } = await prefix(`echo "$0"`, session(9801, FLOOR), { shell });
+    assert.equal(out, "/bin/sh\n", `SHELL=${shell}`);
+    assert.equal(code, 0);
+  }
+  for (const kind of installed) {
+    assert.match((await prefix(bashTool(kind, `echo "$0"`), session(9801, FLOOR), { shell: shells[kind] })).out, new RegExp(`${kind}\\n$`), "control: the Bash tool does not run under sh");
+  }
+});
+
+test("the Bash tool runs under the shell its snapshot names, whatever SHELL says", { skip: !installed.length && "neither bash nor zsh installed" }, async () => {
+  for (const kind of installed) for (const shell of ["/usr/bin/fish", "/bin/sh", null, ...installed.map((k) => shells[k])]) {
+    const { out, code } = await prefix(bashTool(kind, which), session(9801, FLOOR), { shell });
+    assert.equal(out, kind, `snapshot-${kind}, SHELL=${shell}`);
+    assert.equal(code, 0);
+  }
+});
+
+// Claude Code falls back to a login shell when it cannot make a snapshot, and the
+// command is then the Bash tool's with no snapshot to read: the cwd tail is what is left.
+test("a Bash-tool command with no snapshot still runs under bash or zsh", { skip: !installed.length && "neither bash nor zsh installed" }, async () => {
+  for (const shell of ["/usr/bin/fish", null, ...installed.map((k) => shells[k])]) {
+    const { out, code } = await prefix(`${which} && ${cwdTail()}`, session(9801, FLOOR), { shell });
     assert.match(out, /^(bash|zsh)$/, `SHELL=${shell}`);
     assert.equal(code, 0);
   }
 });
 
-test("CLAUDE_CODE_SHELL wins over SHELL, but only when it names bash or zsh and is executable", { skip: !(shells.bash && shells.zsh) && "needs both bash and zsh" }, async () => {
-  const { bash, zsh } = shells;
-  const got = async (extra, shell) => (await prefix(which, session(9801, FLOOR, extra), { shell })).out;
-  assert.equal(await got({ CLAUDE_CODE_SHELL: zsh }, bash), "zsh");
-  assert.equal(await got({ CLAUDE_CODE_SHELL: bash }, zsh), "bash");
-  assert.equal(await got({ CLAUDE_CODE_SHELL: "/bin/sh" }, zsh), "zsh", "names neither");
-  assert.equal(await got({ CLAUDE_CODE_SHELL: "/nonexistent/bash" }, zsh), "zsh", "not executable");
+test("CLAUDE_CODE_SHELL wins over SHELL, but only when it names the snapshot's shell and is executable", async () => {
+  const [a, b, c] = ["floor-a-", "floor-b-", "floor-c-"].map(tmp);
+  fakeBin(a, "bash", "from-ccs"); fakeBin(b, "bash", "from-shell"); fakeBin(c, "zsh", "wrong-kind");
+  const got = async (ccs) => (await prefix(bashTool("bash", "ignored"),
+    session(9801, FLOOR, ccs === undefined ? {} : { CLAUDE_CODE_SHELL: ccs }), { shell: join(b, "bash") })).out;
+  assert.equal(await got(join(a, "bash")), "from-ccs");
+  assert.equal(await got(join(c, "zsh")), "from-shell", "names the other shell than the snapshot");
+  assert.equal(await got("/bin/sh"), "from-shell", "names neither");
+  assert.equal(await got("/nonexistent/bash"), "from-shell", "not executable");
 });
 
-test("no usable SHELL: zsh first, then bash; bash first when SHELL names bash", async () => {
+test("no usable SHELL: the snapshot's shell from PATH; with no snapshot, zsh first, then bash, bash first when SHELL names bash", async () => {
   const dir = tmp("floor-bin-");
   fakeBin(dir, "zsh"); fakeBin(dir, "bash");
-  const got = async (shell) => (await prefix("ignored", session(9801, FLOOR, withPath(dir)), { shell })).out;
-  assert.equal(await got("/usr/bin/fish"), "fake-zsh");
-  assert.equal(await got(null), "fake-zsh");
-  assert.equal(await got("/nonexistent/bash"), "fake-bash");
+  const got = async (cmd, shell) => (await prefix(cmd, session(9801, FLOOR, withPath(dir)), { shell })).out;
+  assert.equal(await got(bashTool("bash", "ignored"), "/usr/bin/fish"), "fake-bash");
+  assert.equal(await got(bashTool("zsh", "ignored"), null), "fake-zsh");
+  const noSnapshot = `ignored && ${cwdTail()}`;
+  assert.equal(await got(noSnapshot, "/usr/bin/fish"), "fake-zsh");
+  assert.equal(await got(noSnapshot, null), "fake-zsh");
+  assert.equal(await got(noSnapshot, "/nonexistent/bash"), "fake-bash");
 });
 
 const usual = ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
-const inUsual = [shells.bash, shells.zsh].some((p) => p && usual.some((d) => p.startsWith(`${d}/`)));
-test("a PATH that has no bash or zsh still finds one in the usual directories", { skip: !inUsual && "bash and zsh live outside the usual directories" }, async () => {
-  const { out } = await prefix(which, session(9801, undefined, { PATH: tmp("floor-empty-") }), { shell: null });
-  assert.match(out, /^(bash|zsh)$/);
+const inUsual = installed.filter((k) => usual.some((d) => shells[k].startsWith(`${d}/`)));
+test("a PATH that has no bash or zsh still finds the snapshot's shell in the usual directories", { skip: !inUsual.length && "bash and zsh live outside the usual directories" }, async () => {
+  for (const kind of inUsual) {
+    const { out } = await prefix(bashTool(kind, which), session(9801, undefined, { PATH: tmp("floor-empty-") }), { shell: null });
+    assert.equal(out, kind);
+  }
 });
 
 // ---- the command string reaches the shell as ONE argument --------------------
 //
 // `sh -c -x` is an option cluster, not a command: bash, zsh and dash all take the
 // first argument that does not start with a dash as the command string unless
-// `--` ends the options. A leading dash in the command must not change that.
+// `--` ends the options.
 const FLOOR_Q = `http://u'ser@h.example.test:1`;   // a quote in the floor must stay one value
 // [command, what it prints given the proxy the child sees]
 const commands = [
-  [`-e 2>/dev/null; printf '[%s]' "$HTTPS_PROXY"`, (seen) => `[${seen}]`],                       // a leading dash
   [`printf '[%s]' 'a'"'"'b' "$(echo sub)" "$HTTPS_PROXY"`, (seen) => `[a'b][sub][${seen}]`],    // quotes, substitution
   [`printf one\nprintf '[%s]' "$HTTPS_PROXY"`, (seen) => `one[${seen}]`],                       // a newline
 ];
 for (const [name, shell] of Object.entries(shells)) {
-  test(`${name}: a leading dash, quotes, substitution and a newline reach the shell intact, with and without a floor`,
+  test(`${name}: quotes, substitution and a newline reach the shell intact, with and without a floor`,
     { skip: !shell && `${name} not installed` }, async () => {
       for (const [cmd, want] of commands) for (const floor of [FLOOR_Q, undefined]) {
-        const { out, code } = await prefix(cmd, session(9801, floor), { shell });
+        const { out, code } = await prefix(bashTool(name === "zsh" ? "zsh" : "bash", cmd), session(9801, floor), { shell });
         assert.equal(out, want(floor ?? CCF), `${cmd} (floor=${floor})`);
         assert.equal(code, 0);
       }
     });
 }
+// No snapshot, so /bin/sh, and with no floor the string is passed on as it came.
+test("sh: a command that begins with a dash is a command, not an option", async () => {
+  const { out, code } = await prefix(`-e 2>/dev/null; printf '[%s]' "$HTTPS_PROXY"`, session(9801, undefined));
+  assert.equal(out, `[${CCF}]`);
+  assert.equal(code, 0);
+});
 
 // The two halves agree on the file's name and directory: what the proxy wrote is
 // what the script reads, with no hand-made file in between.

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, httpsHop, onHopChange, requireHop, selectProxyUrl, directLast, defaultPort } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, httpsHop, onHopChange, requireHop, resolveHop, selectProxyUrl, directLast, defaultPort } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -1302,12 +1302,20 @@ function hopAddress(u) {
 // and a hop URL that carries credentials (published stripped it would be a
 // different hop, answering children 407) are all UNKNOWN, so the file is removed.
 // REQUIRE_HOP forbids a direct dial, so there "nothing configured" is unknown too.
+//
+// A FOURTH ANSWER, undefined: a chain is configured and no walk has landed, so
+// the hop is not known yet. A configured candidate is a guess (it may be the one
+// that is down), and the file is left as it is until a walk names the hop.
 function floorHop() {
-  const candidate = selectProxyUrl(true) || fallbackProxyUrls()[0];
-  // The raw list, not the filtered one: an entry fallbackProxyUrls() drops is configured all the same.
-  if (!candidate && !(process.env.CACHE_FIX_FALLBACK_PROXIES || "").trim()) return requireHop() ? null : "";
+  if (!(selectProxyUrl(true) || fallbackProxyUrls().length)) {
+    // The raw list, not the filtered one: an entry fallbackProxyUrls() drops is configured all the same.
+    const configured = (process.env.CACHE_FIX_FALLBACK_PROXIES || "").trim();
+    return configured || requireHop() ? null : "";
+  }
+  const hop = httpsHop();
+  if (hop === undefined) return undefined;
   try {
-    const u = new URL(httpsHop() ?? candidate);   // "" (every hop refused) or undefined does not parse
+    const u = new URL(hop);   // "" (every hop refused) does not parse
     return /^https?:$/.test(u.protocol) && !u.username && !u.password ? `${u.protocol}//${u.host}` : null;
   } catch { return null; }
 }
@@ -1319,17 +1327,26 @@ function floorHop() {
 function publishChildFloor(port) {
   const path = join(claudeHome(), "proxy-floor", String(port));
   const tmp = `${path}.${process.pid}.tmp`;
+  // False when the hop is not known yet and the file was left alone.
   const write = () => {
     const floor = floorHop();
+    if (floor === undefined) return false;
     try {
-      if (floor === null) return rmSync(path, { force: true });
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(tmp, floor);
-      renameSync(tmp, path);
-    } catch (err) { process.stderr.write(`[cache-fix] child proxy floor not written: ${err?.message}\n`); }
+      if (floor === null) rmSync(path, { force: true });
+      else {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(tmp, floor);
+        renameSync(tmp, path);
+      }
+    } catch (err) {
+      rmSync(tmp, { force: true });
+      process.stderr.write(`[cache-fix] child proxy floor not written: ${err?.message}\n`);
+    }
+    return true;
   };
-  write();
-  return onHopChange(write);
+  const off = onHopChange(write);
+  if (!write()) resolveHop(true);   // one walk names the hop, and the listener writes it
+  return off;
 }
 
 // BOUND OUR OWN LOG, because a default install has nothing else bounding it.

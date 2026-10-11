@@ -29,15 +29,25 @@ for url in "${HTTPS_PROXY-}" "${https_proxy-}" "${HTTP_PROXY-}" "${http_proxy-}"
   done
 done
 
-# The shell Claude Code itself runs commands under: CLAUDE_CODE_SHELL, then SHELL,
-# each only if it names bash or zsh and is executable; else zsh, then bash (bash
-# first when SHELL names bash) from PATH and the usual directories; else /bin/sh.
+# The shell is the one Claude Code runs the command under. Only its Bash tool runs
+# under bash or zsh, and the shell snapshot it sources first names which; hooks,
+# stdio MCP servers and the statusLine run under /bin/sh, and so do they here. The
+# Bash tool without a snapshot (Claude Code could not make one) is told by its cwd
+# tail. The bash or zsh is CLAUDE_CODE_SHELL, then SHELL, each only if it names that
+# shell and is executable; else it is found on PATH and in the usual directories.
+case $1 in
+  */shell-snapshots/snapshot-zsh-*) names=zsh ;;
+  */shell-snapshots/snapshot-bash-*) names=bash ;;
+  *'&& pwd -P >| '*) case ${SHELL-} in *bash*) names='bash zsh' ;; *) names='zsh bash' ;; esac ;;
+  *) names= ;;
+esac
 shell=
 for s in "${CLAUDE_CODE_SHELL-}" "${SHELL-}"; do
-  case $s in *bash*|*zsh*) [ -x "$s" ] && shell=$s && break ;; esac
+  for n in $names; do
+    case $s in *"$n"*) [ -x "$s" ] && shell=$s && break 2 ;; esac
+  done
 done
 if [ -z "$shell" ]; then
-  case ${SHELL-} in *bash*) names='bash zsh' ;; *) names='zsh bash' ;; esac
   for n in $names; do
     shell=$(command -v "$n") && break
     for d in /bin /usr/bin /usr/local/bin /opt/homebrew/bin; do [ -x "$d/$n" ] && shell=$d/$n && break 2; done
