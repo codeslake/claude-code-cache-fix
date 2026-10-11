@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, onHopChange, requireHop, directLast, defaultPort } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, httpsHop, onHopChange, requireHop, selectProxyUrl, directLast, defaultPort } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -445,7 +445,8 @@ function handleHealth(req, res) {
     // candidate; `undefined` is a proxy that has dialled nothing yet — every
     // successor is in that state for its first request — and there the
     // configured candidate is the only thing known and asserts nothing false.
-    https_proxy: (_forwardActive > 0 && hopInUse()) || null,
+    https_proxy: (_forwardActive > 0 && hopAddress(
+      lastHop() ?? (config.httpsProxy || fallbackProxyUrls()[0]))) || null,
     // MEASURED OR MERELY CONFIGURED. The line above publishes a URL in two
     // different situations — the hop a resolve actually used, and the first
     // candidate on a proxy that has dialled nothing yet — and a reader cannot
@@ -1288,31 +1289,39 @@ function hopAddress(u) {
   } catch { return ""; }
 }
 
-// The address /health publishes as https_proxy: the hop the last resolve landed
-// on, else the configured candidate. "" is direct.
-const hopInUse = () => hopAddress(lastHop() ?? (config.httpsProxy || fallbackProxyUrls()[0]));
-
 // THE CHILD FLOOR, written where bin/child-proxy-floor.sh reads it. In forward
 // mode every process the session starts inherits HTTPS_PROXY=<this proxy>, and
 // that script (CLAUDE_CODE_SHELL_PREFIX) swaps it for the hop this proxy itself
 // dials. It runs in a fresh shell per command and cannot ask /health, so the
-// answer sits in a file next to the other cache-fix state.
+// answer sits in <config dir>/proxy-floor/<port>, a directory any local proxy
+// may publish to.
 //
 // THREE STATES: no file = unknown (the script changes nothing), empty file =
-// direct, a URL = that hop. Empty is written, never skipped, when there is no
-// hop: skipping it would tell every child to keep dialling us.
-//
-// Atomic, because a reader may open it between a truncate and a write and would
-// read "direct" for a proxy that has a hop. Not removed on close: a successor on
-// the same port rewrites it at listen, and a stale hop beats none while we are down.
+// direct, a URL = that hop. Empty means "nothing is configured to dial through",
+// and only that: a chain whose hops all refuse, a value that is no http(s) URL,
+// and a hop URL that carries credentials (published stripped it would be a
+// different hop, answering children 407) are all UNKNOWN, so the file is removed.
+// REQUIRE_HOP forbids a direct dial, so there "nothing configured" is unknown too.
+function floorHop() {
+  const chain = [selectProxyUrl(true), ...fallbackProxyUrls()].filter(Boolean);
+  if (!chain.length) return requireHop() ? null : "";
+  try {
+    const u = new URL(httpsHop() ?? chain[0]);   // "" (every hop refused) does not parse
+    return /^https?:$/.test(u.protocol) && !u.username && !u.password ? `${u.protocol}//${u.host}` : null;
+  } catch { return null; }
+}
+
+// Atomic, because a reader may open the file between a truncate and a write and
+// would read "direct" for a proxy that has a hop. Not removed on close: a
+// successor on the same port rewrites it at listen, and a stale hop beats none
+// while we are down.
 function publishChildFloor(port) {
   const path = join(claudeHome(), "proxy-floor", String(port));
   const tmp = `${path}.${process.pid}.tmp`;
   const write = () => {
-    const floor = hopInUse();
+    const floor = floorHop();
     try {
-      // REQUIRE_HOP forbids a direct dial, so "no hop" is unknown there, not direct.
-      if (!floor && requireHop()) return rmSync(path, { force: true });
+      if (floor === null) return rmSync(path, { force: true });
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(tmp, floor);
       renameSync(tmp, path);

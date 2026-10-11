@@ -32,14 +32,14 @@ const tmp = (p) => { const d = mkdtempSync(join(tmpdir(), p)); scratch.push(d); 
 after(() => { for (const d of scratch) rmSync(d, { recursive: true, force: true }); });
 
 // A scrubbed environment with forward mode on and the state dirs in scratch.
-async function wire(reset = true) {
+async function wire() {
   const saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
   for (const k of ENV_KEYS) delete process.env[k];
   const home = tmp("floor-home-");
   Object.assign(process.env, {
     CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_CA_DIR: tmp("floor-ca-"), CLAUDE_CONFIG_DIR: home,
   });
-  if (reset) await resolveHop(true);   // lastHop() is module state: an empty chain resets the previous case's hop
+  await resolveHop(true);   // the hop is module state: a walk over an empty chain resets the previous case's
   return { home, restore() {
     for (const k of ENV_KEYS) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
   } };
@@ -49,12 +49,10 @@ const read = (home, port) => readFileSync(join(home, "proxy-floor", String(port)
 // What is published under a config dir; [] when nothing ever created the directory.
 const ls = (home) => { try { return readdirSync(join(home, "proxy-floor")); } catch { return []; } };
 
-// lastHop() is module state, undefined until something dials: this case must run
-// first and must not reset it, every later one starts from wire()'s reset.
 test("listen publishes the configured hop before anything has dialled", async () => {
   const hop = net.createServer();
   const hopPort = await listenOn(hop);
-  const w = await wire(false);
+  const w = await wire();
   process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${hopPort}`;
   const p = await startProxy({ port: await freePort(), watch: false });
   try {
@@ -84,6 +82,76 @@ test("no hop is an EMPTY file (direct), and the file follows the hop as it chang
     assert.equal(read(w.home, p.port), "", "a chain that emptied is direct again");
 
     assert.deepEqual(ls(w.home), [String(p.port)], "the atomic write left a temp file behind");
+  } finally { await p.close(); a.close(); b.close(); w.restore(); }
+});
+
+// An empty file says "I dial direct", which is only true of a proxy with nothing
+// to dial through. One whose chain is configured and wholly refused is between
+// hops, and its next request may well go through one: the answer is unknown.
+test("a configured chain with no reachable hop is UNKNOWN (no file), not direct", async () => {
+  const w = await wire();
+  const dead = `http://127.0.0.1:${await freePort()}`;
+  process.env.CACHE_FIX_FALLBACK_PROXIES = dead;
+  const p = await startProxy({ port: await freePort(), watch: false });
+  try {
+    assert.equal(read(w.home, p.port), dead, "the configured candidate is published until something dials");
+    assert.equal(await resolveHop(true), "", "every hop refused: the walk falls through");
+    assert.deepEqual(ls(w.home), [], "a chain that is configured but unreachable must not publish direct");
+  } finally { await p.close(); w.restore(); }
+});
+
+test("a configured value that is no usable hop is UNKNOWN, never direct", async () => {
+  for (const bad of ["not a url", "socks5://127.0.0.1:1080"]) {
+    const w = await wire();
+    process.env.CACHE_FIX_UPSTREAM_PROXY = bad;
+    const p = await startProxy({ port: await freePort(), watch: false });
+    try {
+      assert.deepEqual(ls(w.home), [], bad);
+      await resolveHop(true);
+      assert.deepEqual(ls(w.home), [], `${bad} after a walk`);
+    } finally { await p.close(); w.restore(); }
+  }
+});
+
+// A credential-stripped URL is a different hop: children sent to it get a 407
+// from a proxy that wanted the credentials, which is worse than not having
+// moved them at all.
+test("a hop URL that carries credentials is UNKNOWN, it is never published stripped", async () => {
+  const hop = net.createServer();
+  const withCreds = `http://user:pw@127.0.0.1:${await listenOn(hop)}`;
+  try {
+    for (const key of ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES"]) {
+      const w = await wire();
+      process.env[key] = withCreds;
+      const p = await startProxy({ port: await freePort(), watch: false });
+      try {
+        assert.deepEqual(ls(w.home), [], `${key}, before anything dials`);
+        assert.equal(await resolveHop(true), withCreds, "the hop is live and in use");
+        assert.deepEqual(ls(w.home), [], `${key}, once it is the hop in use`);
+      } finally { await p.close(); w.restore(); }
+    }
+  } finally { hop.close(); }
+});
+
+// The six variables get ONE value and the HTTPS walk decides it. An http walk
+// can land on a different hop (it reads HTTP_PROXY only), and letting it write
+// would flip the file between two values as requests alternate.
+test("only the HTTPS hop walk updates the floor: an http walk elsewhere leaves it alone", async () => {
+  const w = await wire();
+  const a = net.createServer(), b = net.createServer();
+  const [aUrl, bUrl] = [`http://127.0.0.1:${await listenOn(a)}`, `http://127.0.0.1:${await listenOn(b)}`];
+  process.env.HTTPS_PROXY = aUrl;
+  process.env.HTTP_PROXY = bUrl;
+  const p = await startProxy({ port: await freePort(), watch: false });
+  const file = join(w.home, "proxy-floor", String(p.port));
+  try {
+    assert.equal(await resolveHop(true), aUrl);
+    assert.equal(read(w.home, p.port), aUrl);
+    const before = statSync(file).ino;
+    assert.equal(await resolveHop(false), bUrl, "the http walk lands on a different hop");
+    assert.equal(read(w.home, p.port), aUrl, "an http walk rewrote the floor");
+    assert.equal(await resolveHop(true), aUrl);
+    assert.equal(statSync(file).ino, before, "an http/https alternation rewrote the file");
   } finally { await p.close(); a.close(); b.close(); w.restore(); }
 });
 
