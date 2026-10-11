@@ -206,6 +206,21 @@ let _lastHopReport = "";
 // field already carried once.
 let _lastHop;
 export const lastHop = () => _lastHop;
+// THE HOP THE HTTPS WALK LAST LANDED ON, for the child proxy floor. Apart from
+// _lastHop, which every walk writes: an http walk reads HTTP_PROXY only and can
+// land elsewhere, and the floor is one value for all six variables.
+// undefined = nothing dialled yet, or nothing configured to dial through;
+// "" = a chain is configured and every hop refused; else the hop in use.
+// Listeners are told on a change, so the floor is rewritten then and not on a timer.
+let _httpsHop;
+export const httpsHop = () => _httpsHop;
+const _hopListeners = new Set();
+export const onHopChange = (fn) => { _hopListeners.add(fn); return () => _hopListeners.delete(fn); };
+function noteHttpsHop(isHTTPS, hop) {
+  if (!isHTTPS || hop === _httpsHop) return;
+  _httpsHop = hop;
+  for (const fn of _hopListeners) fn();
+}
 // WHEN THE CHAIN LAST WENT DIRECT, ISO-8601 UTC, null if never. A point-in-time
 // field cannot report a flap: the chain is back within ~1s and every probe after
 // that reads green, so the outage that actually happened leaves no trace anyone
@@ -316,6 +331,7 @@ async function _resolveHopUncoalesced(isHTTPS) {
     // and stamping it would fire on every reverse-mode proxy that never had one,
     // which empties the field of the meaning it exists for.
     _lastHop = "";
+    noteHttpsHop(isHTTPS, undefined);
     return "";
   }
   const deadline = Date.now() + CHAIN_GRACE_MS;
@@ -341,6 +357,7 @@ async function _resolveHopUncoalesced(isHTTPS) {
           }
         }
         _lastHop = hop;
+        noteHttpsHop(isHTTPS, hop);
         return hop;
       }
     }
@@ -364,6 +381,7 @@ async function _resolveHopUncoalesced(isHTTPS) {
              + (refusing ? "refusing (CACHE_FIX_REQUIRE_HOP=1)" : "dialling direct");
   if (note !== _lastHopReport) { _lastHopReport = note; process.stderr.write(`[upstream] ${note}\n`); }
   _lastHop = "";
+  noteHttpsHop(isHTTPS, "");
   if (!refusing) _directLast = new Date().toISOString();
   return "";
 }

@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, directLast, defaultPort } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, httpsHop, onHopChange, requireHop, selectProxyUrl, directLast, defaultPort } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -18,7 +18,7 @@ import { publishableGates } from "./gate-allowlist.mjs";
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
 // Env is read on every call so tests (and operators flipping the flag at
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
-import { appendFileSync, fstatSync, ftruncateSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeSync } from "node:fs";
+import { appendFileSync, fstatSync, ftruncateSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -1261,6 +1261,12 @@ export async function startProxy(options = {}) {
         "   `claude-via-proxy --remote-control` instead — that variable takes\n" +
         "   one file, so setting it here would untrust the other CA)\n");
   }
+  // The ADVERTISED port: the number in the clients' HTTPS_PROXY is the key the
+  // script looks up. A holder's child binds an ephemeral port and is advertised
+  // under the holder's; a port the OS picked for us is in nobody's HTTPS_PROXY
+  // ahead of time, so there is nothing to publish and nothing to pile up.
+  const advertised = Number(process.env.CACHE_FIX_HELD_PORT) || (port > 0 ? addr.port : 0);
+  const unpublishFloor = forwardAttached && advertised ? publishChildFloor(advertised) : () => {};
   let closed = false;
   return {
     server,
@@ -1276,6 +1282,9 @@ export async function startProxy(options = {}) {
     inheritedSocket: listenFd === 3,
     close: () =>
       new Promise((resolve, reject) => {
+        // Stop publishing the child floor as the stop is signalled, not when the drain ends:
+        // the hop listener's delete is idempotent, and a draining instance must not rewrite a file its successor owns.
+        unpublishFloor();
         try { stopOAuthRefresher(); } catch {}
         try {
           if (watcher) watcher.close();
@@ -1472,6 +1481,64 @@ function hopAddress(u) {
     const x = new URL(u);
     return x.protocol === "http:" || x.protocol === "https:" ? `${x.protocol}//${x.host}` : "";
   } catch { return ""; }
+}
+
+// THE CHILD FLOOR, written where bin/child-proxy-floor.sh reads it. In forward
+// mode every process the session starts inherits HTTPS_PROXY=<this proxy>, and
+// that script (CLAUDE_CODE_SHELL_PREFIX) swaps it for the hop this proxy itself
+// dials. It runs in a fresh shell per command and cannot ask /health, so the
+// answer sits in <config dir>/proxy-floor/<port>, a directory any local proxy
+// may publish to.
+//
+// THREE STATES: no file = unknown (the script changes nothing), empty file =
+// direct, a URL = that hop. Empty means "nothing is configured to dial through",
+// and only that: a chain whose hops all refuse, a value that is no http(s) URL,
+// and a hop URL that carries credentials (published stripped it would be a
+// different hop, answering children 407) are all UNKNOWN, so the file is removed.
+// REQUIRE_HOP forbids a direct dial, so there "nothing configured" is unknown too.
+//
+// A FOURTH ANSWER, undefined: a chain is configured and no walk has landed, so
+// the hop is not known yet. A configured candidate is a guess (it may be the one
+// that is down), and the file is left as it is until a real request's walk names
+// the hop. Listen starts no walk of its own: with every hop down it would stamp
+// direct_last and log "dialling direct" with no dial made, and retire a handover
+// predecessor's good file in the outage.
+function floorHop() {
+  if (!(selectProxyUrl(true) || fallbackProxyUrls().length)) {
+    // The raw list, not the filtered one: an entry fallbackProxyUrls() drops is configured all the same.
+    const configured = (process.env.CACHE_FIX_FALLBACK_PROXIES || "").trim();
+    return configured || requireHop() ? null : "";
+  }
+  const hop = httpsHop();
+  if (hop === undefined) return undefined;
+  try {
+    const u = new URL(hop);   // "" (every hop refused) does not parse
+    return /^https?:$/.test(u.protocol) && !u.username && !u.password ? `${u.protocol}//${u.host}` : null;
+  } catch { return null; }
+}
+
+// Atomic, because a reader may open the file between a truncate and a write and
+// would read "direct" for a proxy that has a hop. Not removed on close: a
+// successor on the same port rewrites it once its walk lands, and a stale hop
+// beats none while we are down.
+function publishChildFloor(port) {
+  const path = join(claudeHome(), "proxy-floor", String(port));
+  const tmp = `${path}.${process.pid}.tmp`;
+  const write = () => {
+    const floor = floorHop();
+    if (floor === undefined) return;   // not known yet: the first real HTTPS walk names it, and the listener runs this again
+    try {
+      if (floor === null) return rmSync(path, { force: true });
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(tmp, floor);
+      renameSync(tmp, path);
+    } catch (err) {
+      try { rmSync(tmp, { force: true }); } catch {}   // under a path that is no directory it throws too
+      process.stderr.write(`[cache-fix] child proxy floor not written: ${err?.message}\n`);
+    }
+  };
+  write();
+  return onHopChange(write);
 }
 
 // BOUND OUR OWN LOG, because a default install has nothing else bounding it.

@@ -32,6 +32,9 @@ import {
 } from "node:fs";
 import { armLineage, reapStamped } from "./proc-helpers.mjs";
 
+import { isolateClaudeHome } from "./proc-helpers.mjs";
+
+isolateClaudeHome();   // the proxy it spawns inherits it
 const serverPath = join(fileURLToPath(new URL(".", import.meta.url)), "..", "proxy", "server.mjs");
 // See proc-helpers.mjs's armLineage()/reapStamped() and
 // stdio-epipe-survival.test.mjs's note, same shape: the spawn below inherits

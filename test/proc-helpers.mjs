@@ -10,7 +10,7 @@
 // and an arrow function in a fourth, and freePort had three different shapes.
 
 import { execFileSync, spawn } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { constants as osConstants, tmpdir } from "node:os";
@@ -207,6 +207,17 @@ export function armLineage(name) {
     process.once(sig, () => process.exit(128 + osConstants.signals[sig]));
   }
   return marker;
+}
+
+// A forward-mode proxy publishes proxy-floor/<port> in the Claude
+// config dir, and a spawned one inherits this process's environment. A file that
+// launches real proxies calls this first, or every run leaves one per port in the
+// developer's own ~/.claude.
+export function isolateClaudeHome() {
+  const dir = mkdtempSync(join(tmpdir(), "ccf-home-"));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  process.once("exit", () => rmSync(dir, { recursive: true, force: true }));
+  return dir;
 }
 
 // A port nobody is listening on RIGHT NOW. It is released before the caller
