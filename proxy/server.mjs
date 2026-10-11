@@ -1102,11 +1102,12 @@ export async function startProxy(options = {}) {
         "   `claude-via-proxy --remote-control` instead — that variable takes\n" +
         "   one file, so setting it here would untrust the other CA)\n");
   }
-  // The ADVERTISED port, which a holder's child (bound to an ephemeral one) is
-  // not: the number in the clients' HTTPS_PROXY is the key the script looks up.
-  const unpublishFloor = forwardAttached
-    ? publishChildFloor(Number(process.env.CACHE_FIX_HELD_PORT) || addr.port)
-    : () => {};
+  // The ADVERTISED port: the number in the clients' HTTPS_PROXY is the key the
+  // script looks up. A holder's child binds an ephemeral port and is advertised
+  // under the holder's; a port the OS picked for us is in nobody's HTTPS_PROXY
+  // ahead of time, so there is nothing to publish and nothing to pile up.
+  const advertised = Number(process.env.CACHE_FIX_HELD_PORT) || (port > 0 ? addr.port : 0);
+  const unpublishFloor = forwardAttached && advertised ? publishChildFloor(advertised) : () => {};
   let closed = false;
   return {
     server,
@@ -1307,20 +1308,14 @@ const hopInUse = () => hopAddress(lastHop() ?? (config.httpsProxy || fallbackPro
 function publishChildFloor(port) {
   const path = join(claudeHome(), `cache-fix-child-proxy-${port}`);
   const tmp = `${path}.${process.pid}.tmp`;
-  let last;
   const write = () => {
     const floor = hopInUse();
-    // REQUIRE_HOP forbids a direct dial, so "no hop" is unknown there, not direct.
-    const state = floor || !requireHop() ? floor : null;
-    if (state === last) return;
     try {
-      if (state === null) rmSync(path, { force: true });
-      else {
-        mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(tmp, state);
-        renameSync(tmp, path);
-      }
-      last = state;
+      // REQUIRE_HOP forbids a direct dial, so "no hop" is unknown there, not direct.
+      if (!floor && requireHop()) return rmSync(path, { force: true });
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(tmp, floor);
+      renameSync(tmp, path);
     } catch (err) { process.stderr.write(`[cache-fix] child proxy floor not written: ${err?.message}\n`); }
   };
   write();

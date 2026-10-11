@@ -18,7 +18,9 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { OURS, cmdOf, freePort, listeners } from "./proc-helpers.mjs";
+import { OURS, cmdOf, freePort, isolateClaudeHome, listeners } from "./proc-helpers.mjs";
+
+isolateClaudeHome();   // its holder and proxy inherit it
 
 const here = dirname(fileURLToPath(import.meta.url));
 const launcherPath = join(here, "..", "bin", "claude-via-proxy.mjs");

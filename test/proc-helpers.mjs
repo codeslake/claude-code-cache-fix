@@ -10,8 +10,10 @@
 // and an arrow function in a fourth, and freePort had three different shapes.
 
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
 // and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
@@ -94,6 +96,17 @@ export function ours(port) {
     }
   } catch { /* no ps either: the caller falls back to listeners() */ }
   return out;
+}
+
+// A forward-mode proxy publishes cache-fix-child-proxy-<port> in the Claude
+// config dir, and a spawned one inherits this process's environment. A file that
+// launches real proxies calls this first, or every run leaves one per port in the
+// developer's own ~/.claude.
+export function isolateClaudeHome() {
+  const dir = mkdtempSync(join(tmpdir(), "ccf-home-"));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  process.once("exit", () => rmSync(dir, { recursive: true, force: true }));
+  return dir;
 }
 
 // A port nobody is listening on RIGHT NOW. It is released before the caller

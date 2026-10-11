@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { exitWithin } from "./child-deadline.mjs";
+import { freePort } from "./proc-helpers.mjs";
 
 // Before upstream.mjs loads: it reads the grace window once, at import.
 process.env.CACHE_FIX_CHAIN_GRACE_MS = "100";
@@ -53,7 +54,7 @@ test("listen publishes the configured hop before anything has dialled", async ()
   const hopPort = await listenOn(hop);
   const w = await wire(false);
   process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${hopPort}`;
-  const p = await startProxy({ port: 0, watch: false });
+  const p = await startProxy({ port: await freePort(), watch: false });
   try {
     assert.equal(read(w.home, p.port), `http://127.0.0.1:${hopPort}`);
   } finally { await p.close(); hop.close(); w.restore(); }
@@ -61,7 +62,7 @@ test("listen publishes the configured hop before anything has dialled", async ()
 
 test("no hop is an EMPTY file (direct), and the file follows the hop as it changes", async () => {
   const w = await wire();
-  const p = await startProxy({ port: 0, watch: false });
+  const p = await startProxy({ port: await freePort(), watch: false });
   const a = net.createServer(), b = net.createServer();
   const [aPort, bPort] = [await listenOn(a), await listenOn(b)];
   try {
@@ -86,7 +87,7 @@ test("no hop is an EMPTY file (direct), and the file follows the hop as it chang
 
 test("a closed instance stops writing", async () => {
   const w = await wire();
-  const p = await startProxy({ port: 0, watch: false });
+  const p = await startProxy({ port: await freePort(), watch: false });
   const hop = net.createServer();
   const hopPort = await listenOn(hop);
   try {
@@ -97,10 +98,21 @@ test("a closed instance stops writing", async () => {
   } finally { hop.close(); w.restore(); }
 });
 
+// A port the OS picked cannot be in anyone's HTTPS_PROXY ahead of time, so there
+// is nothing to look up by it, and a file per ephemeral port would pile up in the
+// config dir: every embedded or test start would leave one.
+test("an OS-assigned port (0) publishes nothing", async () => {
+  const w = await wire();
+  const p = await startProxy({ port: 0, watch: false });
+  try {
+    assert.deepEqual(readdirSync(w.home), []);
+  } finally { await p.close(); w.restore(); }
+});
+
 test("reverse-only mode writes no floor file", async () => {
   const w = await wire();
   delete process.env.CACHE_FIX_FORWARD_PROXY;
-  const p = await startProxy({ port: 0, watch: false });
+  const p = await startProxy({ port: await freePort(), watch: false });
   try {
     assert.deepEqual(readdirSync(w.home), []);
   } finally { await p.close(); w.restore(); }
@@ -112,7 +124,7 @@ test("reverse-only mode writes no floor file", async () => {
 test("REQUIRE_HOP with no hop publishes nothing, never direct", async () => {
   const w = await wire();
   process.env.CACHE_FIX_REQUIRE_HOP = "1";
-  const p = await startProxy({ port: 0, watch: false });
+  const p = await startProxy({ port: await freePort(), watch: false });
   const hop = net.createServer();
   try {
     assert.deepEqual(readdirSync(w.home), []);
@@ -267,7 +279,7 @@ test("a running proxy's floor reaches a child through the script", async () => {
   const hopUrl = `http://127.0.0.1:${await listenOn(hop)}`;
   process.env.CACHE_FIX_FALLBACK_PROXIES = hopUrl;
   await resolveHop(true);
-  const p = await startProxy({ port: 0, watch: false });
+  const p = await startProxy({ port: await freePort(), watch: false });
   try {
     const { out } = await prefix(show, { CLAUDE_CONFIG_DIR: w.home, HTTPS_PROXY: `http://127.0.0.1:${p.port}` });
     assert.deepEqual(lines(out), all(`[${hopUrl}]`));

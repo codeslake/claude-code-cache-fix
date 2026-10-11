@@ -31,6 +31,9 @@ import {
   closeSync, fstatSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
 
+import { isolateClaudeHome } from "./proc-helpers.mjs";
+
+isolateClaudeHome();   // the proxy it spawns inherits it
 const serverPath = join(fileURLToPath(new URL(".", import.meta.url)), "..", "proxy", "server.mjs");
 
 describe("log cap", () => {
