@@ -9,7 +9,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -229,10 +229,10 @@ const shellPath = (bin) => spawnSync("sh", ["-c", `command -v ${bin}`], { encodi
 
 // The prefix is called with one argument, the full command string. The
 // environment is built, not inherited: a developer's own HTTPS_PROXY would
-// otherwise decide the result.
-async function prefix(cmd, env, { shell = "/bin/sh" } = {}) {
+// otherwise decide the result. `shell: null` leaves SHELL unset.
+async function prefix(cmd, env, { shell = shellPath("bash") || "/bin/sh" } = {}) {
   const child = spawn(SCRIPT, [cmd], {
-    env: { PATH: process.env.PATH, SHELL: shell, ...env }, stdio: ["ignore", "pipe", "inherit"],
+    env: { PATH: process.env.PATH, ...(shell === null ? {} : { SHELL: shell }), ...env }, stdio: ["ignore", "pipe", "inherit"],
   });
   let out = "";
   child.stdout.on("data", (c) => (out += c));
@@ -358,11 +358,87 @@ test("bash: a BASH_ENV that re-exports the CCF port does not win", { skip: needs
   assert.match(out, /hop\.example\.test:3128/);
 });
 
-test("sh: the floor reaches a probe", { skip: needs("sh") }, async () => {
-  const { out } = await prefix(probe, session(9801, FLOOR), { shell: "/bin/sh" });
-  assert.ok(!out.includes("9801"), `the child saw the CCF port: ${out}`);
-  assert.match(out, /hop\.example\.test:3128/);
+// ---- which shell runs the command ------------------------------------------
+//
+// Claude Code resolves the shell itself: CLAUDE_CODE_SHELL, then SHELL, each only
+// if it names bash or zsh and is executable; else zsh, then bash, from PATH and
+// the usual directories. Execing $SHELL as given would run a user's fish, or no
+// shell at all when SHELL is unset, where Claude Code would have run bash or zsh.
+const dashAsBash = () => {
+  const dash = shellPath("dash");
+  if (!dash) return null;
+  const link = join(tmp("floor-dash-"), "bash");
+  symlinkSync(dash, link);
+  return link;
+};
+const shells = { bash: shellPath("bash"), zsh: shellPath("zsh"), dash: dashAsBash() };
+const which = `printf '%s' "\${BASH_VERSION:+bash}\${ZSH_VERSION:+zsh}"`;
+// An executable that is not a shell: it prints its own name, so a case can tell
+// which candidate the script picked without bash or zsh being installed.
+function fakeBin(dir, name) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), `#!/bin/sh\nprintf '%s' fake-${name}\n`);
+  chmodSync(join(dir, name), 0o755);
+}
+const withPath = (dir) => ({ PATH: `${dir}:${process.env.PATH}` });
+
+test("SHELL that is not bash or zsh (fish, sh, a path that does not exist, unset) still runs bash or zsh", { skip: !(shells.bash || shells.zsh) && "neither bash nor zsh installed" }, async () => {
+  for (const shell of ["/usr/bin/fish", "/bin/sh", null]) {
+    const { out, code } = await prefix(which, session(9801, FLOOR), { shell });
+    assert.match(out, /^(bash|zsh)$/, `SHELL=${shell}`);
+    assert.equal(code, 0);
+  }
 });
+
+test("CLAUDE_CODE_SHELL wins over SHELL, but only when it names bash or zsh and is executable", { skip: !(shells.bash && shells.zsh) && "needs both bash and zsh" }, async () => {
+  const { bash, zsh } = shells;
+  const got = async (extra, shell) => (await prefix(which, session(9801, FLOOR, extra), { shell })).out;
+  assert.equal(await got({ CLAUDE_CODE_SHELL: zsh }, bash), "zsh");
+  assert.equal(await got({ CLAUDE_CODE_SHELL: bash }, zsh), "bash");
+  assert.equal(await got({ CLAUDE_CODE_SHELL: "/bin/sh" }, zsh), "zsh", "names neither");
+  assert.equal(await got({ CLAUDE_CODE_SHELL: "/nonexistent/bash" }, zsh), "zsh", "not executable");
+});
+
+test("no usable SHELL: zsh first, then bash; bash first when SHELL names bash", async () => {
+  const dir = tmp("floor-bin-");
+  fakeBin(dir, "zsh"); fakeBin(dir, "bash");
+  const got = async (shell) => (await prefix("ignored", session(9801, FLOOR, withPath(dir)), { shell })).out;
+  assert.equal(await got("/usr/bin/fish"), "fake-zsh");
+  assert.equal(await got(null), "fake-zsh");
+  assert.equal(await got("/nonexistent/bash"), "fake-bash");
+});
+
+const usual = ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
+const inUsual = [shells.bash, shells.zsh].some((p) => p && usual.some((d) => p.startsWith(`${d}/`)));
+test("a PATH that has no bash or zsh still finds one in the usual directories", { skip: !inUsual && "bash and zsh live outside the usual directories" }, async () => {
+  const { out } = await prefix(which, session(9801, undefined, { PATH: tmp("floor-empty-") }), { shell: null });
+  assert.match(out, /^(bash|zsh)$/);
+});
+
+// ---- the command string reaches the shell as ONE argument --------------------
+//
+// `sh -c -x` is an option cluster, not a command: bash, zsh and dash all take the
+// first argument that does not start with a dash as the command string unless
+// `--` ends the options. A leading dash in the command must not change that.
+const FLOOR_Q = `http://u'ser@h.example.test:1`;   // a quote in the floor must stay one value
+const commands = [
+  ["a leading dash", `-e 2>/dev/null; printf '[%s]' "$HTTPS_PROXY"`],
+  ["quotes and substitution", `printf '[%s]' 'a'"'"'b' "$(echo sub)" "$HTTPS_PROXY"`],
+  ["a newline", `printf one\nprintf '[%s]' "$HTTPS_PROXY"`],
+];
+for (const [name, shell] of Object.entries(shells)) {
+  for (const [what, cmd] of commands) {
+    test(`${name}: ${what} reaches the shell intact, with and without a floor`, { skip: shell ? false : `${name} not installed` }, async () => {
+      for (const floor of [FLOOR_Q, undefined]) {
+        const seen = floor ?? CCF;
+        const want = { "a leading dash": `[${seen}]`, "quotes and substitution": `[a'b][sub][${seen}]`, "a newline": `one[${seen}]` }[what];
+        const { out, code } = await prefix(cmd, session(9801, floor), { shell });
+        assert.equal(out, want, `floor=${floor}`);
+        assert.equal(code, 0);
+      }
+    });
+  }
+}
 
 // The two halves agree on the file's name and directory: what the proxy wrote is
 // what the script reads, with no hand-made file in between.
