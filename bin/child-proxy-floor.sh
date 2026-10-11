@@ -31,20 +31,24 @@ done
 
 # The shell is the one Claude Code runs the command under. Only its Bash tool runs
 # under bash or zsh; hooks, stdio MCP servers and the statusLine run under /bin/sh,
-# and so do they here. The Bash tool's string is Claude Code's own clauses with the
-# user's command inside an eval after them, so the shell is read from the clauses
-# and not from anything a command can say: the snapshot it sources first, which
-# names the shell, up to the first ` 2>/dev/null` (the clause's own end); or, when
-# Claude Code could not make a snapshot, the setup clause it always adds when a
-# prefix is set. The bash or zsh is CLAUDE_CODE_SHELL, then SHELL, each only if it
-# names that shell and is executable; else it is found on PATH and in the usual
-# directories.
+# and so do they here. The Bash tool's string is Claude Code's own clauses joined
+# by ` && `, with the user's command inside an eval after them, so the shell is read
+# from the clauses and not from anything a command can say: the snapshot it sources
+# first, which names the shell, up to the first ` 2>/dev/null` (the clause's own
+# end); or, with no snapshot, the setup clause it always adds when a prefix is set,
+# wherever among its clauses (a TMPDIR export or the session env script can come
+# first) with ` && eval ` after it. The bash or zsh is CLAUDE_CODE_SHELL, then
+# SHELL, each only if it names that shell and is executable; else it is found on
+# PATH and in the usual directories.
+setup='{ shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true'
 case ${1%% 2>/dev/null*} in
   'source '*/shell-snapshots/snapshot-zsh-*) names=zsh ;;
   'source '*/shell-snapshots/snapshot-bash-*) names=bash ;;
-  '{ shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true && '*)
-    case ${SHELL-} in *bash*) names='bash zsh' ;; *) names='zsh bash' ;; esac ;;
-  *) names= ;;
+  *)
+    case " && $1" in
+      *" && $setup && "*" && eval "*) case ${SHELL-} in *bash*) names='bash zsh' ;; *) names='zsh bash' ;; esac ;;
+      *) names= ;;
+    esac ;;
 esac
 shell=
 for s in "${CLAUDE_CODE_SHELL-}" "${SHELL-}"; do

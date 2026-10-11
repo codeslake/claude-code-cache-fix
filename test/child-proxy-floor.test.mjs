@@ -393,12 +393,14 @@ test("the command string and its exit status pass through", async () => {
 // (when it could make one), and the snapshot's file name says which shell the
 // command is written for. Two fixed setup clauses follow, the user's command is
 // quoted into an eval, and the cwd file comes last (shape read from 2.1.296 and
-// logged from a real session). A command hook, a stdio MCP server and the
-// statusLine pass the bare command.
+// logged from a real session). `lead` is what Claude Code puts ahead of the setup
+// clauses: a sandbox TMPDIR export, a session env script pushed as `<script>\n:`.
+// A command hook, a stdio MCP server and the statusLine pass the bare command.
 const snapshot = (kind) => `/home/u/.claude/shell-snapshots/snapshot-${kind}-1700000000000-abc123.sh`;
 const quoted = (s) => `'${s.replaceAll("'", `'"'"'`)}'`;
-const bashTool = (kind, cmd) => [
+const bashTool = (kind, cmd, lead = []) => [
   ...(kind ? [`source ${snapshot(kind)} 2>/dev/null || true`] : []),
+  ...lead,
   "{ shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true",
   "{ \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true",
   `eval ${quoted(cmd)} < /dev/null`,
@@ -490,6 +492,23 @@ test("a Bash-tool command with no snapshot still runs under bash or zsh, with or
   }
 });
 
+// With no snapshot, Claude Code can put clauses of its own AHEAD of the setup clause:
+// a sandbox TMPDIR export, the session env script (pushed as `<script>\n:`, and
+// free to hold ` 2>/dev/null` or ` && eval `, as a real env file does). The setup
+// clause is still the Bash tool's mark.
+const leads = {
+  "an export": ["export TMPDIR='/tmp/claude-1000'"],
+  "a multi-line env script": [`export A=b\nexport C=d\n:`],
+  "an env script with 2>/dev/null and && eval": [`command -v nope 2>/dev/null && eval "$(true)"\nexport A=b\n:`],
+};
+test("a Bash-tool command with no snapshot and clauses ahead of the setup clause still runs under bash or zsh", { skip: !installed.length && "neither bash nor zsh installed" }, async () => {
+  for (const [what, lead] of Object.entries(leads)) for (const shell of ["/usr/bin/fish", null, ...installed.map((k) => shells[k])]) {
+    const { out, code } = await prefix(bashTool(null, which, lead), session(9801, FLOOR), { shell });
+    assert.match(out, /^(bash|zsh)$/, `${what}, SHELL=${shell}`);
+    assert.equal(code, 0);
+  }
+});
+
 // The shell is read off the Bash tool's own leading clause. A command of the
 // user's that merely MENTIONS a snapshot path, or the cwd tail, is just a command.
 test("a snapshot path, the setup clause or `&& pwd -P >| ` inside the command does not change the shell", { skip: !installed.length && "neither bash nor zsh installed" }, async () => {
@@ -500,7 +519,8 @@ test("a snapshot path, the setup clause or `&& pwd -P >| ` inside the command do
   }
   const setup = bashTool(null, "x").split(" && ")[0];   // the clause Claude Code puts first when it has no snapshot
   for (const text of [`echo "$0"; : ${snapshot("zsh")}`, `echo "$0"; : ${snapshot("bash")}`, `echo "$0" && pwd -P >| /dev/null`,
-                      `echo "$0" && pwd -P >| /dev/null 2>/dev/null`, `echo "$0"; : '${setup} && '`]) {
+                      `echo "$0" && pwd -P >| /dev/null 2>/dev/null`, `echo "$0"; : '${setup} && '`,
+                      `echo "$0"; : '${setup} && ' && eval :`, `export A=b && echo "$0" && eval :`]) {
     for (const shell of [shells.bash, shells.zsh, null]) {
       assert.equal((await prefix(text, session(9801, FLOOR), { shell })).out, "/bin/sh\n", `${text} SHELL=${shell}`);
     }
