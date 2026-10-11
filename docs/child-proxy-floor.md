@@ -8,7 +8,9 @@ The floor gives those processes cache-fix's own upstream instead: the corporate 
 
 ## How it works
 
-1. **cache-fix publishes its hop.** In forward-proxy mode, at listen and whenever the hop its HTTPS walk lands on changes, it writes `<config dir>/proxy-floor/<port>` (`$CLAUDE_CONFIG_DIR`, default `~/.claude`; the directory is created if missing). `<port>` is the port clients put in `HTTPS_PROXY` (the advertised port when a holder runs the proxy; a proxy started on port `0` publishes nothing). The write is atomic (temp file in the same directory, then rename). The content is one line: the scheme and `host:port` of the hop in use (the address `/health` reports as `https_proxy`).
+1. **cache-fix publishes its hop.** In forward-proxy mode, when its HTTPS walk lands on a hop and whenever that hop changes, it writes `<config dir>/proxy-floor/<port>` (`$CLAUDE_CONFIG_DIR`, default `~/.claude`; the directory is created if missing). `<port>` is the port clients put in `HTTPS_PROXY` (the advertised port when a holder runs the proxy; a proxy started on port `0` publishes nothing). The write is atomic (temp file in the same directory, then rename). The content is one line: the scheme and `host:port` of the hop in use (the address `/health` reports as `https_proxy`).
+
+   At listen it writes only an answer that needs no walk: nothing configured to dial through, or a configured value it can see is unusable. With a chain configured it starts one walk and leaves the file as it is until the walk lands, so a predecessor's file (a handover) is never overwritten by the first configured candidate, which may be the hop that is down.
 
    | file | meaning |
    |---|---|
@@ -32,7 +34,7 @@ The floor gives those processes cache-fix's own upstream instead: the corporate 
    - The exports are inside the `-c` string so they run **after** the shell's own startup files. zsh reads `.zshenv` for every `-c`, and one that exports the proxy again would undo a floor set before the shell started.
    - `NO_PROXY` / `no_proxy` are never touched.
    - The six names and the single value are fixed, so another tool that writes the same six names with the same value gives the same result whichever runs first.
-   - `<shell>` is resolved the way Claude Code resolves its own: `CLAUDE_CODE_SHELL`, then `SHELL`, each only if it names bash or zsh and is executable; otherwise `zsh`, then `bash` (`bash` first when `SHELL` names bash) from `PATH` and `/bin`, `/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`; otherwise `/bin/sh`. A `SHELL` of fish, or none, still runs bash or zsh.
+   - `<shell>` is the one Claude Code runs that command under. Its Bash tool runs under bash or zsh, and the command it hands the prefix sources a shell snapshot first (`.../shell-snapshots/snapshot-zsh-...` or `snapshot-bash-...`), which names the shell: `CLAUDE_CODE_SHELL`, then `SHELL`, each only if it names that shell and is executable; otherwise it is found on `PATH` and in `/bin`, `/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`; otherwise `/bin/sh`. When Claude Code could not make a snapshot, the Bash-tool command is told by the `&& pwd -P >| <file>` it ends with, and the shell is `zsh`, then `bash` (`bash` first when `SHELL` names bash). A `SHELL` of fish, or none, still runs bash or zsh. Every other command (command hooks, stdio MCP server commands, the `statusLine` command) runs under `/bin/sh`, as it does without the prefix.
 
 ## Install
 
@@ -53,6 +55,10 @@ The prefix must be an absolute path and the file executable. From an npm global 
 
 **Why the `env` block and not only your shell.** A `claude` started from a Bash command inherits the floor, not cache-fix, so it would bypass the proxy. Claude Code applies its `env` block over the inherited environment at boot, so the nested `claude` re-wires itself to cache-fix. Measured on Claude Code 2.1.296 in an empty config directory with a throwaway API key: `settings.json` `env.HTTPS_PROXY` set to listener A, `HTTPS_PROXY` in the launching environment set to listener B. `claude -p hi` dialled A 29 times and B 0 times, every one a `CONNECT api.anthropic.com:443`. With no `env` entry the same run dialled B 29 times and A 0.
 
+**The launcher does not write the `env` block.** `cache-fix-proxy --remote-control` (and `claude-via-proxy`) wire `HTTPS_PROXY` and the CA into the `claude` process only. With the prefix set and no `env` entry, a `claude` started from a Bash command inherits the floor, not cache-fix, and bypasses it. So the prefix is for sessions wired through the `settings.json` `env` block, which a nested `claude` applies again at boot. If you launch through the launcher and also set the prefix, put `HTTPS_PROXY` (on a fixed proxy port) and `NODE_EXTRA_CA_CERTS` in that `env` block too.
+
+**Another proxy in front of cache-fix.** If something else is the session's proxy and forwards to cache-fix, add only the `CLAUDE_CODE_SHELL_PREFIX` line and leave `HTTPS_PROXY` pointing at the front proxy. The script finds the floor file for whichever loopback port the variables name.
+
 **One slot.** `CLAUDE_CODE_SHELL_PREFIX` holds one command, so there is room for one script. Any prefix script that honours the `proxy-floor/` directory gives the same answer, so if a proxy in front of cache-fix already sets the prefix and reads that directory, keep it and skip this script.
 
 **Opt out** by not setting the prefix. There is no other switch.
@@ -70,14 +76,13 @@ Measured on Claude Code 2.1.296 with no credentials, a throwaway config director
 
 In every prefixed run the `.zshenv` had executed (a variable it exports was visible to the child) and its re-export still lost to the floor.
 
-**Process tree.** Measured directly, `zsh` 5.9 and `bash` 5.1 `exec` the final command of `export ...; command`, and `dash` does not. With `zsh` as `$SHELL` under Claude Code, a stdio MCP server is therefore Claude Code's direct child exactly as without the prefix, and after `SIGTERM` to Claude Code all three probe servers were gone, including one that ignores stdin EOF. With `dash` (reached now only as the last-resort `/bin/sh`, when neither bash nor zsh is installed) the shell stays as the server's parent, so Claude Code signals the shell and not the server: after `claude -p` finished, the servers that exit on stdin EOF were gone, but one that ignores EOF was still running. Bash 3.2 (macOS `/bin/bash`) was not measured.
+**Process tree.** Measured directly, `zsh` 5.9 and `bash` 5.1 `exec` the final command of `export ...; command`, and `dash` 0.5.11 does not: `dash -c 'sleep 5'` and `dash -c 'export A=b; sleep 5'` both leave `dash` as the parent of `sleep`, so the prefix adds no shell layer there that `/bin/sh -c` did not already have. Hooks, stdio MCP servers and the `statusLine` command run under `/bin/sh`, which is `dash` on Debian and Ubuntu: a stdio MCP server's parent is then a shell, and Claude Code signals the shell and not the server. Bash 3.2 (macOS `/bin/bash`, and `/bin/sh` there) was not measured.
 
 ## Limits
 
 - **Not reached:** `apiKeyHelper`, `otelHeadersHelper`, `awsCredentialExport`, Claude Code's own `git` and `gh` calls, and LSP servers. Claude Code starts them without the prefix, so they inherit cache-fix's port. cache-fix passes every non-Anthropic `CONNECT` through as a blind tunnel to its hop (`blindTunnel` in `proxy/forward-proxy.mjs`), so they cost it little, but they still enter its port.
 - **A floor of empty means direct.** When cache-fix has no upstream proxy configured, children are exported `HTTPS_PROXY=''` and connect straight out. Measured with all six variables set to `''`: `curl` and Python `urllib` both connected to the target themselves and neither contacted a proxy (`getproxies() == {}`). On a host that reaches the internet only through a proxy, point cache-fix at that proxy (`HTTPS_PROXY` in the proxy's own environment) so there is a hop to publish.
-- **A stopped proxy leaves its file.** A successor on the same port rewrites it at listen; in between, children keep the last hop.
-- **bash or zsh, not `/bin/sh`.** The script is POSIX sh, but the command runs under the resolved bash or zsh. Everything that goes through the prefix runs there, including command hooks, stdio MCP server commands and the `statusLine` command, which may otherwise run under `/bin/sh`. The two differ where it matters: zsh does not split an unquoted `$VAR` on whitespace (measured: `v="a b"; for x in $v` iterates once under zsh, twice under bash and dash) and stops on a glob that matches nothing (`zsh:1: no matches found`, where bash and dash pass the pattern through). A hook written for `/bin/sh` that relies on either behaves differently with the prefix set.
+- **A stopped proxy leaves its file.** A successor on the same port rewrites it when its walk lands (at listen if it has nothing to walk); in between, children keep the last hop.
 - **macOS and Linux.** The script needs a POSIX `sh`.
 
 ## Troubleshooting
