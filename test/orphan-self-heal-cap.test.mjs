@@ -28,9 +28,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { HOP_ENV, armLineage, cmdOf, freePort, isolateClaudeHome, reapStamped } from "./proc-helpers.mjs";
-
-isolateClaudeHome();   // the holders and proxies it spawns inherit it
+import { HOP_ENV, armLineage, cmdOf, freePort, reapStamped } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
