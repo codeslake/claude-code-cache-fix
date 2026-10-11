@@ -42,11 +42,9 @@ done
 case ${1%% 2>/dev/null*} in
   'source '*/shell-snapshots/snapshot-zsh-*) names=zsh ;;
   'source '*/shell-snapshots/snapshot-bash-*) names=bash ;;
-  *) case $1 in
-       *'{ shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true && '*)
-         case ${SHELL-} in *bash*) names='bash zsh' ;; *) names='zsh bash' ;; esac ;;
-       *) names= ;;
-     esac ;;
+  '{ shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true && '*)
+    case ${SHELL-} in *bash*) names='bash zsh' ;; *) names='zsh bash' ;; esac ;;
+  *) names= ;;
 esac
 shell=
 for s in "${CLAUDE_CODE_SHELL-}" "${SHELL-}"; do

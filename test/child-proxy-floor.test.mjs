@@ -492,14 +492,15 @@ test("a Bash-tool command with no snapshot still runs under bash or zsh, with or
 
 // The shell is read off the Bash tool's own leading clause. A command of the
 // user's that merely MENTIONS a snapshot path, or the cwd tail, is just a command.
-test("a snapshot path or `&& pwd -P >| ` inside the command does not change the shell", { skip: !installed.length && "neither bash nor zsh installed" }, async () => {
+test("a snapshot path, the setup clause or `&& pwd -P >| ` inside the command does not change the shell", { skip: !installed.length && "neither bash nor zsh installed" }, async () => {
   const other = (kind) => (kind === "bash" ? "zsh" : "bash");
   for (const kind of installed) {
     const { out } = await prefix(bashTool(kind, `${which}; echo ${snapshot(other(kind))} 2>/dev/null`), session(9801, FLOOR), { shell: null });
     assert.match(out, new RegExp(`^${kind}`), `snapshot-${kind} whose command names snapshot-${other(kind)}`);
   }
+  const setup = bashTool(null, "x").split(" && ")[0];   // the clause Claude Code puts first when it has no snapshot
   for (const text of [`echo "$0"; : ${snapshot("zsh")}`, `echo "$0"; : ${snapshot("bash")}`, `echo "$0" && pwd -P >| /dev/null`,
-                      `echo "$0" && pwd -P >| /dev/null 2>/dev/null`]) {
+                      `echo "$0" && pwd -P >| /dev/null 2>/dev/null`, `echo "$0"; : '${setup} && '`]) {
     for (const shell of [shells.bash, shells.zsh, null]) {
       assert.equal((await prefix(text, session(9801, FLOOR), { shell })).out, "/bin/sh\n", `${text} SHELL=${shell}`);
     }
