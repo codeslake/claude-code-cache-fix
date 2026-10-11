@@ -15,9 +15,7 @@ import { join, dirname } from "node:path";
 import { onPorts } from "./proc-helpers.mjs";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { DEAD_HOP, HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, hit, isolateClaudeHome, listeners, reapStamped, stamped, sweepTargets, triesWithin, verdict, waitForHolder } from "./proc-helpers.mjs";
-
-isolateClaudeHome();   // the holders and proxies it spawns inherit it
+import { DEAD_HOP, HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, hit, listeners, reapStamped, stamped, sweepTargets, triesWithin, verdict, waitForHolder } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 

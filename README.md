@@ -145,22 +145,6 @@ How it works: the proxy also handles HTTP `CONNECT`. It MITMs **only** the upstr
 
 Corporate proxy chaining works the same as reverse mode: set `HTTPS_PROXY`/`HTTP_PROXY` for the proxy's **own** upstream egress (the proxy dials `api.anthropic.com` through it). The client's `HTTPS_PROXY` points at the cache-fix proxy; the cache-fix proxy's `HTTPS_PROXY` (in its own env) points at the corporate proxy.
 
-**Every process the session starts inherits the proxy.** In forward mode `HTTPS_PROXY` points at cache-fix, and Claude Code hands its environment to its children, so a Bash-tool `aws`, `git`, `pip` or `curl`, a command hook, a stdio MCP server and the `statusLine` command also ride cache-fix. Give them cache-fix's own upstream (the corporate proxy, or direct) instead with [`bin/child-proxy-floor.sh`](docs/child-proxy-floor.md), set as `CLAUDE_CODE_SHELL_PREFIX` in the `settings.json` `env` block together with the rest of the wiring:
-
-```jsonc
-// ~/.claude/settings.json
-{
-  "env": {
-    "HTTPS_PROXY": "http://127.0.0.1:9801",
-    "NO_PROXY": "127.0.0.1,localhost,::1",
-    "NODE_EXTRA_CA_CERTS": "/abs/path/to/.claude/cache-fix-ca/ca.pem",
-    "CLAUDE_CODE_SHELL_PREFIX": "/abs/path/to/claude-code-cache-fix/bin/child-proxy-floor.sh"
-  }
-}
-```
-
-Put the wiring in the `env` block rather than only a shell wrapper: its value overrides the inherited environment at boot, so a `claude` started from a Bash command re-wires itself to cache-fix (measured on Claude Code 2.1.296: 29 connections to the `env` block's listener, 0 to the inherited one). That is a requirement of the prefix, not a preference: the `--remote-control` launcher wires `HTTPS_PROXY` into the `claude` process only, so with the prefix set a nested `claude` started from a Bash command would inherit the floor and bypass cache-fix. If you use the launcher and also set the prefix, put `HTTPS_PROXY` (on a fixed proxy port) and `NODE_EXTRA_CA_CERTS` in the `env` block as well. With another proxy in front of cache-fix, add only the `CLAUDE_CODE_SHELL_PREFIX` line and keep `HTTPS_PROXY` pointing at the front proxy. The prefix is the only setting that reaches hooks, MCP servers and the status line. It holds one command, and any prefix script that reads the `proxy-floor/` directory cache-fix publishes to gives the same answer. From an npm global install the script is `$(npm root -g)/claude-code-cache-fix/bin/child-proxy-floor.sh` (paste the expanded path; `settings.json` does not expand it). Opt out by not setting it. Not reached: `apiKeyHelper`, `otelHeadersHelper`, Claude Code's own `git` and `gh`, and LSP servers. For those, cache-fix passes a non-Anthropic `CONNECT` through as a blind tunnel to its own hop, so they cost it little, but they still enter its port. [`docs/child-proxy-floor.md`](docs/child-proxy-floor.md) has the mechanism, the measurements and the limits.
-
 **Crash semantics on a shared proxy.** In forward-proxy mode the proxy MITMs the whole upstream host, so an in-flight Claude Code session is wired to *this* port and cannot fail over. To keep one bad request from taking the process down, a successful forward-proxy attach installs process-wide `uncaughtException`/`unhandledRejection` handlers that log and keep serving instead of crashing. These are scoped to forward mode (a reverse-only proxy keeps Node's default crash-on-uncaught semantics, letting its supervisor restart it) and are removed when the last forward instance closes. The tradeoff: on a **shared / multi-tenant** proxy, enabling forward mode changes crash behavior for every client on that instance while the mode is on — a fatal bug is swallowed rather than surfaced to a supervisor. If you run one proxy for many sessions, weigh that against a supervised per-session model.
 
 **Running it persistently.** The `... node .../proxy/server.mjs &` above is fine for a quick try, but a backgrounded process is not supervised: it does not restart if it crashes or if the machine reboots. To run forward-proxy mode as a managed service (auto-restart, start-on-login), use the same `install-service` path described under [Running as a service](#running-as-a-service) — just set the flag at install time so it is baked into the unit:

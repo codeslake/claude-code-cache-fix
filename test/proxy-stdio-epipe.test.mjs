@@ -24,9 +24,6 @@ import http from "node:http";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
-import { isolateClaudeHome } from "./proc-helpers.mjs";
-
-isolateClaudeHome();   // the proxy it spawns inherits it
 
 const here = dirname(fileURLToPath(import.meta.url));
 const childPath = join(here, "fixtures", "stdio-epipe-child.mjs");
