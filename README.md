@@ -145,6 +145,26 @@ How it works: the proxy also handles HTTP `CONNECT`. It MITMs **only** the upstr
 
 Corporate proxy chaining works the same as reverse mode: set `HTTPS_PROXY`/`HTTP_PROXY` for the proxy's **own** upstream egress (the proxy dials `api.anthropic.com` through it). The client's `HTTPS_PROXY` points at the cache-fix proxy; the cache-fix proxy's `HTTPS_PROXY` (in its own env) points at the corporate proxy.
 
+**Every process the session starts inherits the proxy.** In forward mode `HTTPS_PROXY` points at cache-fix, and Claude Code hands its environment to its children, so a Bash-tool `aws`, `git`, `pip` or `curl` also rides cache-fix. Register the [`proxy-floor`](docs/hooks/proxy-floor.md) hook and those commands get cache-fix's own upstream (or a direct connection) instead:
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          { "type": "command", "command": "/abs/path/to/hooks/examples/proxy-floor.mjs 9801" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Set `CACHE_FIX_CHILD_PROXY=keep` to opt out. The limits: it covers Bash-tool commands only (`CLAUDE_ENV_FILE` is sourced only by the Bash tool), so other children (stdio MCP servers, hooks, the `statusLine` command) still inherit the proxy. For those, cache-fix passes non-Anthropic `CONNECT`s through as a blind tunnel to its own hop, so they cost it little, but they still enter its port. Wire cache-fix through the `settings.json` `env` block (`HTTPS_PROXY`, `NO_PROXY`, `NODE_EXTRA_CA_CERTS`) rather than only a shell wrapper: its value overrides the inherited environment at boot, so a `claude` started from a Bash command re-wires itself to cache-fix. The hook's page has the measurements.
+
 **Crash semantics on a shared proxy.** In forward-proxy mode the proxy MITMs the whole upstream host, so an in-flight Claude Code session is wired to *this* port and cannot fail over. To keep one bad request from taking the process down, a successful forward-proxy attach installs process-wide `uncaughtException`/`unhandledRejection` handlers that log and keep serving instead of crashing. These are scoped to forward mode (a reverse-only proxy keeps Node's default crash-on-uncaught semantics, letting its supervisor restart it) and are removed when the last forward instance closes. The tradeoff: on a **shared / multi-tenant** proxy, enabling forward mode changes crash behavior for every client on that instance while the mode is on — a fatal bug is swallowed rather than surfaced to a supervisor. If you run one proxy for many sessions, weigh that against a supervised per-session model.
 
 **Running it persistently.** The `... node .../proxy/server.mjs &` above is fine for a quick try, but a backgrounded process is not supervised: it does not restart if it crashes or if the machine reboots. To run forward-proxy mode as a managed service (auto-restart, start-on-login), use the same `install-service` path described under [Running as a service](#running-as-a-service) — just set the flag at install time so it is baked into the unit:
@@ -627,6 +647,7 @@ Some Claude Code behaviors live below the request layer — they happen client-s
 | Script | What it does |
 |---|---|
 | [`worktree-edit-guard.py`](docs/hooks/worktree-edit-guard.md) | Block `Edit`/`Write`/`MultiEdit`/`NotebookEdit` tool calls whose target path escapes the active git worktree, preventing parent-checkout corruption from worktree sessions. Addresses [CC#59628](https://github.com/anthropics/claude-code/issues/59628). |
+| [`proxy-floor.mjs`](docs/hooks/proxy-floor.md) | In forward-proxy mode, give Bash-tool commands cache-fix's own upstream instead of cache-fix itself, so bulk transfers stay off the proxy. |
 
 ## Contributed tools
 

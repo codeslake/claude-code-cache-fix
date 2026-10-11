@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`proxy-floor` SessionStart hook (`hooks/examples/proxy-floor.mjs`).** In forward-proxy mode every process the session starts inherits `HTTPS_PROXY=http://127.0.0.1:<port>`, so Bash-tool commands (`aws`, `git`, `pip`, `curl`) sent bulk transfers through cache-fix. The hook appends six `export` lines to the session's env file that point those commands at the hop cache-fix itself forwards to (`/health` `https_proxy`), or at nothing when it has none. Opt out with `CACHE_FIX_CHILD_PROXY=keep`. It covers Bash-tool commands only; see [`docs/hooks/proxy-floor.md`](docs/hooks/proxy-floor.md).
+
 ### Changed
 
 - **`CACHE_FIX_REQUIRE_HOP=1` now covers the relayed `/v1/messages` route, not just the two `CONNECT` paths.** With the variable set and no chain hop reachable, that route previously dialled `api.anthropic.com` directly — carrying the caller's API key past the boundary the variable exists to enforce, while the `CONNECT` paths correctly refused. It now answers `502` instead, matching them. This is a new user-visible outcome on the primary route: an operator who sets the variable, configures no fallbacks and has no reachable proxy will see requests refused where they previously succeeded, which is what the flag asks for. Unset (the default) nothing changes. Hosts exempted by `NO_PROXY` stay exempt — that is an operator saying "this one is direct on purpose". Three egress sites still do not consult the variable: `storageAgent()`, the update-channel probe, and `fallbackToOrigin()`. The first two issue our own requests and carry no client headers. The third forwards the client's headers verbatim to `downloads.claude.ai` on the opt-in download-rewrite path — it is enumerated here rather than claimed harmless.
