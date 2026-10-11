@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { exitWithin } from "./child-deadline.mjs";
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "hooks", "examples", "proxy-floor.mjs");
 const KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
@@ -36,7 +37,7 @@ async function runHook({ env, args = [], envFile = true }) {
   let out = "";
   child.stdout.on("data", (c) => (out += c));
   child.stderr.on("data", (c) => (out += c));
-  const code = await new Promise((r) => child.on("exit", r));
+  const code = await exitWithin(child, 6000, "the hook exits");
   const written = readFileSync(file, "utf8");
   rmSync(dir, { recursive: true, force: true });
   return { code, out, written };
@@ -84,7 +85,7 @@ for (const [name, host] of [["HTTPS_PROXY", "localhost"], ["https_proxy", "[::1]
 }
 
 for (const [label, value] of [["another loopback port", (p) => `http://127.0.0.1:${p + 1}`],
-  ["a non-loopback host on the CCF port", (p) => `http://10.0.0.1:${p}`],
+  ["a non-loopback host on the CCF port", (p) => `http://proxy.example.test:${p}`],
   ["a value that is not a URL", () => "not a url"]]) {
   test(`env names ${label}: file untouched`, async () => {
     const h = await fakeHealth(200, { https_proxy: HOP });
@@ -96,6 +97,16 @@ for (const [label, value] of [["another loopback port", (p) => `http://127.0.0.1
   });
 }
 
+test("/health is read directly even when the runtime honours proxy env vars", async () => {
+  const h = await fakeHealth(200, { https_proxy: HOP });
+  try {
+    const ccf = `http://127.0.0.1:${h.port}`;
+    const r = await runHook({ env: { HTTP_PROXY: ccf, HTTPS_PROXY: ccf, NODE_USE_ENV_PROXY: "1" }, args: [String(h.port)] });
+    assert.equal(r.code, 0);
+    assert.equal(r.written, SEED + sixLines(HOP));
+  } finally { h.close(); }
+});
+
 test("/health unreachable: file untouched, exit 0", async () => {
   const h = await fakeHealth(200, {});
   const { port } = h;
@@ -105,17 +116,19 @@ test("/health unreachable: file untouched, exit 0", async () => {
   assert.equal(r.written, SEED);
 });
 
-test("/health that never answers: gives up within the timeout, file untouched", async () => {
-  const srv = http.createServer(() => {}); // accepts, never responds
-  const port = await listen(srv);
-  try {
-    const t0 = Date.now();
-    const r = await runHook({ env: { HTTPS_PROXY: `http://127.0.0.1:${port}` }, args: [String(port)] });
-    assert.equal(r.code, 0);
-    assert.equal(r.written, SEED);
-    assert.ok(Date.now() - t0 < 4000, "hook must not hang the session start");
-  } finally { srv.closeAllConnections(); srv.close(); }
-});
+for (const [label, answer] of [["never answers", () => {}], ["stops mid-body", (q, res) => { res.writeHead(200); res.write("{"); }]]) {
+  test(`/health that ${label}: gives up within the timeout, file untouched`, async () => {
+    const srv = http.createServer(answer);
+    const port = await listen(srv);
+    try {
+      const t0 = Date.now();
+      const r = await runHook({ env: { HTTPS_PROXY: `http://127.0.0.1:${port}` }, args: [String(port)] });
+      assert.equal(r.code, 0);
+      assert.equal(r.written, SEED);
+      assert.ok(Date.now() - t0 < 4000, "hook must not hang the session start");
+    } finally { srv.closeAllConnections(); srv.close(); }
+  });
+}
 
 for (const [label, status, body] of [["non-200", 503, { status: "degraded" }], ["unparseable", 200, "<html>"]]) {
   test(`/health ${label}: file untouched, exit 0`, async () => {
