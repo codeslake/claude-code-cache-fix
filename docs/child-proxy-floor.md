@@ -8,21 +8,31 @@ The floor gives those processes cache-fix's own upstream instead: the corporate 
 
 ## How it works
 
-1. **cache-fix publishes its hop.** In forward-proxy mode, at listen and whenever the hop it dials through changes, it writes `cache-fix-child-proxy-<port>` next to its other state (`$CLAUDE_CONFIG_DIR`, default `~/.claude`). `<port>` is the port clients put in `HTTPS_PROXY` (the advertised port when a holder runs the proxy; a proxy started on port `0` publishes nothing). The write is atomic (temp file, then rename). The same address `/health` reports as `https_proxy` is the content, with credentials dropped.
+1. **cache-fix publishes its hop.** In forward-proxy mode, at listen and whenever the hop its HTTPS walk lands on changes, it writes `<config dir>/proxy-floor/<port>` (`$CLAUDE_CONFIG_DIR`, default `~/.claude`; the directory is created if missing). `<port>` is the port clients put in `HTTPS_PROXY` (the advertised port when a holder runs the proxy; a proxy started on port `0` publishes nothing). The write is atomic (temp file in the same directory, then rename). The content is one line: the scheme and `host:port` of the hop in use (the address `/health` reports as `https_proxy`).
 
    | file | meaning |
    |---|---|
    | absent | unknown. The script changes nothing. |
-   | empty | cache-fix dials direct, so children do too. |
+   | empty | cache-fix has no upstream proxy configured at all, so it dials direct, and children do too. |
    | a URL | that hop. |
 
-   With `CACHE_FIX_REQUIRE_HOP=1` and no hop, the file is removed rather than emptied: direct is forbidden there, so "unknown" (children keep cache-fix, which refuses) is the safe answer.
+   Direct is published **only** when nothing is configured to dial through (no `CACHE_FIX_UPSTREAM_PROXY` or `HTTPS_PROXY`, no `CACHE_FIX_FALLBACK_PROXIES`). Every other case where cache-fix cannot name a hop removes the file, because "unknown" (children keep cache-fix's port, as without the script) is safe where a wrong "direct" or a wrong URL is not:
 
-2. **The script reads it.** Claude Code runs every shell command through `CLAUDE_CODE_SHELL_PREFIX`, passing one argument: the full command string. The script looks at `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`, `all_proxy` in order. The first one that is a loopback URL (`127.0.0.1`, `localhost`, `[::1]`) whose port has a readable floor file decides. It then runs the command as `"$SHELL" -c "export HTTPS_PROXY='<floor>' https_proxy='<floor>' HTTP_PROXY='<floor>' http_proxy='<floor>' ALL_PROXY='<floor>' all_proxy='<floor>'; <command>"`. If nothing decides, it runs `"$SHELL" -c "<command>"` unchanged.
+   - a chain is configured and every hop is unreachable: cache-fix is between hops, not direct;
+   - a configured value is not an `http(s)` URL, or does not parse;
+   - the hop URL carries credentials (`http://user:pw@host:port`). Published stripped, it would be a different hop that answers children `407`, so it is never published;
+   - `CACHE_FIX_REQUIRE_HOP=1` and no hop: direct is forbidden there, so children keep cache-fix, which refuses.
+
+   Only the HTTPS hop walk (the one `CONNECT` tunnels and `https://` relays use) rewrites the file. The six variables get one value, and an `http://` walk that lands on another hop does not flip it.
+
+   **A convention any local proxy may publish to.** One file per listen port, named for the port clients put in `HTTPS_PROXY`, in `<config dir>/proxy-floor/`; the content is the floor as above. Nothing in the directory is specific to cache-fix.
+
+2. **The script reads it.** Claude Code runs every shell command through `CLAUDE_CODE_SHELL_PREFIX`, passing one argument: the full command string. The script looks at `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`, `all_proxy` in order. The first one that is a loopback URL (`127.0.0.1`, `localhost`, `[::1]`) whose port has a readable file in `$CLAUDE_CONFIG_DIR/proxy-floor/` (else `~/.claude/proxy-floor/`, for a proxy and a session with different config directories) decides. Every loopback port among the six is tried, so a proxy chained in front of cache-fix that publishes to the same directory is found whichever of the two the variables name. It then runs the command as `<shell> -c -- "export HTTPS_PROXY='<floor>' https_proxy='<floor>' HTTP_PROXY='<floor>' http_proxy='<floor>' ALL_PROXY='<floor>' all_proxy='<floor>'; <command>"`. If nothing decides, it runs `<shell> -c -- "<command>"` unchanged. The `--` ends the options, so a command that begins with a dash is still a command.
 
    - The exports are inside the `-c` string so they run **after** the shell's own startup files. zsh reads `.zshenv` for every `-c`, and one that exports the proxy again would undo a floor set before the shell started.
    - `NO_PROXY` / `no_proxy` are never touched.
    - The six names and the single value are fixed, so another tool that writes the same six names with the same value gives the same result whichever runs first.
+   - `<shell>` is resolved the way Claude Code resolves its own: `CLAUDE_CODE_SHELL`, then `SHELL`, each only if it names bash or zsh and is executable; otherwise `zsh`, then `bash` (`bash` first when `SHELL` names bash) from `PATH` and `/bin`, `/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`; otherwise `/bin/sh`. A `SHELL` of fish, or none, still runs bash or zsh.
 
 ## Install
 
@@ -39,11 +49,11 @@ Add the prefix to the `env` block of `~/.claude/settings.json` (or a project's `
 }
 ```
 
-The prefix must be an absolute path and the file executable. cache-fix and the session must resolve the same Claude config directory (`CLAUDE_CONFIG_DIR`, else `~/.claude`), because that is where the file is looked up.
+The prefix must be an absolute path and the file executable. From an npm global install the script is `$(npm root -g)/claude-code-cache-fix/bin/child-proxy-floor.sh`: the package ships `bin/` and the file keeps its executable bit (`ls -l` it to check). `settings.json` does not expand `$(...)`, so run `npm root -g` once and paste the absolute result. cache-fix and the session should resolve the same Claude config directory (`CLAUDE_CONFIG_DIR`, else `~/.claude`), because that is where the file is looked up first; the script also tries `~/.claude/proxy-floor/`.
 
 **Why the `env` block and not only your shell.** A `claude` started from a Bash command inherits the floor, not cache-fix, so it would bypass the proxy. Claude Code applies its `env` block over the inherited environment at boot, so the nested `claude` re-wires itself to cache-fix. Measured on Claude Code 2.1.296 in an empty config directory with a throwaway API key: `settings.json` `env.HTTPS_PROXY` set to listener A, `HTTPS_PROXY` in the launching environment set to listener B. `claude -p hi` dialled A 29 times and B 0 times, every one a `CONNECT api.anthropic.com:443`. With no `env` entry the same run dialled B 29 times and A 0.
 
-**One prefix only.** `CLAUDE_CODE_SHELL_PREFIX` holds one command. If a proxy in front of cache-fix already sets it, keep that one and skip this script: that proxy's own floor is what children get.
+**One slot.** `CLAUDE_CODE_SHELL_PREFIX` holds one command, so there is room for one script. Any prefix script that honours the `proxy-floor/` directory gives the same answer, so if a proxy in front of cache-fix already sets the prefix and reads that directory, keep it and skip this script.
 
 **Opt out** by not setting the prefix. There is no other switch.
 
@@ -60,16 +70,17 @@ Measured on Claude Code 2.1.296 with no credentials, a throwaway config director
 
 In every prefixed run the `.zshenv` had executed (a variable it exports was visible to the child) and its re-export still lost to the floor.
 
-**Process tree.** Measured directly, `zsh` 5.9 and `bash` 5.1 `exec` the final command of `export ...; command`, and `dash` does not. With `zsh` as `$SHELL` under Claude Code, a stdio MCP server is therefore Claude Code's direct child exactly as without the prefix, and after `SIGTERM` to Claude Code all three probe servers were gone, including one that ignores stdin EOF. With `dash` the shell stays as the server's parent, so Claude Code signals the shell and not the server: after `claude -p` finished, the servers that exit on stdin EOF were gone, but one that ignores EOF was still running. Bash 3.2 (macOS `/bin/bash`) was not measured.
+**Process tree.** Measured directly, `zsh` 5.9 and `bash` 5.1 `exec` the final command of `export ...; command`, and `dash` does not. With `zsh` as `$SHELL` under Claude Code, a stdio MCP server is therefore Claude Code's direct child exactly as without the prefix, and after `SIGTERM` to Claude Code all three probe servers were gone, including one that ignores stdin EOF. With `dash` (reached now only as the last-resort `/bin/sh`, when neither bash nor zsh is installed) the shell stays as the server's parent, so Claude Code signals the shell and not the server: after `claude -p` finished, the servers that exit on stdin EOF were gone, but one that ignores EOF was still running. Bash 3.2 (macOS `/bin/bash`) was not measured.
 
 ## Limits
 
 - **Not reached:** `apiKeyHelper`, `otelHeadersHelper`, `awsCredentialExport`, Claude Code's own `git` and `gh` calls, and LSP servers. Claude Code starts them without the prefix, so they inherit cache-fix's port. cache-fix passes every non-Anthropic `CONNECT` through as a blind tunnel to its hop (`blindTunnel` in `proxy/forward-proxy.mjs`), so they cost it little, but they still enter its port.
-- **A floor of empty means direct.** When cache-fix has no hop, children are exported `HTTPS_PROXY=''` and connect straight out. Measured with all six variables set to `''`: `curl` and Python `urllib` both connected to the target themselves and neither contacted a proxy (`getproxies() == {}`). On a host that reaches the internet only through a proxy, point cache-fix at that proxy (`HTTPS_PROXY` in the proxy's own environment) so there is a hop to publish.
+- **A floor of empty means direct.** When cache-fix has no upstream proxy configured, children are exported `HTTPS_PROXY=''` and connect straight out. Measured with all six variables set to `''`: `curl` and Python `urllib` both connected to the target themselves and neither contacted a proxy (`getproxies() == {}`). On a host that reaches the internet only through a proxy, point cache-fix at that proxy (`HTTPS_PROXY` in the proxy's own environment) so there is a hop to publish.
 - **A stopped proxy leaves its file.** A successor on the same port rewrites it at listen; in between, children keep the last hop.
-- **POSIX shells on macOS and Linux.** The script is `/bin/sh`.
+- **bash or zsh, not `/bin/sh`.** The script is POSIX sh, but the command runs under the resolved bash or zsh. Everything that goes through the prefix runs there, including command hooks, stdio MCP server commands and the `statusLine` command, which may otherwise run under `/bin/sh`. The two differ where it matters: zsh does not split an unquoted `$VAR` on whitespace (measured: `v="a b"; for x in $v` iterates once under zsh, twice under bash and dash) and stops on a glob that matches nothing (`zsh:1: no matches found`, where bash and dash pass the pattern through). A hook written for `/bin/sh` that relies on either behaves differently with the prefix set.
+- **macOS and Linux.** The script needs a POSIX `sh`.
 
 ## Troubleshooting
 
-- Children still show cache-fix's port: the file is missing or unreadable. `cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache-fix-child-proxy-9801"` (use your port) should print a URL, or nothing for direct. No file means unknown, which leaves the proxy unchanged. Check that cache-fix runs in forward-proxy mode, listens on a fixed port, and shares your config directory.
+- Children still show cache-fix's port: the file is missing or unreadable. `cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/proxy-floor/9801"` (use your port) should print a URL, or nothing for direct. No file means unknown, which leaves the proxy unchanged: besides a proxy that has not started, that is what a chain with no reachable hop, a hop URL with credentials and an unparseable value look like. Check that cache-fix runs in forward-proxy mode, listens on a fixed port, and shares your config directory.
 - Check the script alone: `HTTPS_PROXY=http://127.0.0.1:9801 bin/child-proxy-floor.sh 'echo "$HTTPS_PROXY"'`.
