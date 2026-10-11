@@ -14,18 +14,14 @@
 # earlier. The six keys and the single value are shared with other tools that
 # write the same floor, so none of this can be reordered or narrowed.
 dir=${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}
-found=0
 for url in "${HTTPS_PROXY-}" "${https_proxy-}" "${HTTP_PROXY-}" "${http_proxy-}" "${ALL_PROXY-}" "${all_proxy-}"; do
   hostport=${url#*://}; hostport=${hostport%%/*}; hostport=${hostport##*@}
   port=${hostport##*:}
   case ${hostport%:*} in 127.0.0.1|localhost|'[::1]') ;; *) continue ;; esac
   case $port in ''|*[!0-9]*) continue ;; esac
-  [ -r "$dir/cache-fix-child-proxy-$port" ] || continue
-  floor=$(cat "$dir/cache-fix-child-proxy-$port") && found=1 && break
-done
-
-if [ "$found" = 1 ]; then
-  q=$(printf '%s' "$floor" | sed "s/'/'\\\\''/g")
+  file=$dir/cache-fix-child-proxy-$port
+  [ -r "$file" ] || continue
+  q=$(sed "s/'/'\\\\''/g" "$file") || continue   # single-quote-escaped: the floor stays one value
   exec "${SHELL:-/bin/sh}" -c "export HTTPS_PROXY='$q' https_proxy='$q' HTTP_PROXY='$q' http_proxy='$q' ALL_PROXY='$q' all_proxy='$q'; $1"
-fi
+done
 exec "${SHELL:-/bin/sh}" -c "$1"
