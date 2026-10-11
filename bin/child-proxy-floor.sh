@@ -13,15 +13,16 @@
 # every -c, and a .zshenv that exports the proxy again would undo a floor set
 # earlier. The six keys and the single value are shared with other tools that
 # write the same floor, so none of this can be reordered or narrowed.
-dir=${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}
 for url in "${HTTPS_PROXY-}" "${https_proxy-}" "${HTTP_PROXY-}" "${http_proxy-}" "${ALL_PROXY-}" "${all_proxy-}"; do
   hostport=${url#*://}; hostport=${hostport%%/*}; hostport=${hostport##*@}
   port=${hostport##*:}
   case ${hostport%:*} in 127.0.0.1|localhost|'[::1]') ;; *) continue ;; esac
   case $port in ''|*[!0-9]*) continue ;; esac
-  file=$dir/cache-fix-child-proxy-$port
-  [ -r "$file" ] || continue
-  q=$(sed "s/'/'\\\\''/g" "$file") || continue   # single-quote-escaped: the floor stays one value
-  exec "${SHELL:-/bin/sh}" -c "export HTTPS_PROXY='$q' https_proxy='$q' HTTP_PROXY='$q' http_proxy='$q' ALL_PROXY='$q' all_proxy='$q'; $1"
+  for dir in "${CLAUDE_CONFIG_DIR:-${HOME-}/.claude}" "${HOME-}/.claude"; do
+    file=$dir/proxy-floor/$port
+    [ -r "$file" ] || continue
+    q=$(sed "s/'/'\\\\''/g" "$file") || continue   # single-quote-escaped: the floor stays one value
+    exec "${SHELL:-/bin/sh}" -c "export HTTPS_PROXY='$q' https_proxy='$q' HTTP_PROXY='$q' http_proxy='$q' ALL_PROXY='$q' all_proxy='$q'; $1"
+  done
 done
 exec "${SHELL:-/bin/sh}" -c "$1"

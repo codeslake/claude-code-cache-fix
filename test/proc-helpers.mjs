@@ -98,7 +98,7 @@ export function ours(port) {
   return out;
 }
 
-// A forward-mode proxy publishes cache-fix-child-proxy-<port> in the Claude
+// A forward-mode proxy publishes proxy-floor/<port> in the Claude
 // config dir, and a spawned one inherits this process's environment. A file that
 // launches real proxies calls this first, or every run leaves one per port in the
 // developer's own ~/.claude.

@@ -9,7 +9,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -45,7 +45,9 @@ async function wire(reset = true) {
   } };
 }
 const listenOn = (srv) => new Promise((r) => srv.listen(0, "127.0.0.1", () => r(srv.address().port)));
-const read = (home, port) => readFileSync(join(home, `cache-fix-child-proxy-${port}`), "utf8");
+const read = (home, port) => readFileSync(join(home, "proxy-floor", String(port)), "utf8");
+// What is published under a config dir; [] when nothing ever created the directory.
+const ls = (home) => { try { return readdirSync(join(home, "proxy-floor")); } catch { return []; } };
 
 // lastHop() is module state, undefined until something dials: this case must run
 // first and must not reset it, every later one starts from wire()'s reset.
@@ -81,7 +83,7 @@ test("no hop is an EMPTY file (direct), and the file follows the hop as it chang
     assert.equal(await resolveHop(true), "");
     assert.equal(read(w.home, p.port), "", "a chain that emptied is direct again");
 
-    assert.deepEqual(readdirSync(w.home), [`cache-fix-child-proxy-${p.port}`], "the atomic write left a temp file behind");
+    assert.deepEqual(ls(w.home), [String(p.port)], "the atomic write left a temp file behind");
   } finally { await p.close(); a.close(); b.close(); w.restore(); }
 });
 
@@ -105,7 +107,7 @@ test("an OS-assigned port (0) publishes nothing", async () => {
   const w = await wire();
   const p = await startProxy({ port: 0, watch: false });
   try {
-    assert.deepEqual(readdirSync(w.home), []);
+    assert.deepEqual(ls(w.home), []);
   } finally { await p.close(); w.restore(); }
 });
 
@@ -114,7 +116,7 @@ test("reverse-only mode writes no floor file", async () => {
   delete process.env.CACHE_FIX_FORWARD_PROXY;
   const p = await startProxy({ port: await freePort(), watch: false });
   try {
-    assert.deepEqual(readdirSync(w.home), []);
+    assert.deepEqual(ls(w.home), []);
   } finally { await p.close(); w.restore(); }
 });
 
@@ -127,13 +129,13 @@ test("REQUIRE_HOP with no hop publishes nothing, never direct", async () => {
   const p = await startProxy({ port: await freePort(), watch: false });
   const hop = net.createServer();
   try {
-    assert.deepEqual(readdirSync(w.home), []);
+    assert.deepEqual(ls(w.home), []);
     process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${await listenOn(hop)}`;
     await resolveHop(true);
     assert.match(read(w.home, p.port), /^http:\/\/127\.0\.0\.1:\d+$/);
     hop.close();
     await resolveHop(true);
-    assert.deepEqual(readdirSync(w.home), [], "a hop that went away left a stale floor, or an empty one");
+    assert.deepEqual(ls(w.home), [], "a hop that went away left a stale floor, or an empty one");
   } finally { await p.close(); hop.close(); w.restore(); }
 });
 
@@ -142,7 +144,7 @@ test("a holder's child publishes under the advertised port, not its own ephemera
   process.env.CACHE_FIX_HELD_PORT = "9951";
   const p = await startProxy({ port: 0, watch: false });
   try {
-    assert.deepEqual(readdirSync(w.home), ["cache-fix-child-proxy-9951"]);
+    assert.deepEqual(ls(w.home), ["9951"]);
   } finally { await p.close(); w.restore(); }
 });
 
@@ -169,10 +171,15 @@ async function prefix(cmd, env, { shell = "/bin/sh" } = {}) {
   await withDeadline(drained, 5_000, child, "child-proxy-floor.sh stdout to drain");
   return { out, code };
 }
+// What a proxy leaves for the script: <config dir>/proxy-floor/<port>.
+function publish(configDir, port, floor) {
+  mkdirSync(join(configDir, "proxy-floor"), { recursive: true });
+  writeFileSync(join(configDir, "proxy-floor", String(port)), floor);
+}
 // A session whose children inherited a proxy on `port`, with a floor dir for it.
 function session(port, floor, extra = {}) {
   const home = tmp("floor-cfg-");
-  if (floor !== undefined) writeFileSync(join(home, `cache-fix-child-proxy-${port}`), floor);
+  if (floor !== undefined) publish(home, port, floor);
   return { CLAUDE_CONFIG_DIR: home, HTTPS_PROXY: `http://127.0.0.1:${port}`, ...extra };
 }
 const show = SIX.map((k) => `printf '%s=[%s]\\n' ${k} "\${${k}-unset}"`).join("; ");
@@ -202,6 +209,20 @@ test("NO file: unknown, the command runs unchanged", async () => {
   assert.deepEqual(lines(out), { ...all("[unset]"), HTTPS_PROXY: `[${CCF}]`, ALL_PROXY: `[${CCF}]` });
 });
 
+// Any local proxy may publish to the directory, and the session and the proxy
+// need not share a config dir: CLAUDE_CONFIG_DIR is looked in first, then
+// $HOME/.claude.
+test("the floor is looked up in CLAUDE_CONFIG_DIR/proxy-floor first, then $HOME/.claude/proxy-floor", async () => {
+  const cfg = tmp("floor-cfg-"), home = tmp("floor-home-");
+  publish(join(home, ".claude"), 9801, "http://home.example.test:1");
+  const env = { HOME: home, HTTPS_PROXY: CCF };
+  const got = async (extra) => lines((await prefix(show, { ...env, ...extra })).out).HTTPS_PROXY;
+  assert.equal(await got({ CLAUDE_CONFIG_DIR: cfg }), "[http://home.example.test:1]", "config dir has no file: fall back to $HOME/.claude");
+  assert.equal(await got({}), "[http://home.example.test:1]", "CLAUDE_CONFIG_DIR unset");
+  publish(cfg, 9801, FLOOR);
+  assert.equal(await got({ CLAUDE_CONFIG_DIR: cfg }), `[${FLOOR}]`, "the config dir wins when both have a file");
+});
+
 test("a file for ANOTHER port, or a non-loopback host, changes nothing", async () => {
   const other = session(9802, FLOOR);                              // file is for 9802, the env names 9801
   assert.equal(lines((await prefix(show, { ...other, HTTPS_PROXY: CCF })).out).HTTPS_PROXY, `[${CCF}]`);
@@ -219,8 +240,8 @@ test("loopback spellings all find the floor", async () => {
 
 test("the first variable that names a floor file wins; one without a file is passed over", async () => {
   const home = tmp("floor-cfg-");
-  writeFileSync(join(home, "cache-fix-child-proxy-9802"), "http://second.example.test:1");
-  writeFileSync(join(home, "cache-fix-child-proxy-9803"), "http://third.example.test:1");
+  publish(home, 9802, "http://second.example.test:1");
+  publish(home, 9803, "http://third.example.test:1");
   const env = { CLAUDE_CONFIG_DIR: home, HTTPS_PROXY: "http://127.0.0.1:9801", http_proxy: "http://127.0.0.1:9802",
                 ALL_PROXY: "http://127.0.0.1:9803" };
   assert.equal(lines((await prefix(show, env)).out).HTTPS_PROXY, "[http://second.example.test:1]");

@@ -1306,7 +1306,7 @@ const hopInUse = () => hopAddress(lastHop() ?? (config.httpsProxy || fallbackPro
 // read "direct" for a proxy that has a hop. Not removed on close: a successor on
 // the same port rewrites it at listen, and a stale hop beats none while we are down.
 function publishChildFloor(port) {
-  const path = join(claudeHome(), `cache-fix-child-proxy-${port}`);
+  const path = join(claudeHome(), "proxy-floor", String(port));
   const tmp = `${path}.${process.pid}.tmp`;
   const write = () => {
     const floor = hopInUse();
