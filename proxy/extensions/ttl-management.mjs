@@ -46,17 +46,21 @@ export default {
     const detectedTier = ctx.meta?._ttlTier || "1h";
     const ttlParam = ttlValue === "5m" || detectedTier === "5m" ? "5m" : "1h";
 
-    if (Array.isArray(body.system)) {
-      body.system = body.system.map((block) => injectTtl(block, ttlParam));
-    }
+    // The API rejects a ttl='1h' block after a ttl='5m' one (order: system, messages).
+    // Walk back to front so a bare marker takes 1h when a 1h block follows it.
+    let seen1h = false;
+    const fill = (blocks) => {
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        blocks[i] = injectTtl(blocks[i], seen1h ? "1h" : ttlParam);
+        if (blocks[i].cache_control?.ttl === "1h") seen1h = true;
+      }
+    };
 
     if (Array.isArray(body.messages)) {
-      for (const msg of body.messages) {
-        if (!Array.isArray(msg.content)) continue;
-        for (let i = 0; i < msg.content.length; i++) {
-          msg.content[i] = injectTtl(msg.content[i], ttlParam);
-        }
+      for (let i = body.messages.length - 1; i >= 0; i--) {
+        if (Array.isArray(body.messages[i].content)) fill(body.messages[i].content);
       }
     }
+    if (Array.isArray(body.system)) fill(body.system);
   },
 };

@@ -240,3 +240,67 @@ test("ttl-management: existing ttl='5m' marker is not overwritten", async () => 
     assert.deepEqual(ctx.body.system[0].cache_control, { type: "ephemeral", ttl: "5m" });
   });
 });
+
+// --- ordering: a ttl='1h' block must not come after a ttl='5m' block (system -> messages) ---
+
+// Effective ttl of every cache_control block in request order; a bare marker is the API's 5m.
+function ttlsInOrder(body) {
+  return [...body.system, ...body.messages.flatMap((m) => m.content)]
+    .filter((b) => b.cache_control)
+    .map((b) => b.cache_control.ttl ?? "5m");
+}
+
+function assertNo1hAfter5m(ttls) {
+  const first5m = ttls.indexOf("5m");
+  assert.ok(first5m === -1 || ttls.lastIndexOf("1h") < first5m, `1h after 5m: ${ttls}`);
+}
+
+test("ttl-management: subagent 5m, client 1h on a later assistant block → bare markers before it get 1h", async () => {
+  await withEnv({ CACHE_FIX_TTL_MAIN: undefined, CACHE_FIX_TTL_SUBAGENT: "5m" }, async (mod) => {
+    const ctx = {
+      body: {
+        system: [{ type: "text", text: SUBAGENT_PROMPT, cache_control: { type: "ephemeral" } }],
+        messages: [
+          { role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] },
+          { role: "assistant", content: [{ type: "text", text: "yo", cache_control: { type: "ephemeral", ttl: "1h" } }] },
+        ],
+      },
+      headers: {},
+      meta: {},
+    };
+    await mod.onRequest(ctx);
+    const ttls = ttlsInOrder(ctx.body);
+    assert.deepEqual(ttls, ["1h", "1h", "1h"]);
+    assertNo1hAfter5m(ttls);
+  });
+});
+
+test("ttl-management: 1h before an explicit 5m, bare tail marker → tail keeps 5m (no global 1h-wins)", async () => {
+  await withEnv({ CACHE_FIX_TTL_MAIN: undefined, CACHE_FIX_TTL_SUBAGENT: undefined }, async (mod) => {
+    const ctx = {
+      body: {
+        system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral", ttl: "1h" } }],
+        messages: [
+          { role: "user", content: [{ type: "text", text: "a" }] },
+          { role: "assistant", content: [{ type: "text", text: "b", cache_control: { type: "ephemeral", ttl: "1h" } }] },
+          { role: "user", content: [{ type: "text", text: "c", cache_control: { type: "ephemeral", ttl: "5m" } }] },
+          { role: "user", content: [{ type: "text", text: "d", cache_control: { type: "ephemeral" } }] },
+        ],
+      },
+      headers: {},
+      meta: { _ttlTier: "5m" },
+    };
+    await mod.onRequest(ctx);
+    const ttls = ttlsInOrder(ctx.body);
+    assert.deepEqual(ttls, ["1h", "1h", "5m", "5m"]);
+    assertNo1hAfter5m(ttls);
+  });
+});
+
+test("ttl-management: subagent 5m with no 1h anywhere → system still gets 5m", async () => {
+  await withEnv({ CACHE_FIX_TTL_MAIN: undefined, CACHE_FIX_TTL_SUBAGENT: "5m" }, async (mod) => {
+    const ctx = subagentCtx();
+    await mod.onRequest(ctx);
+    assert.deepEqual(ctx.body.system[0].cache_control, { type: "ephemeral", ttl: "5m" });
+  });
+});
