@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, httpsHop, onHopChange, requireHop, resolveHop, selectProxyUrl, directLast, defaultPort } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, httpsHop, onHopChange, requireHop, selectProxyUrl, directLast, defaultPort } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -1305,7 +1305,10 @@ function hopAddress(u) {
 //
 // A FOURTH ANSWER, undefined: a chain is configured and no walk has landed, so
 // the hop is not known yet. A configured candidate is a guess (it may be the one
-// that is down), and the file is left as it is until a walk names the hop.
+// that is down), and the file is left as it is until a real request's walk names
+// the hop. Listen starts no walk of its own: with every hop down it would stamp
+// direct_last and log "dialling direct" with no dial made, and retire a handover
+// predecessor's good file in the outage.
 function floorHop() {
   if (!(selectProxyUrl(true) || fallbackProxyUrls().length)) {
     // The raw list, not the filtered one: an entry fallbackProxyUrls() drops is configured all the same.
@@ -1329,14 +1332,14 @@ function publishChildFloor(port) {
   const tmp = `${path}.${process.pid}.tmp`;
   const write = () => {
     const floor = floorHop();
-    if (floor === undefined) return void resolveHop(true);   // not known yet: one walk names it, and the listener runs this again
+    if (floor === undefined) return;   // not known yet: the first real HTTPS walk names it, and the listener runs this again
     try {
       if (floor === null) return rmSync(path, { force: true });
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(tmp, floor);
       renameSync(tmp, path);
     } catch (err) {
-      rmSync(tmp, { force: true });
+      try { rmSync(tmp, { force: true }); } catch {}   // under a path that is no directory it throws too
       process.stderr.write(`[cache-fix] child proxy floor not written: ${err?.message}\n`);
     }
   };

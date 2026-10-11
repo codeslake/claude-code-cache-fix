@@ -30,16 +30,23 @@ for url in "${HTTPS_PROXY-}" "${https_proxy-}" "${HTTP_PROXY-}" "${http_proxy-}"
 done
 
 # The shell is the one Claude Code runs the command under. Only its Bash tool runs
-# under bash or zsh, and the shell snapshot it sources first names which; hooks,
-# stdio MCP servers and the statusLine run under /bin/sh, and so do they here. The
-# Bash tool without a snapshot (Claude Code could not make one) is told by its cwd
-# tail. The bash or zsh is CLAUDE_CODE_SHELL, then SHELL, each only if it names that
-# shell and is executable; else it is found on PATH and in the usual directories.
-case $1 in
-  */shell-snapshots/snapshot-zsh-*) names=zsh ;;
-  */shell-snapshots/snapshot-bash-*) names=bash ;;
-  *'&& pwd -P >| '*) case ${SHELL-} in *bash*) names='bash zsh' ;; *) names='zsh bash' ;; esac ;;
-  *) names= ;;
+# under bash or zsh; hooks, stdio MCP servers and the statusLine run under /bin/sh,
+# and so do they here. The Bash tool's string is Claude Code's own clauses with the
+# user's command inside an eval after them, so the shell is read from the clauses
+# and not from anything a command can say: the snapshot it sources first, which
+# names the shell, up to the first ` 2>/dev/null` (the clause's own end); or, when
+# Claude Code could not make a snapshot, the setup clause it always adds when a
+# prefix is set. The bash or zsh is CLAUDE_CODE_SHELL, then SHELL, each only if it
+# names that shell and is executable; else it is found on PATH and in the usual
+# directories.
+case ${1%% 2>/dev/null*} in
+  'source '*/shell-snapshots/snapshot-zsh-*) names=zsh ;;
+  'source '*/shell-snapshots/snapshot-bash-*) names=bash ;;
+  *) case $1 in
+       *'{ shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true && '*)
+         case ${SHELL-} in *bash*) names='bash zsh' ;; *) names='zsh bash' ;; esac ;;
+       *) names= ;;
+     esac ;;
 esac
 shell=
 for s in "${CLAUDE_CODE_SHELL-}" "${SHELL-}"; do
