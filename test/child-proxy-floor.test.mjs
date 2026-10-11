@@ -101,15 +101,17 @@ test("a configured chain with no reachable hop is UNKNOWN (no file), not direct"
 });
 
 test("a configured value that is no usable hop is UNKNOWN, never direct", async () => {
-  for (const bad of ["not a url", "socks5://127.0.0.1:1080"]) {
-    const w = await wire();
-    process.env.CACHE_FIX_UPSTREAM_PROXY = bad;
-    const p = await startProxy({ port: await freePort(), watch: false });
-    try {
-      assert.deepEqual(ls(w.home), [], bad);
-      await resolveHop(true);
-      assert.deepEqual(ls(w.home), [], `${bad} after a walk`);
-    } finally { await p.close(); w.restore(); }
+  for (const key of ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES"]) {
+    for (const bad of ["not a url", "socks5://127.0.0.1:1080"]) {
+      const w = await wire();
+      process.env[key] = bad;
+      const p = await startProxy({ port: await freePort(), watch: false });
+      try {
+        assert.deepEqual(ls(w.home), [], `${key}=${bad}`);
+        await resolveHop(true);
+        assert.deepEqual(ls(w.home), [], `${key}=${bad} after a walk`);
+      } finally { await p.close(); w.restore(); }
+    }
   }
 });
 

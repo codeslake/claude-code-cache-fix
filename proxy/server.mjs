@@ -1303,10 +1303,11 @@ function hopAddress(u) {
 // different hop, answering children 407) are all UNKNOWN, so the file is removed.
 // REQUIRE_HOP forbids a direct dial, so there "nothing configured" is unknown too.
 function floorHop() {
-  const chain = [selectProxyUrl(true), ...fallbackProxyUrls()].filter(Boolean);
-  if (!chain.length) return requireHop() ? null : "";
+  const candidate = selectProxyUrl(true) || fallbackProxyUrls()[0];
+  // The raw list, not the filtered one: an entry fallbackProxyUrls() drops is configured all the same.
+  if (!candidate && !(process.env.CACHE_FIX_FALLBACK_PROXIES || "").trim()) return requireHop() ? null : "";
   try {
-    const u = new URL(httpsHop() ?? chain[0]);   // "" (every hop refused) does not parse
+    const u = new URL(httpsHop() ?? candidate);   // "" (every hop refused) or undefined does not parse
     return /^https?:$/.test(u.protocol) && !u.username && !u.password ? `${u.protocol}//${u.host}` : null;
   } catch { return null; }
 }
