@@ -60,7 +60,8 @@ test("listen publishes no guess: fallback #1 down and #2 up, the file names #2 a
   const p = await startProxy({ port: await freePort(), watch: false });
   try {
     assert.deepEqual(ls(w.home), [], "the configured candidate was published before any walk");
-    assert.equal(await resolveHop(true), up);
+    // No resolveHop() here: the proxy starts its own walk, and the file follows it.
+    for (let i = 0; i < 100 && !ls(w.home).length; i++) await new Promise((r) => setTimeout(r, 20));
     assert.equal(read(w.home, p.port), up);
   } finally { await p.close(); hop.close(); w.restore(); }
 });
