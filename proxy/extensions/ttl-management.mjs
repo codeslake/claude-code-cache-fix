@@ -27,6 +27,11 @@ function injectTtl(block, ttlParam) {
   return block;
 }
 
+// A subagent's continue request drops the SDK prefix from its system but keeps the agent-id header, so the
+// id seen with the prefix classifies it. shortcut: capped at 1000 ids in insertion order; an evicted id's continue reads "main".
+const SUBAGENT_IDS = new Set();
+const MAX_SUBAGENT_IDS = 1000;
+
 export { detectRequestType, injectTtl };
 
 export default {
@@ -38,7 +43,12 @@ export default {
     const { body } = ctx;
     if (!body.system) return;
 
-    const requestType = detectRequestType(body.system);
+    let requestType = detectRequestType(body.system);
+    const agentId = ctx.headers?.["x-claude-code-agent-id"];
+    if (agentId && requestType === "subagent") {
+      SUBAGENT_IDS.add(agentId);
+      if (SUBAGENT_IDS.size > MAX_SUBAGENT_IDS) SUBAGENT_IDS.delete(SUBAGENT_IDS.values().next().value);
+    } else if (agentId && SUBAGENT_IDS.has(agentId)) requestType = "subagent";
     const ttlValue = requestType === "subagent" ? TTL_SUBAGENT : TTL_MAIN;
 
     if (ttlValue === "none") return;
