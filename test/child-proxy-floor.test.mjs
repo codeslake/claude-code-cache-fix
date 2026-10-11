@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { exitWithin } from "./child-deadline.mjs";
+import { exitWithin, withDeadline } from "./child-deadline.mjs";
 import { freePort } from "./proc-helpers.mjs";
 
 // Before upstream.mjs loads: it reads the grace window once, at import.
@@ -164,7 +164,9 @@ async function prefix(cmd, env, { shell = "/bin/sh" } = {}) {
   });
   let out = "";
   child.stdout.on("data", (c) => (out += c));
+  const drained = new Promise((r) => child.stdout.on("close", r));   // "exit" can come before the last chunk
   const code = await exitWithin(child, 15_000, "child-proxy-floor.sh");
+  await withDeadline(drained, 5_000, child, "child-proxy-floor.sh stdout to drain");
   return { out, code };
 }
 // A session whose children inherited a proxy on `port`, with a floor dir for it.
