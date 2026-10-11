@@ -32,7 +32,6 @@ done
 # The shell Claude Code itself runs commands under: CLAUDE_CODE_SHELL, then SHELL,
 # each only if it names bash or zsh and is executable; else zsh, then bash (bash
 # first when SHELL names bash) from PATH and the usual directories; else /bin/sh.
-# $SHELL as given may be fish, or unset.
 shell=
 for s in "${CLAUDE_CODE_SHELL-}" "${SHELL-}"; do
   case $s in *bash*|*zsh*) [ -x "$s" ] && shell=$s && break ;; esac
@@ -40,7 +39,7 @@ done
 if [ -z "$shell" ]; then
   case ${SHELL-} in *bash*) names='bash zsh' ;; *) names='zsh bash' ;; esac
   for n in $names; do
-    shell=$(command -v "$n") && [ -x "$shell" ] && break
+    shell=$(command -v "$n") && break
     for d in /bin /usr/bin /usr/local/bin /opt/homebrew/bin; do [ -x "$d/$n" ] && shell=$d/$n && break 2; done
     shell=
   done
