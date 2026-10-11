@@ -206,6 +206,15 @@ let _lastHopReport = "";
 // field already carried once.
 let _lastHop;
 export const lastHop = () => _lastHop;
+// Told when the hop in use changes, so a consumer that publishes it (the child
+// proxy floor file) rewrites on the change and not on a timer. Returns the unsubscribe.
+const _hopListeners = new Set();
+export const onHopChange = (fn) => { _hopListeners.add(fn); return () => _hopListeners.delete(fn); };
+function setLastHop(hop) {
+  if (hop === _lastHop) return;
+  _lastHop = hop;
+  for (const fn of _hopListeners) fn();
+}
 // WHEN THE CHAIN LAST WENT DIRECT, ISO-8601 UTC, null if never. A point-in-time
 // field cannot report a flap: the chain is back within ~1s and every probe after
 // that reads green, so the outage that actually happened leaves no trace anyone
@@ -315,7 +324,7 @@ async function _resolveHopUncoalesced(isHTTPS) {
     // configured" is not a fall-through — there was no chain to fall through —
     // and stamping it would fire on every reverse-mode proxy that never had one,
     // which empties the field of the meaning it exists for.
-    _lastHop = "";
+    setLastHop("");
     return "";
   }
   const deadline = Date.now() + CHAIN_GRACE_MS;
@@ -340,7 +349,7 @@ async function _resolveHopUncoalesced(isHTTPS) {
             process.stderr.write(`[upstream] hop ${addrOf(primary)} is back\n`);
           }
         }
-        _lastHop = hop;
+        setLastHop(hop);
         return hop;
       }
     }
@@ -363,7 +372,7 @@ async function _resolveHopUncoalesced(isHTTPS) {
   const note = `hop ${addrOf(primary)} unusable — no chain hop reachable, `
              + (refusing ? "refusing (CACHE_FIX_REQUIRE_HOP=1)" : "dialling direct");
   if (note !== _lastHopReport) { _lastHopReport = note; process.stderr.write(`[upstream] ${note}\n`); }
-  _lastHop = "";
+  setLastHop("");
   if (!refusing) _directLast = new Date().toISOString();
   return "";
 }

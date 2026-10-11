@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, directLast, defaultPort } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, onHopChange, requireHop, directLast, defaultPort } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -17,7 +17,7 @@ import { publishableGates } from "./gate-allowlist.mjs";
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
 // Env is read on every call so tests (and operators flipping the flag at
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
-import { appendFileSync, fstatSync, ftruncateSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeSync } from "node:fs";
+import { appendFileSync, fstatSync, ftruncateSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -445,8 +445,7 @@ function handleHealth(req, res) {
     // candidate; `undefined` is a proxy that has dialled nothing yet — every
     // successor is in that state for its first request — and there the
     // configured candidate is the only thing known and asserts nothing false.
-    https_proxy: (_forwardActive > 0 && hopAddress(
-      lastHop() ?? (config.httpsProxy || fallbackProxyUrls()[0]))) || null,
+    https_proxy: (_forwardActive > 0 && hopInUse()) || null,
     // MEASURED OR MERELY CONFIGURED. The line above publishes a URL in two
     // different situations — the hop a resolve actually used, and the first
     // candidate on a proxy that has dialled nothing yet — and a reader cannot
@@ -1103,6 +1102,11 @@ export async function startProxy(options = {}) {
         "   `claude-via-proxy --remote-control` instead — that variable takes\n" +
         "   one file, so setting it here would untrust the other CA)\n");
   }
+  // The ADVERTISED port, which a holder's child (bound to an ephemeral one) is
+  // not: the number in the clients' HTTPS_PROXY is the key the script looks up.
+  const unpublishFloor = forwardAttached
+    ? publishChildFloor(Number(process.env.CACHE_FIX_HELD_PORT) || addr.port)
+    : () => {};
   let closed = false;
   return {
     server,
@@ -1124,6 +1128,7 @@ export async function startProxy(options = {}) {
         if (!closed) {
           closed = true;
           if (forwardAttached) { _forwardActive--; removeSelfHeal(); }
+          unpublishFloor();
         }
         try { stopOAuthRefresher(); } catch {}
         try {
@@ -1280,6 +1285,46 @@ function hopAddress(u) {
     const x = new URL(u);
     return x.protocol === "http:" || x.protocol === "https:" ? `${x.protocol}//${x.host}` : "";
   } catch { return ""; }
+}
+
+// The address /health publishes as https_proxy: the hop the last resolve landed
+// on, else the configured candidate. "" is direct.
+const hopInUse = () => hopAddress(lastHop() ?? (config.httpsProxy || fallbackProxyUrls()[0]));
+
+// THE CHILD FLOOR, written where bin/child-proxy-floor.sh reads it. In forward
+// mode every process the session starts inherits HTTPS_PROXY=<this proxy>, and
+// that script (CLAUDE_CODE_SHELL_PREFIX) swaps it for the hop this proxy itself
+// dials. It runs in a fresh shell per command and cannot ask /health, so the
+// answer sits in a file next to the other cache-fix state.
+//
+// THREE STATES: no file = unknown (the script changes nothing), empty file =
+// direct, a URL = that hop. Empty is written, never skipped, when there is no
+// hop: skipping it would tell every child to keep dialling us.
+//
+// Atomic, because a reader may open it between a truncate and a write and would
+// read "direct" for a proxy that has a hop. Not removed on close: a successor on
+// the same port rewrites it at listen, and a stale hop beats none while we are down.
+function publishChildFloor(port) {
+  const path = join(claudeHome(), `cache-fix-child-proxy-${port}`);
+  const tmp = `${path}.${process.pid}.tmp`;
+  let last;
+  const write = () => {
+    const floor = hopInUse();
+    // REQUIRE_HOP forbids a direct dial, so "no hop" is unknown there, not direct.
+    const state = floor || !requireHop() ? floor : null;
+    if (state === last) return;
+    try {
+      if (state === null) rmSync(path, { force: true });
+      else {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(tmp, state);
+        renameSync(tmp, path);
+      }
+      last = state;
+    } catch (err) { process.stderr.write(`[cache-fix] child proxy floor not written: ${err?.message}\n`); }
+  };
+  write();
+  return onHopChange(write);
 }
 
 // BOUND OUR OWN LOG, because a default install has nothing else bounding it.
