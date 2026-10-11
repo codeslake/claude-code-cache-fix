@@ -413,7 +413,7 @@ const withPath = (dir) => ({ PATH: `${dir}:${process.env.PATH}` });
 const cwdTail = () => `pwd -P >| '${join(tmp("floor-cwd-"), "cwd")}'`;
 
 test("a hook, MCP or statusLine command runs under /bin/sh, never under SHELL", async () => {
-  for (const shell of [shells.bash, shells.zsh, "/usr/bin/fish", null].filter((s) => s !== "")) {
+  for (const shell of [shells.bash, shells.zsh, "/usr/bin/fish", null]) {
     const { out, code } = await prefix(`echo "$0"`, session(9801, FLOOR), { shell });
     assert.equal(out, "/bin/sh\n", `SHELL=${shell}`);
     assert.equal(code, 0);

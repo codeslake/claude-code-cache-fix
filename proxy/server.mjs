@@ -1322,31 +1322,26 @@ function floorHop() {
 
 // Atomic, because a reader may open the file between a truncate and a write and
 // would read "direct" for a proxy that has a hop. Not removed on close: a
-// successor on the same port rewrites it at listen, and a stale hop beats none
-// while we are down.
+// successor on the same port rewrites it once its walk lands, and a stale hop
+// beats none while we are down.
 function publishChildFloor(port) {
   const path = join(claudeHome(), "proxy-floor", String(port));
   const tmp = `${path}.${process.pid}.tmp`;
-  // False when the hop is not known yet and the file was left alone.
   const write = () => {
     const floor = floorHop();
-    if (floor === undefined) return false;
+    if (floor === undefined) return void resolveHop(true);   // not known yet: one walk names it, and the listener runs this again
     try {
-      if (floor === null) rmSync(path, { force: true });
-      else {
-        mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(tmp, floor);
-        renameSync(tmp, path);
-      }
+      if (floor === null) return rmSync(path, { force: true });
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(tmp, floor);
+      renameSync(tmp, path);
     } catch (err) {
       rmSync(tmp, { force: true });
       process.stderr.write(`[cache-fix] child proxy floor not written: ${err?.message}\n`);
     }
-    return true;
   };
-  const off = onHopChange(write);
-  if (!write()) resolveHop(true);   // one walk names the hop, and the listener writes it
-  return off;
+  write();
+  return onHopChange(write);
 }
 
 // BOUND OUR OWN LOG, because a default install has nothing else bounding it.

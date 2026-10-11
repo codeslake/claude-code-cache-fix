@@ -74,9 +74,11 @@ Measured on Claude Code 2.1.296 with no credentials, a throwaway config director
 | stdio MCP server, from `--mcp-config` and from a plugin | stand-in hop (6 of 6) | the dead port (6 of 6) |
 | `statusLine` command | stand-in hop (1 of 1) | the dead port (1 of 1) |
 
-In every prefixed run the `.zshenv` had executed (a variable it exports was visible to the child) and its re-export still lost to the floor.
+In every prefixed Bash-tool run the `.zshenv` had executed (a variable it exports was visible to the child) and its re-export still lost to the floor.
 
-**Process tree.** Measured directly, `zsh` 5.9 and `bash` 5.1 `exec` the final command of `export ...; command`, and `dash` 0.5.11 does not: `dash -c 'sleep 5'` and `dash -c 'export A=b; sleep 5'` both leave `dash` as the parent of `sleep`, so the prefix adds no shell layer there that `/bin/sh -c` did not already have. Hooks, stdio MCP servers and the `statusLine` command run under `/bin/sh`, which is `dash` on Debian and Ubuntu: a stdio MCP server's parent is then a shell, and Claude Code signals the shell and not the server. Bash 3.2 (macOS `/bin/bash`, and `/bin/sh` there) was not measured.
+That table was measured with `zsh` running every command. The hook and stdio MCP rows were repeated after the script moved them to `/bin/sh` (`dash` 0.5.11 here): `claude -p` with `SHELL` naming `zsh`, a `SessionStart` and a `SessionEnd` hook and one `--mcp-config` server, each logging `readlink /proc/$$/exe` and `getproxies()`. With the prefix 2 of 2 hooks and 1 of 1 server saw the stand-in hop; without it they saw the dead port. In both runs the hooks ran under `dash`, not `zsh`. The `statusLine` row was not repeated.
+
+**Process tree.** Measured directly, `zsh` 5.9 and `bash` 5.1 `exec` the final command of `export ...; command`, and `dash` 0.5.11 does not. Hooks, stdio MCP servers and the `statusLine` command run under `/bin/sh`, which is `dash` on Debian and Ubuntu, so with the prefix the shell stays as the server's parent: a stdio MCP server's parent was `sh` with the prefix and `claude` without it. Claude Code then signals the shell and not the server. Measured under Claude Code with `dash` in that role, after `claude -p` finished the servers that exit on stdin EOF were gone, but one that ignores EOF was still running. Bash 3.2 (macOS `/bin/bash`, and `/bin/sh` there) was not measured.
 
 ## Limits
 
