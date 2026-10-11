@@ -164,9 +164,10 @@ Three ways to wire it, depending on how broadly you want the vars to apply.
 
 > **If anything else on this host also MITMs `api.anthropic.com`** — a corporate
 > TLS-inspecting agent, an account-switching pin proxy — do not use these
-> recipes. `NODE_EXTRA_CA_CERTS` takes one file, so pinning it to our CA alone
-> silently untrusts every other component. Use `--remote-control`, which
-> publishes into `ca-trust.d/` and consumes the merged bundle instead. See
+> recipes with our CA alone. `NODE_EXTRA_CA_CERTS` takes one file, so pinning it
+> to our CA alone silently untrusts every other component. Put both CAs in one
+> file ([how](#client-trust-behind-a-tls-inspecting-corporate-proxy)), or use
+> `--remote-control` with a merged bundle (needs 4.4.0-beta.0 or newer). See
 > [Coexisting with another MITM](#coexisting-with-another-mitm-on-the-same-machine-ca-trustd).
 
 ```bash
@@ -189,7 +190,31 @@ claude() {
 }
 ```
 
+#### Client trust behind a TLS-inspecting corporate proxy
+
+If a corporate proxy inspects TLS, the hosts we blind-tunnel (everything except
+`api.anthropic.com`) come back re-signed by its root. Claude Code adds
+`NODE_EXTRA_CA_CERTS` to its built-in and system roots, so a corporate root that
+is in neither must go in the same file as our CA. Build one file holding both
+(temp file + `mv`, so nothing reads it half-written) and use it in place of
+`ca.pem` in a), b) or c):
+
+```bash
+cat ~/.claude/cache-fix-ca/ca.pem /path/to/corporate-root.pem > ~/.claude/cache-fix-client-ca.pem.tmp
+mv ~/.claude/cache-fix-client-ca.pem.tmp ~/.claude/cache-fix-client-ca.pem
+export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-client-ca.pem   # or set it in the recipe you chose
+```
+
+Every input file must end in a newline. One that does not runs its `END` line
+into the next file's `BEGIN` line, and node then drops that certificate and
+everything after it in the file, with a warning on stderr.
+
 #### Coexisting with another MITM on the same machine (`ca-trust.d`)
+
+*Needs 4.4.0-beta.0 or newer (`npm install -g claude-code-cache-fix@next`).
+`npm install -g claude-code-cache-fix` installs the `latest` tag, 4.3.0 at the
+time of writing, which has no `ca-trust.d` handling: its `--remote-control`
+hands Claude `ca.pem` alone.*
 
 `NODE_EXTRA_CA_CERTS` takes exactly **one** file. If anything else on the host
 also MITMs `api.anthropic.com` and also sets that variable — a corporate agent,
@@ -213,6 +238,19 @@ bundle**: merging requires finding the ambient corporate roots, which is
 environment-specific (a Linux host may keep them outside the bundle a shell
 points at; a Mac keeps them in the keychain), and two components both rebuilding
 it would race one output.
+
+Nothing in cache-fix builds `ca-trust.pem`, so if you or another tool have not
+built it, `--remote-control` finds no bundle and hands Claude our CA alone, with
+no corporate root. To build it yourself, after one `--remote-control` launch has
+published `ca-trust.d/ccf.pem` (same newline rule as above):
+
+```bash
+cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+cat ca-trust.d/*.pem /path/to/corporate-root.pem > ca-trust.pem.tmp
+mv ca-trust.pem.tmp ca-trust.pem
+```
+
+Re-run it when a publisher's CA changes.
 
 The bundle is used only if node, handed that file, will actually verify our
 proxy's leaf. The launcher does not predict that — it asks: a child process with
@@ -244,9 +282,9 @@ not ask drops every corporate root on a machine whose bundle was fine.
 **A damaged merge does not cost the other publishers their CAs.** The damage
 lives in the merge, not in the files that fed it, so the launcher rebuilds from
 the `ca-trust.d/` publishers that still work rather than falling back to its own
-CA alone. The saving is one certificate per surviving publisher: measured on
-this box (ours plus one peer), one certificate under the old fallback against
-two under the rebuild; on a three-publisher host, one against three.
+CA alone. The saving is one certificate per surviving publisher: measured with
+ours plus one peer, one certificate under the old fallback against two under the
+rebuild; with three publishers, one against three.
 
 Both paths are fixed names under `<config>`, deliberately with no env override
 of their own. They are two halves of one rendezvous: a knob on either half alone
@@ -289,7 +327,7 @@ Failed to fetch version from .../claude-code-releases/latest after 3 attempt(s):
   unable to verify the first certificate
 ```
 
-Measured with `openssl s_client -proxy 127.0.0.1:9901 -connect downloads.claude.ai:443
+Measured with `openssl s_client -proxy 127.0.0.1:9801 -connect downloads.claude.ai:443
 -servername downloads.claude.ai`:
 
 | `CACHE_FIX_DOWNLOAD_REWRITE` | leaf CN | verify |
@@ -371,12 +409,40 @@ The installed config picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`
 
 The service runs `cache-fix-proxy server` in the foreground, which is just the proxy without the wrapper-mode claude launcher.
 
-**Manual (any platform):**
+**Wiring the client (bash or zsh):** the service runs only the proxy end. For
+forward mode (install it with `CACHE_FIX_FORWARD_PROXY=on`, see
+[Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working)), add this
+function to `~/.bashrc` or `~/.zshrc`; the syntax is valid in both. The port is
+the default and the CA is the one the proxy generates on first start under the
+default `CLAUDE_CONFIG_DIR`:
 
 ```bash
-nohup cache-fix-proxy server > /tmp/cache-fix-proxy.log 2>&1 &
-echo 'export ANTHROPIC_BASE_URL=http://127.0.0.1:9801' >> ~/.bashrc
+claude() {
+  HTTPS_PROXY=http://127.0.0.1:9801 \
+  NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
+    command claude "$@"
+}
 ```
+
+Sessions Claude Code starts itself never pass through that function. Give them
+the same environment with a launcher, saved as `~/.local/bin/cache-fix-claude`
+and made executable (`chmod +x`):
+
+```sh
+#!/bin/sh
+export HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS="$HOME/.claude/cache-fix-ca/ca.pem"
+exec "$@"
+```
+
+and exported from the same rc file:
+`export CLAUDE_CODE_PROCESS_WRAPPER="$HOME/.local/bin/cache-fix-claude"`. Behind a
+TLS-inspecting corporate proxy, use the combined file from [Client trust behind a
+TLS-inspecting corporate proxy](#client-trust-behind-a-tls-inspecting-corporate-proxy)
+in place of `ca.pem` in both. If `settings.json` has an `env` block setting
+either variable, that block wins over what the function or launcher exports.
+
+Reverse mode (`ANTHROPIC_BASE_URL`, no Remote Control) is the
+[Quick start](#quick-start-proxy-recommended).
 
 ### Docker
 
