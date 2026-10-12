@@ -1,7 +1,9 @@
 // An API-key org whose credit is spent gets a 400 from upstream. Claude Code
 // re-runs apiKeyHelper only on 401/403, never on 400, so handleMessages'
 // buffered branch answers that one 400 as 401 (body and headers untouched).
-// Everything else (Bearer requests, other 400s, other statuses) passes as-is.
+// Claude Code sends the helper's key in x-api-key AND as Authorization: Bearer
+// <same key>, so that pair counts as an API-key request. Everything else
+// (OAuth Bearer, other 400s, other statuses) passes as-is.
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -70,7 +72,13 @@ describe("API-key credit-balance 400 is answered as 401", () => {
     assert.equal(res.headers["content-type"], "application/json");
   });
 
-  it("a Bearer request keeps its 400, with or without x-api-key", async () => {
+  it("x-api-key + Authorization: Bearer <same key> + credit 400 -> 401, body byte-identical", async () => {
+    const res = await ask(400, CREDIT_BODY, { "x-api-key": "sk-ant-test", authorization: "Bearer sk-ant-test" });
+    assert.equal(res.status, 401);
+    assert.equal(res.body.toString(), CREDIT_BODY);
+  });
+
+  it("a Bearer request keeps its 400 unless its Bearer is the x-api-key", async () => {
     for (const headers of [{ authorization: "Bearer x" }, { authorization: "Bearer x", "x-api-key": "sk-ant-test" }]) {
       const res = await ask(400, CREDIT_BODY, headers);
       assert.equal(res.status, 400);

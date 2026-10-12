@@ -232,8 +232,11 @@ async function handleMessages(clientReq, clientRes) {
     const rawResponse = Buffer.concat(chunks);
     // Claude Code re-runs apiKeyHelper and retries on 401/403 but never on 400,
     // so a spent API-key org must read as 401 for the helper to rotate keys.
-    const creditSpent = statusCode === 400 && clientReq.headers["x-api-key"]
-      && !/^bearer /i.test(clientReq.headers.authorization || "")
+    // It sends the helper's key in x-api-key and, from the second call on, also
+    // as `Authorization: Bearer <same key>`, so only a different Bearer (OAuth) is excluded.
+    const { authorization, "x-api-key": apiKey } = clientReq.headers;
+    const creditSpent = statusCode === 400 && apiKey
+      && (!authorization || authorization === `Bearer ${apiKey}`)
       && /credit balance is too low/i.test(rawResponse);
     const outStatus = creditSpent ? 401 : statusCode;
 
