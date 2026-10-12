@@ -172,8 +172,8 @@ Three ways to wire it, depending on how broadly you want the vars to apply.
 
 ```bash
 # a) per-invocation — scoped to just this claude run
-HTTPS_PROXY=http://127.0.0.1:9801 \
-NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}" \
+np=${NO_PROXY:-$no_proxy}; np="127.0.0.1,localhost,::1${np:+,$np}"
+HTTPS_PROXY=http://127.0.0.1:9801 NO_PROXY=$np no_proxy=$np \
 NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
   claude
 
@@ -182,13 +182,15 @@ NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
 #    shell's HTTPS breaks if the proxy is ever down. Programs Claude Code starts
 #    can be kept off it: see "Keeping other programs off the proxy" below)
 export HTTPS_PROXY=http://127.0.0.1:9801
+: "${NO_PROXY:=$no_proxy}"   # adopt a lowercase-only no_proxy
 export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}"
+export no_proxy=$NO_PROXY
 export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
 
 # c) scoped to claude only — a shell function (recommended; avoids b's blast radius)
 claude() {
-  HTTPS_PROXY=http://127.0.0.1:9801 \
-  NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}" \
+  local np=${NO_PROXY:-$no_proxy}; np="127.0.0.1,localhost,::1${np:+,$np}"
+  HTTPS_PROXY=http://127.0.0.1:9801 NO_PROXY=$np no_proxy=$np \
   NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
     command claude "$@"
 }
@@ -205,10 +207,13 @@ is in neither must go in the same file as our CA. Build one file holding both
 
 ```bash
 # awk 1, not cat: it ends every input with a newline, so no certificate is torn
-awk 1 ~/.claude/cache-fix-ca/ca.pem /path/to/corporate-root.pem > ~/.claude/cache-fix-client-ca.pem.tmp
-mv ~/.claude/cache-fix-client-ca.pem.tmp ~/.claude/cache-fix-client-ca.pem
+awk 1 ~/.claude/cache-fix-ca/ca.pem /path/to/corporate-root.pem > ~/.claude/cache-fix-client-ca.pem.tmp &&
+  mv ~/.claude/cache-fix-client-ca.pem.tmp ~/.claude/cache-fix-client-ca.pem
 export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-client-ca.pem   # or set it in the recipe you chose
 ```
+
+A mistyped input path makes `awk` exit non-zero, so the `&&` stops before the
+`mv` and a bundle already there is left as it was.
 
 Rebuild this file whenever cache-fix regenerates its CA (the proxy does so when
 its CA directory is wiped): a copy holding the old CA makes the client distrust
@@ -235,8 +240,9 @@ Claude Code expands no `~`, `$HOME` or `${HOME}` in that value, so use the
 absolute path. When one `settings.json` is shared across machines with different
 home directories, leave the setting out of it and put
 `export CLAUDE_CODE_SHELL_PREFIX=~/...` in the shell rc instead: the shell
-expands an unquoted `~`. Under a node version manager the path changes with the
-node version.
+expands an unquoted `~`. An `export` in an rc file reaches the sessions Claude
+Code starts itself only when its background process was started from a shell that
+read that rc. Under a node version manager the path changes with the node version.
 
 - **It reaches** the Bash tool (foreground and background), command hooks, stdio
   MCP servers and the `statusLine` command.
@@ -248,7 +254,9 @@ node version.
   comes back through the proxy, with trust, only if `HTTPS_PROXY`,
   `NODE_EXTRA_CA_CERTS` (by absolute path) and `NO_PROXY` are all in the
   `settings.json` `env` block. A session wired only by a shell function or a
-  launcher has none of them there, so put all three in that block.
+  launcher has none of them there, so put all three in that block. That block's
+  `NO_PROXY` replaces the shell's: set it to `127.0.0.1,localhost,::1` and append
+  your own hosts to that value.
 - **Bash sandbox mode** loses its own proxy under the unset. That is read from
   Claude Code's code, not measured.
 - **If the file is missing**, Bash commands exit 127, hooks error, stdio MCP
@@ -257,8 +265,8 @@ node version.
   MCP server.
 
 Measured on Claude Code 2.1.296. After a Claude Code upgrade, check it again: in
-a session with the prefix set, ask Claude to run `env | grep -i _proxy` and
-expect only `NO_PROXY` and `no_proxy` lines.
+a session with the prefix set, ask Claude to run
+`env | grep -iE '^(https?|all)_proxy='` and expect no output.
 
 **Already have a `CLAUDE_CODE_SHELL_PREFIX`?** The setting holds one program. Set
 `CACHE_FIX_PREV_SHELL_PREFIX` (same `env` block) to your previous prefix, as an
@@ -332,8 +340,8 @@ published `ca-trust.d/ccf.pem`:
 
 ```bash
 cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-awk 1 ca-trust.d/*.pem /path/to/corporate-root.pem > ca-trust.pem.tmp
-mv ca-trust.pem.tmp ca-trust.pem
+awk 1 ca-trust.d/*.pem /path/to/corporate-root.pem > ca-trust.pem.tmp &&
+  mv ca-trust.pem.tmp ca-trust.pem
 ```
 
 Re-run it when a publisher's CA changes.
@@ -504,8 +512,8 @@ default `CLAUDE_CONFIG_DIR`:
 
 ```bash
 claude() {
-  HTTPS_PROXY=http://127.0.0.1:9801 \
-  NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}" \
+  local np=${NO_PROXY:-$no_proxy}; np="127.0.0.1,localhost,::1${np:+,$np}"
+  HTTPS_PROXY=http://127.0.0.1:9801 NO_PROXY=$np no_proxy=$np \
   NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
     command claude "$@"
 }
@@ -517,8 +525,9 @@ and made executable (`chmod +x`):
 
 ```sh
 #!/bin/sh
+np=${NO_PROXY:-$no_proxy}; np="127.0.0.1,localhost,::1${np:+,$np}"
 export HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS="$HOME/.claude/cache-fix-ca/ca.pem" \
-  NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}"
+  NO_PROXY="$np" no_proxy="$np"
 exec "$@"
 ```
 
@@ -530,7 +539,7 @@ shell that read that rc. Behind a TLS-inspecting corporate proxy, use the
 combined file from [Client trust behind a TLS-inspecting corporate
 proxy](#client-trust-behind-a-tls-inspecting-corporate-proxy) in place of
 `ca.pem` in both. If `settings.json` has an `env` block setting
-either variable, that block wins over what the function or launcher exports.
+any of these variables, that block wins over what the function or launcher exports.
 
 Reverse mode (`ANTHROPIC_BASE_URL`, no Remote Control) is the
 [Quick start](#quick-start-proxy-recommended).
