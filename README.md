@@ -232,12 +232,13 @@ cache-fix), or unsets them when cache-fix has none. It leaves `NO_PROXY` alone.
 
 cache-fix writes that proxy's URL at startup to
 `${CLAUDE_CONFIG_DIR:-~/.claude}/cache-fix-state/upstream-<port>`, `<port>` being the
-port it listens on: one line, mode 0600 (the URL may carry credentials), empty when
-there is none, and left in place when cache-fix exits so a new instance on that port
-overwrites it. The program finds the file by the port in `HTTPS_PROXY`, and only when
-that variable names this machine (`127.0.0.1`, `localhost` or `[::1]`), that is,
-cache-fix itself. Any other value, no file, an empty file, or a file that names
-cache-fix's own address gives the unset.
+port it listens on: one line, mode 0600 (the URL may carry credentials). When
+cache-fix has no such proxy it writes no file and removes an earlier instance's. The
+file is left in place when cache-fix exits, so a new instance on that port overwrites
+it and children started in between stay covered. The program finds the file by the
+port in `HTTPS_PROXY`, and only when that variable names this machine (`127.0.0.1`,
+`localhost` or `[::1]`), that is, cache-fix itself. Any other value, no file, an
+empty file, or a file that names cache-fix's own address gives the unset.
 
 It is opt-in: nothing in cache-fix sets `CLAUDE_CODE_SHELL_PREFIX` for you. Put
 its absolute path, from `command -v cache-fix-shell-prefix` (a release that has
@@ -278,7 +279,7 @@ read that rc. Under a node version manager the path changes with the node versio
 Measured on Claude Code 2.1.296. After a Claude Code upgrade, check it again: in
 a session with the prefix set, ask Claude to run
 `env | grep -iE '^(https?|all)_proxy='` and expect the URL in that file on every
-line, or no output when the file is empty.
+line, or no output when there is no file.
 
 **Already have a `CLAUDE_CODE_SHELL_PREFIX`?** The setting holds one program. Set
 `CACHE_FIX_PREV_SHELL_PREFIX` (same `env` block) to your previous prefix, as an

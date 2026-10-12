@@ -17,7 +17,7 @@ if [ -n "$url" ]; then
   export SHELL_PREFIX_UPSTREAM=$url
   u='export HTTPS_PROXY="$SHELL_PREFIX_UPSTREAM" https_proxy="$SHELL_PREFIX_UPSTREAM" HTTP_PROXY="$SHELL_PREFIX_UPSTREAM" http_proxy="$SHELL_PREFIX_UPSTREAM" ALL_PROXY="$SHELL_PREFIX_UPSTREAM" all_proxy="$SHELL_PREFIX_UPSTREAM"'
 else
-  u='unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy SHELL_PREFIX_UPSTREAM'
+  u='unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy'
 fi
 eval "$u"
 # Bash tool (Claude puts no CLAUDE_PROJECT_DIR there): remember which Claude this is
