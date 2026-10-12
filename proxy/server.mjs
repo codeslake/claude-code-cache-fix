@@ -17,7 +17,7 @@ import { publishableGates } from "./gate-allowlist.mjs";
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
 // Env is read on every call so tests (and operators flipping the flag at
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
-import { appendFileSync, fstatSync, ftruncateSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeSync } from "node:fs";
+import { appendFileSync, fstatSync, ftruncateSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -1152,6 +1152,28 @@ export async function startProxy(options = {}) {
   };
 }
 
+// WHERE THE PROXY WE FORWARD TO IS WRITTEN DOWN, for bin/shell-prefix.sh. What Claude
+// Code starts (a Bash command, a hook) is given that proxy instead of ours, so it does
+// not depend on this process being up. One line, keyed by the port actually bound
+// (config.port is 0 under the held-port descriptor), empty when there is none. 0600: the
+// URL may carry credentials. Never removed on exit, so a successor on the same port
+// overwrites it and children started across a handover stay covered. Written from the
+// script entry only, like the sweep below: an embedder's startProxy() touches no home dir.
+function publishUpstream(port) {
+  const dir = join(claudeHome(), "cache-fix-state");
+  const file = join(dir, `upstream-${port}`);
+  const tmp = `${file}.tmp.${process.pid}`;
+  const url = config.httpsProxy || fallbackProxyUrls()[0] || "";
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(tmp, url && `${url}\n`, { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch (err) {
+    process.stderr.write(`[cache-fix] could not write ${file}: ${err.message}\n`);
+    try { rmSync(tmp, { force: true }); } catch {}
+  }
+}
+
 // CLI entrypoint — preserves the v3.x behavior of `node proxy/server.mjs`
 // (used by `cache-fix-proxy server` and by `fork(SERVER_PATH)` in the
 // wrapper). When this module is imported as a library, none of this runs.
@@ -1610,6 +1632,7 @@ if (invokedAsScript) {
   startProxy()
     .then((handle) => {
       active = handle;
+      publishUpstream(handle.port);
       say(process.stdout, `proxy listening on ${handle.address}:${handle.port}\n`);
       sweepUpdateFossil();
     })

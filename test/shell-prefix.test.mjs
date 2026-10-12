@@ -1,12 +1,14 @@
 // bin/shell-prefix.sh as Claude Code runs it: the command is the one argument,
 // and the environment is shaped like the kind of child being started. The
 // script reads only variables Claude Code sets per child kind, so each case
-// builds exactly that environment and probes what the command can see.
+// builds exactly that environment and probes what the command can see. The one
+// thing it reads besides those is the file cache-fix-proxy writes under the
+// config dir: the proxy cache-fix itself forwards to.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { text } from "node:stream/consumers";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +31,19 @@ const env = (extra) => ({
 const bashTool = (SHELL, extra) => env({ SHELL, CLAUDE_PID: "4242", ...extra });
 const hook = (extra) => env({ SHELL: "/nonexistent/fish", CLAUDE_PROJECT_DIR: "/p", CLAUDE_PID: "4242", ...extra });
 const mcp = (extra) => env({ SHELL: "/nonexistent/fish", CLAUDE_PROJECT_DIR: "/p", ...extra });
+
+// What settings.json's env block gives Claude Code: the six name cache-fix. The proxy
+// writes what it forwards to into upstream-<its port> under the config dir; `sidecar`
+// is that file's content (undefined: no file).
+const UP = "http://up.invalid:3128";
+const PORT = 9801; // only names the file: nothing listens here
+const sixOf = (url) => Object.fromEntries(SIX.map((v) => [v, url]));
+const viaCcf = (sidecar, own = `http://127.0.0.1:${PORT}`) => {
+  const cfg = mkdtempSync(join(tmp, "cfg-"));
+  mkdirSync(join(cfg, "cache-fix-state"));
+  if (sidecar !== undefined) writeFileSync(join(cfg, "cache-fix-state", `upstream-${PORT}`), sidecar);
+  return { CLAUDE_CONFIG_DIR: cfg, ...sixOf(own) };
+};
 
 async function run(e, cmd, cwd) {
   const child = spawn(SCRIPT, [cmd], { env: e, cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -56,23 +71,23 @@ for (const sh of ["zsh", "bash"]) {
     });
 }
 
-test("Bash tool: a .zshenv that re-exports HTTPS_PROXY is undone",
+test("Bash tool: a .zshenv that re-exports HTTPS_PROXY is overridden back to the upstream",
   { skip: !zsh && "zsh not installed" }, async () => {
     const z = mkdtempSync(join(tmp, "z-"));
     writeFileSync(join(z, ".zshenv"), "export HTTPS_PROXY=http://zenv.invalid ZENV_RAN=1\n");
-    const v = vars((await run(bashTool(zsh, { ZDOTDIR: z }), PROBE)).out);
+    const v = vars((await run(bashTool(zsh, { ZDOTDIR: z, ...viaCcf(UP) }), PROBE)).out);
     assert.equal(v.ZENV_RAN, "1", "the .zshenv did not run, so this proves nothing");
-    assert.deepEqual(proxies(v), KEPT);
+    assert.deepEqual(proxies(v), { ...sixOf(UP), ...KEPT });
   });
 
 const bash = which("bash");
-test("Bash tool: a BASH_ENV file that re-exports HTTPS_PROXY is undone",
+test("Bash tool: a BASH_ENV file that re-exports HTTPS_PROXY is overridden back to the upstream",
   { skip: !bash && "bash not installed" }, async () => {
     const f = join(tmp, "bash-env");
     writeFileSync(f, "export HTTPS_PROXY=http://benv.invalid BENV_RAN=1\n");
-    const v = vars((await run(bashTool(bash, { BASH_ENV: f }), PROBE)).out);
+    const v = vars((await run(bashTool(bash, { BASH_ENV: f, ...viaCcf(UP) }), PROBE)).out);
     assert.equal(v.BENV_RAN, "1", "the BASH_ENV file did not run, so this proves nothing");
-    assert.deepEqual(proxies(v), KEPT);
+    assert.deepEqual(proxies(v), { ...sixOf(UP), ...KEPT });
   });
 
 for (const [name, extra] of [["top-level", {}], ["nested", { SHELL_PREFIX_CLAUDE_PID: "4141" }]]) {
@@ -126,3 +141,36 @@ for (const [kind, e, cmd] of [["Bash tool", bashTool("/bin/sh"), "exit 7"], ["ho
     assert.equal((await run(e, cmd)).code, 7);
   });
 }
+
+// The upstream is handed on through every kind of child, whatever its shell.
+const kinds = [
+  ["Bash tool under sh", (x) => bashTool("/bin/sh", x)],
+  ["Bash tool under zsh", (x) => bashTool(zsh, x), !zsh],
+  ["Bash tool under bash", (x) => bashTool(bash, x), !bash],
+  ["hook", hook],
+  ["chained prefix", (x) => bashTool("/bin/sh", { CACHE_FIX_PREV_SHELL_PREFIX: prev, ...x })],
+  ["stdio MCP", mcp, false, [process.execPath, server].map(q).join(" "), (r) => JSON.parse(r.out).env],
+];
+const NASTY = "http://us'er:p$HOME\"x`id`;\\y@up.invalid:3128";
+for (const [kind, mk, absent, cmd = PROBE, parse = (r) => vars(r.out)] of kinds) {
+  test(`${kind}: all six get the sidecar's upstream (quotes and $ intact), none cache-fix's own; unset without one`,
+    { skip: absent && "not installed" }, async () => {
+      const seen = async (extra) => proxies(parse(await run(mk(extra), cmd)));
+      for (const url of [UP, NASTY]) assert.deepEqual(await seen(viaCcf(url)), { ...sixOf(url), ...KEPT }, url);
+      for (const none of ["", undefined]) assert.deepEqual(await seen(viaCcf(none)), KEPT, `sidecar ${none}`);
+    });
+}
+
+const seenViaSh = async (e) => proxies(vars((await run(bashTool("/bin/sh", e), PROBE)).out));
+test("the sidecar is found by HTTPS_PROXY's port in every loopback form, and only then", async () => {
+  for (const own of [`http://localhost:${PORT}`, `http://[::1]:${PORT}`, `http://u:p@127.0.0.1:${PORT}/`])
+    assert.deepEqual(await seenViaSh(viaCcf(UP, own)), { ...sixOf(UP), ...KEPT }, own);
+  for (const own of [`http://pin.invalid:${PORT}`, "http://127.0.0.1", `http://127.0.0.1:${PORT}x`, "http://127.0.0.1:../../x"])
+    assert.deepEqual(await seenViaSh(viaCcf(UP, own)), KEPT, own);
+});
+test("a sidecar naming cache-fix's own port is not handed on; another loopback port is", async () => {
+  for (const own of [`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}/`, `http://u:p@[::1]:${PORT}`])
+    assert.deepEqual(await seenViaSh(viaCcf(own)), KEPT, own);
+  const other = "http://127.0.0.1:3128";
+  assert.deepEqual(await seenViaSh(viaCcf(other)), { ...sixOf(other), ...KEPT });
+});

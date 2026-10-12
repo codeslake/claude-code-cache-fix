@@ -4,7 +4,7 @@
 
 ### Added
 
-- **`cache-fix-shell-prefix`, an opt-in `CLAUDE_CODE_SHELL_PREFIX` program that keeps what Claude Code starts off the forward proxy.** In forward mode the Bash tool, command hooks, stdio MCP servers and the status line inherit `HTTPS_PROXY` and its siblings; this unsets the six proxy variables for them and leaves `NO_PROXY` alone. Nothing sets the variable for you: point it at `command -v cache-fix-shell-prefix` in the `settings.json` `env` block (README, "Keeping other programs off the proxy"). `CACHE_FIX_PREV_SHELL_PREFIX` chains an existing prefix after the unset.
+- **`cache-fix-shell-prefix`, an opt-in `CLAUDE_CODE_SHELL_PREFIX` program that keeps what Claude Code starts off cache-fix.** In forward mode the Bash tool, command hooks, stdio MCP servers and the status line inherit `HTTPS_PROXY` and its siblings, so they depend on the proxy being up. This sets the six proxy variables for them to the proxy cache-fix itself forwards to, or unsets them when it has none, and leaves `NO_PROXY` alone. `cache-fix-proxy` records that URL in `${CLAUDE_CONFIG_DIR:-~/.claude}/cache-fix-state/upstream-<port>` (one line, mode 0600, left in place on exit so a handover keeps children covered). Nothing sets the variable for you: point it at `command -v cache-fix-shell-prefix` in the `settings.json` `env` block (README, "Keeping other programs off the proxy"). `CACHE_FIX_PREV_SHELL_PREFIX` chains an existing prefix after it.
 
 ### Changed
 
