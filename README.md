@@ -176,9 +176,10 @@ HTTPS_PROXY=http://127.0.0.1:9801 \
 NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
   claude
 
-# b) whole shell — add to ~/.zshrc / ~/.bashrc (every HTTPS in that shell goes
-#    through the proxy; harmless since non-anthropic hosts are blind-tunneled,
-#    but that shell's HTTPS breaks if the proxy is ever down)
+# b) whole shell — add to ~/.zshrc / ~/.bashrc (every HTTPS in that shell, and
+#    every program Claude Code starts from it, goes through the proxy; that
+#    shell's HTTPS breaks if the proxy is ever down. Programs Claude Code starts
+#    can be kept off it: see "Keeping other programs off the proxy" below)
 export HTTPS_PROXY=http://127.0.0.1:9801
 export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
 
@@ -208,6 +209,79 @@ export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-client-ca.pem   # or set it in th
 Every input file must end in a newline. One that does not runs its `END` line
 into the next file's `BEGIN` line, and node then drops that certificate and
 everything after it in the file, with a warning on stderr.
+
+#### Keeping other programs off the proxy
+
+In forward-proxy mode everything Claude Code starts inherits the proxy
+variables: Bash commands, hooks, MCP servers, the status line. The proxy
+blind-tunnels their non-Anthropic CONNECTs, but all of them now depend on the
+proxy being up. `cache-fix-shell-prefix` is a program for Claude Code's
+`CLAUDE_CODE_SHELL_PREFIX` setting. It unsets `HTTPS_PROXY`, `https_proxy`,
+`HTTP_PROXY`, `http_proxy`, `ALL_PROXY` and `all_proxy` for what Claude Code
+starts, and leaves `NO_PROXY` alone. It is opt-in: nothing in cache-fix sets
+`CLAUDE_CODE_SHELL_PREFIX` for you. Put its absolute path, from `command -v cache-fix-shell-prefix`, in the `env`
+block of `settings.json`:
+
+```json
+{ "env": { "CLAUDE_CODE_SHELL_PREFIX": "/absolute/path/to/cache-fix-shell-prefix" } }
+```
+
+Claude Code expands no `~`, `$HOME` or `${HOME}` in that value, so use the
+absolute path. When one `settings.json` is shared across machines with different
+home directories, leave the setting out of it and put
+`export CLAUDE_CODE_SHELL_PREFIX=~/...` in the shell rc instead: the shell
+expands an unquoted `~`. Under a node version manager the path changes with the
+node version.
+
+- **It reaches** the Bash tool (foreground and background), command hooks, stdio
+  MCP servers and the `statusLine` command.
+- **It does not reach** exec-form hooks, `apiKeyHelper`, `otelHeadersHelper` and
+  the other helper commands, Claude Code's own `git` and `gh`, or LSP servers.
+  Those still inherit the proxy, and the proxy passes their non-Anthropic
+  CONNECTs through as a blind tunnel.
+- **A `claude` started from a Bash command** comes back through the proxy only if
+  `HTTPS_PROXY` is in the `settings.json` `env` block. A session wired only by a
+  shell function or a launcher is not.
+- **Bash sandbox mode** loses its own proxy under the unset. That is read from
+  Claude Code's code, not measured.
+- **If the file is missing**, Bash commands exit 127, hooks error, stdio MCP
+  servers fail to start and the status line is blank. Turn the prefix off by
+  removing the line. Do not use a file-less one-line value: it breaks every stdio
+  MCP server.
+
+Measured on Claude Code 2.1.296.
+
+**Already have a `CLAUDE_CODE_SHELL_PREFIX`?** The setting holds one program. Set
+`CACHE_FIX_PREV_SHELL_PREFIX` (same `env` block) to your previous prefix, as an
+absolute path with no arguments, and it runs after the unset. A relative name, a
+missing file or a file that is not executable is skipped. With a chained prefix,
+hooks run under that prefix's shell.
+
+**Which version carries it.** `cache-fix-shell-prefix` ships in releases after
+4.4.0-beta.0: it is not in 4.3.0 or 4.4.0-beta.0. On an older install, save
+[`bin/shell-prefix.sh`](https://github.com/cnighswonger/claude-code-cache-fix/blob/main/bin/shell-prefix.sh)
+from this repository to any absolute path, `chmod +x` it, and use that path as
+the value.
+
+#### Using cswap-pin and cache-fix together
+
+`cswap-pin` is the account-switching pin proxy mentioned above. To have Claude
+Code talk to the pin and the pin talk to cache-fix:
+
+1. Run cache-fix in forward-proxy mode as a service:
+   `CACHE_FIX_FORWARD_PROXY=on cache-fix-proxy install-service`. It listens on
+   `127.0.0.1:9801` unless `CACHE_FIX_PROXY_PORT` says otherwise.
+2. From a plain shell, not from inside a pinned session (there the shell already
+   carries the pin as `HTTPS_PROXY`, and the pin would record itself as its own
+   upstream), pin through it:
+   `HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=<a file holding cache-fix's ca.pem and, behind a TLS-inspecting proxy, your corporate root> cswap pin <N>`.
+3. Add only the pin's line to your shell rc:
+   `claude() { (cswap pin --ensure >/dev/null 2>&1 &); command claude "$@"; }`.
+   The pin writes `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` and
+   `NODE_EXTRA_CA_CERTS` into the `env` block of `~/.claude.json`, which
+   overrides cache-fix's client recipe for those keys. So do not also add that
+   recipe or use `--remote-control`; keep the service from step 1.
+4. For child processes, set one prefix, either tool's, not both.
 
 #### Coexisting with another MITM on the same machine (`ca-trust.d`)
 
