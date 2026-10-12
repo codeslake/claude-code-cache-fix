@@ -1156,17 +1156,16 @@ export async function startProxy(options = {}) {
 // Code starts (a Bash command, a hook) is given that proxy instead of ours, so it does
 // not depend on this process being up. One line, keyed by the port actually bound
 // (config.port is 0 under the held-port descriptor). 0600: the URL may carry credentials.
-// No upstream: no file, and a predecessor's is removed (missing reads as empty, and an
-// empty file per start would litter the config dir of every host that runs this bare).
-// Never removed on exit, so a successor on the same port overwrites it and children
-// started across a handover stay covered. Written from the script entry only, like the
-// sweep below: an embedder's startProxy() touches no home dir.
+// No upstream (we dial direct): an empty line, which overwrites a predecessor's URL. The
+// file's absence is a different answer: no cache-fix owns that port, so the reader leaves
+// its proxy variables alone. Never removed on exit, so a successor on the same port
+// overwrites it and children started across a handover stay covered. Written from the
+// script entry only, like the sweep below: an embedder's startProxy() touches no home dir.
 function publishUpstream(port) {
   const file = join(claudeHome(), "cache-fix-state", `upstream-${port}`);
   const url = selectProxyUrl(true) || fallbackProxyUrls()[0] || "";
   const tmp = `${file}.tmp.${process.pid}`;
   try {
-    if (!url) return rmSync(file, { force: true });
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(tmp, `${url}\n`, { mode: 0o600 });
     renameSync(tmp, file);

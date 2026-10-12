@@ -54,8 +54,9 @@ describe("upstream sidecar", { concurrency: true }, () => {
     const url = "http://httponly.invalid:3128";
     assert.equal((await published({ HTTP_PROXY: url }))?.body, `${url}\n`);
   });
-  it("leaves no file when there is no upstream, and removes a predecessor's", async () => {
-    assert.equal(await published({}), null);
-    assert.equal(await published({}, "http://old.invalid:3128\n"), null);
+  it("holds an empty line when there is no upstream, over a predecessor's file", async () => {
+    const empty = { body: "\n", mode: 0o600 };
+    assert.deepEqual(await published({}), empty);
+    assert.deepEqual(await published({}, "http://old.invalid:3128\n"), empty);
   });
 });
