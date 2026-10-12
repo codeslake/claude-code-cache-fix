@@ -230,6 +230,12 @@ async function handleMessages(clientReq, clientRes) {
     const chunks = [];
     for await (const chunk of upstreamRes) chunks.push(chunk);
     const rawResponse = Buffer.concat(chunks);
+    // Claude Code re-runs apiKeyHelper and retries on 401/403 but never on 400,
+    // so a spent API-key org must read as 401 for the helper to rotate keys.
+    const creditSpent = statusCode === 400 && clientReq.headers["x-api-key"]
+      && !/^bearer /i.test(clientReq.headers.authorization || "")
+      && /credit balance is too low/i.test(rawResponse);
+    const outStatus = creditSpent ? 401 : statusCode;
 
     if (extSnapshot.length > 0) {
       let responseBody;
@@ -241,14 +247,14 @@ async function handleMessages(clientReq, clientRes) {
       if (responseBody) {
         const resCtx = { status: statusCode, headers: responseHeaders, body: responseBody, meta };
         await runOnResponse(resCtx, extSnapshot);
-        clientRes.writeHead(statusCode, resCtx.headers);
-        clientRes.end(JSON.stringify(resCtx.body));
+        clientRes.writeHead(outStatus, resCtx.headers);
+        clientRes.end(creditSpent ? rawResponse : JSON.stringify(resCtx.body));
       } else {
-        clientRes.writeHead(statusCode, responseHeaders);
+        clientRes.writeHead(outStatus, responseHeaders);
         clientRes.end(rawResponse);
       }
     } else {
-      clientRes.writeHead(statusCode, responseHeaders);
+      clientRes.writeHead(outStatus, responseHeaders);
       clientRes.end(rawResponse);
     }
     return;
