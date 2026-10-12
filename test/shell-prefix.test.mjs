@@ -8,7 +8,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { text } from "node:stream/consumers";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -151,7 +151,7 @@ const kinds = [
   ["chained prefix", (x) => bashTool("/bin/sh", { CACHE_FIX_PREV_SHELL_PREFIX: prev, ...x })],
   ["stdio MCP", mcp, false, [process.execPath, server].map(q).join(" "), (r) => JSON.parse(r.out).env],
 ];
-const NASTY = "http://us'er:p$HOME\"x`id`;\\y@up.invalid:3128";
+const NASTY = "http://us'er:p$HOME\"x`id`;\\y*[a-z]?@up.invalid:3128";
 for (const [kind, mk, absent, cmd = PROBE, parse = (r) => vars(r.out)] of kinds) {
   test(`${kind}: all six get the sidecar's upstream (quotes and $ intact), none cache-fix's own; unset without one`,
     { skip: absent && "not installed" }, async () => {
@@ -160,6 +160,10 @@ for (const [kind, mk, absent, cmd = PROBE, parse = (r) => vars(r.out)] of kinds)
       for (const none of ["", undefined]) assert.deepEqual(await seen(viaCcf(none)), KEPT, `sidecar ${none}`);
     });
 }
+
+test("the upstream is exported quoted, so no shell splits or globs it", () => {
+  assert.doesNotMatch(readFileSync(SCRIPT, "utf8"), /^\s*export \w+=\$/m);
+});
 
 const seenViaSh = async (e) => proxies(vars((await run(bashTool("/bin/sh", e), PROBE)).out));
 test("the sidecar is found by HTTPS_PROXY's port in every loopback form, and only then", async () => {
@@ -173,4 +177,8 @@ test("a sidecar naming cache-fix's own port is not handed on; another loopback p
     assert.deepEqual(await seenViaSh(viaCcf(own)), KEPT, own);
   const other = "http://127.0.0.1:3128";
   assert.deepEqual(await seenViaSh(viaCcf(other)), { ...sixOf(other), ...KEPT });
+});
+test("with HTTPS_PROXY unset or empty the port comes from https_proxy", async () => {
+  for (const upper of ["", undefined])
+    assert.deepEqual(await seenViaSh({ ...viaCcf(UP), HTTPS_PROXY: upper }), { ...sixOf(UP), ...KEPT }, `HTTPS_PROXY ${upper}`);
 });

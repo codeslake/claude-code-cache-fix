@@ -236,7 +236,7 @@ port it listens on: one line, mode 0600 (the URL may carry credentials). When
 cache-fix has no such proxy it writes no file and removes an earlier instance's. The
 file is left in place when cache-fix exits, so a new instance on that port overwrites
 it and children started in between stay covered. The program finds the file by the
-port in `HTTPS_PROXY`, and only when that variable names this machine (`127.0.0.1`,
+port in `HTTPS_PROXY` (`https_proxy` when that is empty), and only when it names this machine (`127.0.0.1`,
 `localhost` or `[::1]`), that is, cache-fix itself. Any other value, no file, an
 empty file, or a file that names cache-fix's own address gives the unset.
 

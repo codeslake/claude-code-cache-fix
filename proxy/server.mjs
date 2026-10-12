@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, directLast, defaultPort } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, selectProxyUrl, lastHop, directLast, defaultPort } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -1163,7 +1163,7 @@ export async function startProxy(options = {}) {
 // sweep below: an embedder's startProxy() touches no home dir.
 function publishUpstream(port) {
   const file = join(claudeHome(), "cache-fix-state", `upstream-${port}`);
-  const url = config.httpsProxy || fallbackProxyUrls()[0] || "";
+  const url = selectProxyUrl(true) || fallbackProxyUrls()[0] || "";
   const tmp = `${file}.tmp.${process.pid}`;
   try {
     if (!url) return rmSync(file, { force: true });

@@ -3,18 +3,18 @@
 # servers, statusLine) it points the six proxy variables at the proxy cache-fix itself forwards
 # to, not at cache-fix, and unsets them when cache-fix has none. cache-fix-proxy writes that
 # URL to ${CLAUDE_CONFIG_DIR:-~/.claude}/cache-fix-state/upstream-<its port>; the port is the one
-# in HTTPS_PROXY, taken only when that names this machine. The URL travels in
-# SHELL_PREFIX_UPSTREAM, so it is never spliced into a command string. The script reads only
-# those and the variables Claude Code sets per child kind (CLAUDE_PROJECT_DIR, CLAUDE_PID,
-# SHELL), never the command.
-h=${HTTPS_PROXY#*://}; h=${h##*@}; h=${h%%/*}
+# in HTTPS_PROXY (https_proxy when that is empty), taken only when that names this machine.
+# The URL travels in SHELL_PREFIX_UPSTREAM, so it is never spliced into a command string. The
+# script reads only those and the variables Claude Code sets per child kind (CLAUDE_PROJECT_DIR,
+# CLAUDE_PID, SHELL), never the command.
+h=${HTTPS_PROXY:-${https_proxy-}}; h=${h#*://}; h=${h##*@}; h=${h%%/*}
 case $h in 127.0.0.1:*|localhost:*|'[::1]:'*) port=${h##*:} ;; *) port= ;; esac
 url=; f=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache-fix-state/upstream-$port
 case $port in ''|*[!0-9]*) ;; *) [ -r "$f" ] && read -r url < "$f" ;; esac
 h=${url#*://}; h=${h##*@}; h=${h%%/*}
 case $h in "127.0.0.1:$port"|"localhost:$port"|"[::1]:$port") url= ;; esac
 if [ -n "$url" ]; then
-  export SHELL_PREFIX_UPSTREAM=$url
+  export SHELL_PREFIX_UPSTREAM="$url"
   u='export HTTPS_PROXY="$SHELL_PREFIX_UPSTREAM" https_proxy="$SHELL_PREFIX_UPSTREAM" HTTP_PROXY="$SHELL_PREFIX_UPSTREAM" http_proxy="$SHELL_PREFIX_UPSTREAM" ALL_PROXY="$SHELL_PREFIX_UPSTREAM" all_proxy="$SHELL_PREFIX_UPSTREAM"'
 else
   u='unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy'

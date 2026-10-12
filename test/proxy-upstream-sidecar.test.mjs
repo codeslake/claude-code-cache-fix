@@ -50,6 +50,10 @@ describe("upstream sidecar", { concurrency: true }, () => {
     const r = await published({ CACHE_FIX_FALLBACK_PROXIES: "http://fb1.invalid:3128,http://fb2.invalid:3128" });
     assert.equal(r.body, "http://fb1.invalid:3128\n");
   });
+  it("publishes the hop CCF dials when only HTTP_PROXY is set", async () => {
+    const url = "http://httponly.invalid:3128";
+    assert.equal((await published({ HTTP_PROXY: url }))?.body, `${url}\n`);
+  });
   it("leaves no file when there is no upstream, and removes a predecessor's", async () => {
     assert.equal(await published({}), null);
     assert.equal(await published({}, "http://old.invalid:3128\n"), null);
