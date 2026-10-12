@@ -21,7 +21,9 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { OURS, armLineage, cmdOf, freePort, reapStamped, sweepTargets, waitForHolder } from "./proc-helpers.mjs";
+import { OURS, armLineage, cmdOf, freePort, privateConfigDir, reapStamped, sweepTargets, waitForHolder } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const launcherPath = join(here, "..", "bin", "claude-via-proxy.mjs");

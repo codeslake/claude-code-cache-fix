@@ -7,7 +7,9 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, w
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { HOP_ENV, cmdOf, sweepTargets } from "./proc-helpers.mjs";
+import { HOP_ENV, cmdOf, privateConfigDir, sweepTargets } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 // A HOLDER THAT ADOPTS ITS PREDECESSOR'S SOCKET, started the way a handover
 // starts one: the listening socket on fd 3 and the two handover variables. It

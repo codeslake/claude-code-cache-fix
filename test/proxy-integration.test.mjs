@@ -2,11 +2,13 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { exitWithin } from "./child-deadline.mjs";
 import http from "node:http";
-import { armLineage, reapStamped } from "./proc-helpers.mjs";
+import { armLineage, privateConfigDir, reapStamped } from "./proc-helpers.mjs";
 
 // See proc-helpers.mjs's armLineage()/reapStamped(): the spawn below inherits
 // the marker through `{...process.env}`.
 const lineage = armLineage("proxy-integration");
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 let proxyPort;
 let proxyProcess;

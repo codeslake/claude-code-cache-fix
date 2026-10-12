@@ -225,12 +225,26 @@ In forward-proxy mode everything Claude Code starts inherits the proxy
 variables: Bash commands, hooks, MCP servers, the status line. The proxy
 blind-tunnels their non-Anthropic CONNECTs, but all of them now depend on the
 proxy being up. `cache-fix-shell-prefix` is a program for Claude Code's
-`CLAUDE_CODE_SHELL_PREFIX` setting. It unsets `HTTPS_PROXY`, `https_proxy`,
-`HTTP_PROXY`, `http_proxy`, `ALL_PROXY` and `all_proxy` for what Claude Code
-starts, and leaves `NO_PROXY` alone. It is opt-in: nothing in cache-fix sets
-`CLAUDE_CODE_SHELL_PREFIX` for you. Put its absolute path, from
-`command -v cache-fix-shell-prefix` (a release that has it: see "Which version
-carries it" below), in the `env` block of `settings.json`:
+`CLAUDE_CODE_SHELL_PREFIX` setting. For what Claude Code starts it sets
+`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY` and
+`all_proxy` to the proxy cache-fix itself forwards to (the proxy you had before
+cache-fix), or unsets them when cache-fix has none. It leaves `NO_PROXY` alone.
+
+cache-fix writes that proxy's URL at startup to
+`${CLAUDE_CONFIG_DIR:-~/.claude}/cache-fix-state/upstream-<port>`, `<port>` being the
+port it listens on: one line, mode 0600 (the URL may carry credentials). When
+cache-fix has no such proxy it writes an empty line there. The
+file is left in place when cache-fix exits, so a new instance on that port overwrites
+it and children started in between stay covered. The program finds the file by the
+port in `HTTPS_PROXY` (`https_proxy` when that is empty), and only when it names this machine (`127.0.0.1`,
+`localhost` or `[::1]`), that is, cache-fix itself. An empty file, or a file that
+names cache-fix's own address, gives the unset. No file (any other value in
+`HTTPS_PROXY`, a pin's loopback hop, your own proxy): your proxy variables are left
+as they are.
+
+It is opt-in: nothing in cache-fix sets `CLAUDE_CODE_SHELL_PREFIX` for you. Put
+its absolute path, from `command -v cache-fix-shell-prefix` (a release that has
+it: see "Which version carries it" below), in the `env` block of `settings.json`:
 
 ```json
 { "env": { "CLAUDE_CODE_SHELL_PREFIX": "/absolute/path/to/cache-fix-shell-prefix" } }
@@ -248,7 +262,7 @@ read that rc. Under a node version manager the path changes with the node versio
   MCP servers and the `statusLine` command.
 - **It does not reach** exec-form hooks, `apiKeyHelper`, `otelHeadersHelper` and
   the other helper commands, Claude Code's own `git` and `gh`, or LSP servers.
-  Those still inherit the proxy, and the proxy passes their non-Anthropic
+  Those still inherit cache-fix as their proxy, and it passes their non-Anthropic
   CONNECTs through as a blind tunnel.
 - **A `claude` started from a Bash command** (nested, or bare in a plain shell)
   comes back through the proxy, with trust, only if `HTTPS_PROXY`,
@@ -257,7 +271,7 @@ read that rc. Under a node version manager the path changes with the node versio
   launcher has none of them there, so put all three in that block. That block's
   `NO_PROXY` replaces the shell's: set it to `127.0.0.1,localhost,::1` and append
   your own hosts to that value.
-- **Bash sandbox mode** loses its own proxy under the unset. That is read from
+- **Bash sandbox mode** loses its own proxy under the change. That is read from
   Claude Code's code, not measured.
 - **If the file is missing**, Bash commands exit 127, hooks error, stdio MCP
   servers fail to start and the status line is blank. Turn the prefix off by
@@ -266,15 +280,16 @@ read that rc. Under a node version manager the path changes with the node versio
 
 Measured on Claude Code 2.1.296. After a Claude Code upgrade, check it again: in
 a session with the prefix set, ask Claude to run
-`env | grep -iE '^(https?|all)_proxy='` and expect no output.
+`env | grep -iE '^(https?|all)_proxy='` and expect the URL in that file on every
+line, no output when the file is empty, and your own values when there is no file.
 
 **Already have a `CLAUDE_CODE_SHELL_PREFIX`?** The setting holds one program. Set
 `CACHE_FIX_PREV_SHELL_PREFIX` (same `env` block) to your previous prefix, as an
-absolute path with no arguments, and it runs after the unset. A relative name, a
+absolute path with no arguments, and it runs after the change. A relative name, a
 missing file or a file that is not executable is skipped. With a chained prefix,
 that prefix runs the command in place of this program's own shell step, so hooks
 run under its shell, a startup file that re-exports a proxy variable is no longer
-undone, and a previous prefix that does not `exec` its command leaves a wrapper
+overridden, and a previous prefix that does not `exec` its command leaves a wrapper
 process in front of each stdio MCP server, orphaned when Claude Code exits.
 
 **Which version carries it.** `cache-fix-shell-prefix` ships in releases after

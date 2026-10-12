@@ -36,6 +36,9 @@ import { DEAD_HOP } from "./proc-helpers.mjs";
 import "./proc-helpers.mjs"; // pins CACHE_FIX_HANDOVER_ENV for the holder this file boots
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { privateConfigDir } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 import { armLineage, reapStamped } from "./proc-helpers.mjs";
 

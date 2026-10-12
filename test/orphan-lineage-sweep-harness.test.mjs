@@ -12,7 +12,9 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 import { withDeadline, exitWithin } from "./child-deadline.mjs";
-import { HOP_ENV, OURS, reapStamped, stamped } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, privateConfigDir, reapStamped, stamped } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const testFile = join(dirname(fileURLToPath(import.meta.url)), "proxy-held-port.test.mjs");
 

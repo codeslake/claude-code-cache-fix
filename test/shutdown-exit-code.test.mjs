@@ -9,8 +9,10 @@ import { drainBudgetMs, drainRoute, forcedCloseLine } from "../proxy/server.mjs"
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { armLineage, reapStamped } from "./proc-helpers.mjs";
+import { armLineage, privateConfigDir, reapStamped } from "./proc-helpers.mjs";
 import { availableParallelism } from "node:os";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 // See proc-helpers.mjs's armLineage()/reapStamped() and this file's own

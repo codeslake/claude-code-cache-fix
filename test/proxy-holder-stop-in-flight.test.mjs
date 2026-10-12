@@ -9,8 +9,10 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { armLineage, cmdOf, freePort as takePort, listeners, reapStamped, sweepTargets } from "./proc-helpers.mjs";
+import { armLineage, cmdOf, freePort as takePort, listeners, privateConfigDir, reapStamped, sweepTargets } from "./proc-helpers.mjs";
 import { exitWithin, withDeadline } from "./child-deadline.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 // ITS OWN FILE, not tidiness: this case used to sit at the end of
 // proxy-holder-handover.test.mjs, serially after that file's ~56s "holder

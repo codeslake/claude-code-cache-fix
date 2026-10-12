@@ -47,7 +47,9 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { DEAD_HOP, OURS, armLineage, cmdOf, freePort as takePort, listeners, probeHealth as probe, reapStamped, sweepTargets, waitForHolder } from "./proc-helpers.mjs";
+import { DEAD_HOP, OURS, armLineage, cmdOf, freePort as takePort, listeners, privateConfigDir, probeHealth as probe, reapStamped, sweepTargets, waitForHolder } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 // EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and

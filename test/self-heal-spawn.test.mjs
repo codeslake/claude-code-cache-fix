@@ -5,7 +5,7 @@ import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { HOP_ENV, OURS, cmdOf } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, privateConfigDir } from "./proc-helpers.mjs";
 
 // WHAT AN ORPHANED PROXY ASKS FOR WHEN IT HEALS, read off the spawn itself.
 // test/fixtures/spawn-spy.cjs stands in for the replacement holder, so nothing
@@ -45,7 +45,7 @@ async function heal({ stopped, deploy }) {
   const open = [];
   const upstream = net.createServer((s) => open.push(s));   // accepts, never replies
   await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
-  const env = { ...process.env, SPY_SERVER: join(root, "proxy", "server.mjs"),
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: privateConfigDir(), SPY_SERVER: join(root, "proxy", "server.mjs"),
     NODE_OPTIONS: `--require ${join(root, "test", "fixtures", "spawn-spy.cjs")}`,
     CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_HELD_PORT: String(sock.address().port), LISTEN_FDS: "1",
     CACHE_FIX_SELF_HEAL_MS: "50", CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,

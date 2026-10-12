@@ -23,9 +23,9 @@ import { mkdtemp, writeFile, chmod, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
-import "./proc-helpers.mjs"; // pins CACHE_FIX_HANDOVER_ENV for the holder this file boots
+import { armLineage, privateConfigDir, reapStamped } from "./proc-helpers.mjs"; // also pins CACHE_FIX_HANDOVER_ENV for the holder this file boots
 
-import { armLineage, reapStamped } from "./proc-helpers.mjs";
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 // EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
