@@ -1,9 +1,11 @@
 // An API-key org whose credit is spent gets a 400 from upstream. Claude Code
 // re-runs apiKeyHelper only on 401/403, never on 400, so handleMessages'
 // buffered branch answers that one 400 as 401 (body and headers untouched).
-// Claude Code sends the helper's key in x-api-key AND as Authorization: Bearer
-// <same key>, so that pair counts as an API-key request. Everything else
-// (OAuth Bearer, other 400s, other statuses) passes as-is.
+// Claude Code sends an apiKeyHelper key in x-api-key AND as Authorization:
+// Bearer <same key>; a static ANTHROPIC_API_KEY goes in x-api-key only. Only
+// the helper pair is rewritten: a 401 to a static key is retried with backoff
+// instead of failing at once. Everything else (x-api-key alone, OAuth Bearer,
+// other 400s, other statuses) passes as-is.
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -37,7 +39,9 @@ function clientRequest(port, headers) {
   });
 }
 
-describe("API-key credit-balance 400 is answered as 401", () => {
+const HELPER = { "x-api-key": "sk-ant-test", authorization: "Bearer sk-ant-test" };
+
+describe("apiKeyHelper credit-balance 400 is answered as 401", () => {
   let handle, upstream, reply;
 
   before(async () => {
@@ -64,18 +68,18 @@ describe("API-key credit-balance 400 is answered as 401", () => {
     return clientRequest(handle.port, headers);
   }
 
-  it("x-api-key + credit 400 -> 401, body byte-identical, headers unchanged", async () => {
-    const res = await ask(400, CREDIT_BODY, { "x-api-key": "sk-ant-test" });
+  it("x-api-key + Authorization: Bearer <same key> + credit 400 -> 401, body byte-identical, headers unchanged", async () => {
+    const res = await ask(400, CREDIT_BODY, HELPER);
     assert.equal(res.status, 401);
     assert.equal(res.body.toString(), CREDIT_BODY);
     assert.equal(res.headers["x-should-retry"], "false");
     assert.equal(res.headers["content-type"], "application/json");
   });
 
-  it("x-api-key + Authorization: Bearer <same key> + credit 400 -> 401, body byte-identical", async () => {
-    const res = await ask(400, CREDIT_BODY, { "x-api-key": "sk-ant-test", authorization: "Bearer sk-ant-test" });
-    assert.equal(res.status, 401);
-    assert.equal(res.body.toString(), CREDIT_BODY);
+  it("a static x-api-key alone keeps its 400", async () => {
+    const res = await ask(400, CREDIT_BODY, { "x-api-key": "sk-ant-test" });
+    assert.equal(res.status, 400);
+    assert.deepEqual(JSON.parse(res.body), JSON.parse(CREDIT_BODY));
   });
 
   it("a Bearer request keeps its 400 unless its Bearer is the x-api-key", async () => {
@@ -86,14 +90,14 @@ describe("API-key credit-balance 400 is answered as 401", () => {
     }
   });
 
-  it("x-api-key + another 400 body keeps its 400", async () => {
-    const res = await ask(400, OTHER_400, { "x-api-key": "sk-ant-test" });
+  it("helper pair + another 400 body keeps its 400", async () => {
+    const res = await ask(400, OTHER_400, HELPER);
     assert.equal(res.status, 400);
     assert.equal(res.body.toString(), OTHER_400);
   });
 
-  it("x-api-key + 200 is untouched", async () => {
-    const res = await ask(200, OK_200, { "x-api-key": "sk-ant-test" });
+  it("helper pair + 200 is untouched", async () => {
+    const res = await ask(200, OK_200, HELPER);
     assert.equal(res.status, 200);
     assert.equal(res.body.toString(), OK_200);
   });
