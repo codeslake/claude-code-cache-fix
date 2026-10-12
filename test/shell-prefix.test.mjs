@@ -65,6 +65,16 @@ test("Bash tool: a .zshenv that re-exports HTTPS_PROXY is undone",
     assert.deepEqual(proxies(v), KEPT);
   });
 
+const bash = which("bash");
+test("Bash tool: a BASH_ENV file that re-exports HTTPS_PROXY is undone",
+  { skip: !bash && "bash not installed" }, async () => {
+    const f = join(tmp, "bash-env");
+    writeFileSync(f, "export HTTPS_PROXY=http://benv.invalid BENV_RAN=1\n");
+    const v = vars((await run(bashTool(bash, { BASH_ENV: f }), PROBE)).out);
+    assert.equal(v.BENV_RAN, "1", "the BASH_ENV file did not run, so this proves nothing");
+    assert.deepEqual(proxies(v), KEPT);
+  });
+
 for (const [name, extra] of [["top-level", {}], ["nested", { SHELL_PREFIX_CLAUDE_PID: "4141" }]]) {
   test(`hook (${name}): runs under /bin/sh, not $SHELL; six unset, NO_PROXY kept`, async () => {
     const r = await run(hook(extra), `${PROBE}; echo /no-such-dir/*.zz`);
