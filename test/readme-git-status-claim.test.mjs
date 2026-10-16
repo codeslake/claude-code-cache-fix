@@ -53,7 +53,20 @@ test("the git-status section states the per-session cost, not a per-call 1,800",
     const text = prose(readFileSync(new URL(`../${f}`, import.meta.url), "utf8"));
     const section = gitStatusSection(text);
     assert.ok(!perCall.test(section), `${f}: git-status section still carries the per-call 1,800 figure`);
-    assert.ok(section.includes("650"), `${f}: git-status section does not name the per-session 650 figure`);
+    for (const n of ["650", "147", "2.1.301"]) {
+      assert.ok(section.includes(n), `${f}: git-status section does not name ${n}`);
+    }
+  }
+});
+
+// The injection into the system prompt is the 2.1.267-2.1.270 history; the
+// 2.1.301 first-user-message sentence is the present. One paragraph must not
+// state both in the present tense.
+test("the English git-status sections put the system-prompt injection in the past", () => {
+  for (const f of ["README.md", "docs/extension-impact-guide.md"]) {
+    const section = gitStatusSection(prose(readFileSync(new URL(`../${f}`, import.meta.url), "utf8")));
+    assert.ok(!/injects a `git status` block into the system prompt/.test(section),
+      `${f}: git-status section states the system-prompt injection in the present tense`);
   }
 });
 
