@@ -363,7 +363,7 @@ This fails the request entirely. Common triggers: hi-res manuscript scans, retin
 
 **Measured impact:**
 - @wadabum validated: 18-token `cache_creation` across git state changes with the flag set (vs thousands without).
-- Saves ~1,800 tokens per call (~7,180 chars of git instructions removed from system prompt + Bash tool description).
+- Saves about 650 tokens per session (gitStatus ~953 chars plus a ~580-char attribution block, both in the first user message), plus 147 tokens shared across sessions (a 4-line `# Git` section in the Bash tool description). Measured on CC 2.1.301, where the block no longer sits in the system prompt.
 
 ## Validating Impact Yourself
 

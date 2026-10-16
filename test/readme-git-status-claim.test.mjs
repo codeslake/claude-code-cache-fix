@@ -42,3 +42,24 @@ test("the git-status section names the 2.1.267 version qualifier and drops the u
       `${f}: git-status section still carries the unqualified present-tense claim`);
   }
 });
+
+// Measured on CC 2.1.301: the git context is written once per session into the
+// first user message (~650 tokens, plus 147 shared in the Bash tool
+// description), not ~1,800 tokens on every call.
+const perCall = /1[,.\s]?800/;
+
+test("the git-status section states the per-session cost, not a per-call 1,800", () => {
+  for (const f of files) {
+    const text = prose(readFileSync(new URL(`../${f}`, import.meta.url), "utf8"));
+    const section = gitStatusSection(text);
+    assert.ok(!perCall.test(section), `${f}: git-status section still carries the per-call 1,800 figure`);
+    assert.ok(section.includes("650"), `${f}: git-status section does not name the per-session 650 figure`);
+  }
+});
+
+test("the CHANGELOG git-status entry does not carry the per-call 1,800 figure", () => {
+  const text = readFileSync(new URL("../CHANGELOG.md", import.meta.url), "utf8");
+  const entry = text.split("\n").find((l) => l.includes("The git-status recommendation no longer claims"));
+  assert.ok(entry, "CHANGELOG git-status entry not found");
+  assert.ok(!perCall.test(entry), "CHANGELOG git-status entry still carries the per-call 1,800 figure");
+});
