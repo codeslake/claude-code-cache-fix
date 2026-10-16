@@ -42,3 +42,37 @@ test("the git-status section names the 2.1.267 version qualifier and drops the u
       `${f}: git-status section still carries the unqualified present-tense claim`);
   }
 });
+
+// Measured on CC 2.1.301: the git context is written once per session into the
+// first user message (~650 tokens, plus 147 shared in the Bash tool
+// description), not ~1,800 tokens on every call.
+const perCall = /1[,.\s]?800/;
+
+test("the git-status section states the per-session cost, not a per-call 1,800", () => {
+  for (const f of files) {
+    const text = prose(readFileSync(new URL(`../${f}`, import.meta.url), "utf8"));
+    const section = gitStatusSection(text);
+    assert.ok(!perCall.test(section), `${f}: git-status section still carries the per-call 1,800 figure`);
+    for (const n of ["650", "147", "2.1.301"]) {
+      assert.ok(section.includes(n), `${f}: git-status section does not name ${n}`);
+    }
+  }
+});
+
+// The injection into the system prompt is the 2.1.267-2.1.270 history; the
+// 2.1.301 first-user-message sentence is the present. One paragraph must not
+// state both in the present tense.
+test("the English git-status sections put the system-prompt injection in the past", () => {
+  for (const f of ["README.md", "docs/extension-impact-guide.md"]) {
+    const section = gitStatusSection(prose(readFileSync(new URL(`../${f}`, import.meta.url), "utf8")));
+    assert.ok(!/injects a `git status` block into the system prompt/.test(section),
+      `${f}: git-status section states the system-prompt injection in the present tense`);
+  }
+});
+
+test("the CHANGELOG git-status entry does not carry the per-call 1,800 figure", () => {
+  const text = readFileSync(new URL("../CHANGELOG.md", import.meta.url), "utf8");
+  const entry = text.split("\n").find((l) => l.includes("The git-status recommendation no longer claims"));
+  assert.ok(entry, "CHANGELOG git-status entry not found");
+  assert.ok(!perCall.test(entry), "CHANGELOG git-status entry still carries the per-call 1,800 figure");
+});
