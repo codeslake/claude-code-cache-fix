@@ -183,6 +183,34 @@ async function preForward(clientReq, clientRes, _abortController, extSnapshot, r
   return { handled: false, parsed, forwardBody, headers, meta };
 }
 
+// `${session id}:${key fingerprint}` -> ms until which a repeat 429 for that
+// pool key from that session passes through.
+const poolBackoff = new Map();
+
+// True when this 429 should read as 401: apiKey is in select-key's rotating
+// pool (one sha256 hex line per key in pool.fp) and this session's retry-after
+// window for it is not already open. A repeat from the same session inside the
+// window means the helper handed the key back, so it stays 429: a fully
+// limited pool waits instead of looping 401s onto the soonest-free key. Another
+// session still on that key gets its own 401, so it rotates too.
+function poolKeyLimited(apiKey, retryAfter, sessionId = "") {
+  const fp = createHash("sha256").update(apiKey).digest("hex");
+  let pool;
+  try {
+    pool = readFileSync(join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "claude-api-key", "pool.fp"), "utf8");
+  } catch {
+    return false; // no readable pool: rewrite nothing
+  }
+  const now = Date.now();
+  const slot = `${sessionId}:${fp}`;
+  if (!pool.split("\n").includes(fp) || now < (poolBackoff.get(slot) ?? 0)) return false;
+  for (const [k, expiry] of poolBackoff) if (expiry <= now) poolBackoff.delete(k);
+  const seconds = parseFloat(retryAfter);
+  // 60 s: the apiKeyHelper cache TTL a 429 would otherwise pin the key for.
+  poolBackoff.set(slot, now + (seconds >= 0 ? seconds : 60) * 1000);
+  return true;
+}
+
 async function handleMessages(clientReq, clientRes) {
   const abortController = new AbortController();
   const extSnapshot = snapshotRegistry();
@@ -265,15 +293,19 @@ async function handleMessages(clientReq, clientRes) {
     for await (const chunk of upstreamRes) chunks.push(chunk);
     const rawResponse = Buffer.concat(chunks);
     // Claude Code re-runs apiKeyHelper and retries on 401/403 but never on 400,
-    // so a spent API-key org must read as 401 for the helper to rotate keys.
-    // A helper key goes out in x-api-key AND `Authorization: Bearer <same key>`;
-    // a static ANTHROPIC_API_KEY only in x-api-key, and a 401 to that is retried
-    // with backoff (measured 11 requests, 185 s) instead of failing at once, so
-    // only the helper shape is rewritten.
-    const { authorization, "x-api-key": apiKey } = clientReq.headers;
-    const creditSpent = statusCode === 400 && apiKey && authorization === `Bearer ${apiKey}`
-      && /credit balance is too low/i.test(rawResponse);
-    const outStatus = creditSpent ? 401 : statusCode;
+    // and on a 429 it retries the same cached key for 60 s, so a spent API-key
+    // org (400) and a rate-limited pooled key (429) must read as 401 for the
+    // helper to rotate keys. A helper key goes out in x-api-key AND
+    // `Authorization: Bearer <same key>`; a static ANTHROPIC_API_KEY only in
+    // x-api-key, and a 401 to that is retried with backoff (measured 11
+    // requests, 185 s) instead of failing at once, so only the helper shape is
+    // rewritten. A 429 counts only for a key in select-key's pool.fp, once per
+    // session and retry-after window (poolKeyLimited).
+    const { authorization, "x-api-key": apiKey, "x-claude-code-session-id": sessionId } = clientReq.headers;
+    const rotateKey = apiKey && authorization === `Bearer ${apiKey}`
+      && (statusCode === 400 ? /credit balance is too low/i.test(rawResponse)
+        : statusCode === 429 && poolKeyLimited(apiKey, responseHeaders["retry-after"], sessionId));
+    const outStatus = rotateKey ? 401 : statusCode;
 
     if (extSnapshot.length > 0) {
       let responseBody;
@@ -290,7 +322,7 @@ async function handleMessages(clientReq, clientRes) {
       await runOnResponse(resCtx, extSnapshot);
       if (responseBody) {
         clientRes.writeHead(outStatus, resCtx.headers);
-        clientRes.end(creditSpent ? rawResponse : JSON.stringify(resCtx.body));
+        clientRes.end(rotateKey ? rawResponse : JSON.stringify(resCtx.body));
         return;
       }
     }
