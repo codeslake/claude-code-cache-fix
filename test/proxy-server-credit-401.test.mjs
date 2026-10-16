@@ -2,9 +2,9 @@
 // its rate limit a 429. Claude Code re-runs apiKeyHelper only on 401/403: on a
 // 400 it never does, on a 429 it retries the same cached key for 60 s. So
 // handleMessages' buffered branch answers that one 400 as 401, and a 429 for a
-// key listed in select-key's pool.fp as 401, once per retry-after window (a
-// repeat inside it stays 429, so a fully limited pool waits instead of looping
-// 401s). Body and headers are untouched.
+// key listed in select-key's pool.fp as 401, once per session and retry-after
+// window (a repeat from the same session inside it stays 429, so a fully
+// limited pool waits instead of looping 401s). Body and headers are untouched.
 // Claude Code sends an apiKeyHelper key in x-api-key AND as Authorization:
 // Bearer <same key>; a static ANTHROPIC_API_KEY goes in x-api-key only. Only
 // the helper pair is rewritten: a 401 to a static key is retried with backoff
@@ -31,7 +31,7 @@ const CREDIT_BODY = JSON.stringify({
 }, null, 2);
 const OTHER_400 = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "prompt is too long" } });
 const OK_200 = JSON.stringify({ type: "message", content: [] });
-const RATE_429 = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Error" }, request_id: "req_rate" });
+const RATE_429 = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Error" }, request_id: "req_rate" }, null, 2);
 
 function clientRequest(port, headers) {
   return new Promise((resolve, reject) => {
@@ -49,7 +49,7 @@ function clientRequest(port, headers) {
 }
 
 const HELPER = { "x-api-key": "sk-ant-test", authorization: "Bearer sk-ant-test" };
-const helperOf = (key) => ({ "x-api-key": key, authorization: `Bearer ${key}` });
+const helperOf = (key, session) => ({ "x-api-key": key, authorization: `Bearer ${key}`, ...(session && { "x-claude-code-session-id": session }) });
 const fp = (key) => createHash("sha256").update(key).digest("hex");
 
 describe("apiKeyHelper credit-balance 400 and pooled-key 429 are answered as 401", () => {
@@ -139,30 +139,45 @@ describe("apiKeyHelper credit-balance 400 and pooled-key 429 are answered as 401
     writePool("sk-pool-oauth");
     const res = await ask(429, RATE_429, { authorization: "Bearer sk-pool-oauth" });
     assert.equal(res.status, 429);
-    assert.equal(res.body.toString(), RATE_429);
+    assert.deepEqual(JSON.parse(res.body), JSON.parse(RATE_429));
   });
 
   it("a helper key outside pool.fp + 429 keeps its 429", async () => {
     writePool("sk-pool-other");
     const res = await ask(429, RATE_429, helperOf("sk-not-pooled"));
     assert.equal(res.status, 429);
-    assert.equal(res.body.toString(), RATE_429);
+    assert.deepEqual(JSON.parse(res.body), JSON.parse(RATE_429));
+  });
+
+  it("a pooled static x-api-key alone + 429 keeps its 429", async () => {
+    writePool("sk-pool-static");
+    const res = await ask(429, RATE_429, { "x-api-key": "sk-pool-static" });
+    assert.equal(res.status, 429);
+    assert.deepEqual(JSON.parse(res.body), JSON.parse(RATE_429));
   });
 
   it("no pool.fp + helper pair + 429 keeps its 429", async () => {
     writePool();
     const res = await ask(429, RATE_429, helperOf("sk-pool-nofile"));
     assert.equal(res.status, 429);
-    assert.equal(res.body.toString(), RATE_429);
+    assert.deepEqual(JSON.parse(res.body), JSON.parse(RATE_429));
   });
 
-  it("the same pooled key: first 429 -> 401, a repeat inside the window stays 429", async () => {
+  it("the same pooled key, same session: first 429 -> 401, a repeat inside the window stays 429", async () => {
     writePool("sk-pool-twice");
-    const first = await ask(429, RATE_429, helperOf("sk-pool-twice"));
+    const first = await ask(429, RATE_429, helperOf("sk-pool-twice", "s1"));
     assert.equal(first.status, 401);
-    const second = await ask(429, RATE_429, helperOf("sk-pool-twice"));
+    const second = await ask(429, RATE_429, helperOf("sk-pool-twice", "s1"));
     assert.equal(second.status, 429);
-    assert.equal(second.body.toString(), RATE_429);
+    assert.deepEqual(JSON.parse(second.body), JSON.parse(RATE_429));
+  });
+
+  it("the same pooled key, another session: its first 429 is answered 401 too", async () => {
+    writePool("sk-pool-shared");
+    for (const session of ["s1", "s2"]) {
+      const res = await ask(429, RATE_429, helperOf("sk-pool-shared", session));
+      assert.equal(res.status, 401);
+    }
   });
 
   it("retry-after: 0 leaves no window, so a repeat 429 is answered 401 again", async () => {
