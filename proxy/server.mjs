@@ -321,8 +321,10 @@ async function handleMessages(clientReq, clientRes) {
       const resCtx = { status: statusCode, headers: responseHeaders, body: responseBody, meta };
       await runOnResponse(resCtx, extSnapshot);
       if (responseBody) {
-        clientRes.writeHead(outStatus, resCtx.headers);
-        clientRes.end(rotateKey ? rawResponse : JSON.stringify(resCtx.body));
+        // Upstream's content-length describes its bytes, not this re-serialisation.
+        const out = rotateKey ? rawResponse : JSON.stringify(resCtx.body);
+        clientRes.writeHead(outStatus, { ...resCtx.headers, "content-length": Buffer.byteLength(out) });
+        clientRes.end(out);
         return;
       }
     }
@@ -427,8 +429,9 @@ async function handleBootstrap(clientReq, clientRes) {
     const resCtx = { status: statusCode, headers: responseHeaders, body: responseBody, meta };
     await runOnResponse(resCtx, extSnapshot);
     if (responseBody !== null) {
-      clientRes.writeHead(statusCode, resCtx.headers);
-      clientRes.end(JSON.stringify(resCtx.body));
+      const out = JSON.stringify(resCtx.body);
+      clientRes.writeHead(statusCode, { ...resCtx.headers, "content-length": Buffer.byteLength(out) });
+      clientRes.end(out);
       return;
     }
   }
