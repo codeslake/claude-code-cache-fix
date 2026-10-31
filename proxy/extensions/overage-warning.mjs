@@ -42,8 +42,7 @@ function debug(msg) {
 //
 // Cross-response dedup: per Q5h window (keyed by q5h_resets_at), the set
 // of thresholds we've already warned at. Window expires when q5h_resets_at
-// changes (new window = new dedup state). A reply with no 5h header (accounts
-// without a 5h limit) is sampled and keyed on its 7d window instead.
+// changes (new window = new dedup state).
 
 const WINDOW_MS = 15 * 60 * 1000;
 const WINDOW_MAX_SAMPLES = 60;
@@ -108,12 +107,11 @@ export function parseTriggerFromHeaders(headers) {
     snapshot: {
       q5h_pct: q5h_util !== null ? Math.round(q5h_util * 100) : null,
       q7d_pct: q7d_util !== null ? Math.round(q7d_util * 100) : null,
-      q5h_resets_at: q5h_resets_at || null,
+      q5h_resets_at,
     },
     raw: {
       q5h_util,
       q5h_resets_at,
-      window_resets_at: q5h_resets_at || intOf("anthropic-ratelimit-unified-7d-reset"),
     },
   };
 }
@@ -189,8 +187,7 @@ export function formatStderrLine({ ts, trigger, snapshot, projection }) {
   const upgrade = trigger.upgrade_paths.length
     ? trigger.upgrade_paths.join(", ")
     : "(none)";
-  const seg = (name, pct) => (pct === null ? "" : `${name}=${pct}% `);
-  const head = `[overage-warning] ${ts} ${seg("Q5h", snapshot.q5h_pct)}${seg("Q7d", snapshot.q7d_pct)}(surpassed ${trigger.surpassed_threshold})`;
+  const head = `[overage-warning] ${ts} Q5h=${snapshot.q5h_pct}% Q7d=${snapshot.q7d_pct}% (surpassed ${trigger.surpassed_threshold})`;
   if (projection && projection.min_to_100 !== null && projection.cost_per_hr_usd_coarse !== null) {
     return `${head} — projected 100% in ~${projection.min_to_100} min, estimated continued burn ≈ $${projection.cost_per_hr_usd_coarse.toFixed(2)}/hr at API rates (coarse). Upgrade paths: ${upgrade}.`;
   }
@@ -224,8 +221,6 @@ export function formatJsonlRecord({ ts, trigger, snapshot, projection }) {
 // --- Window management ---
 
 export function recordSample(state, sample) {
-  // One slope never spans two windows (5h and 7d utilisations are not comparable).
-  if (state.window.length && state.window[0].w !== sample.w) state.window.length = 0;
   state.window.push(sample);
   const cutoff = sample.t - WINDOW_MS;
   while (state.window.length && state.window[0].t < cutoff) state.window.shift();
@@ -285,12 +280,10 @@ export default {
       // Always capture quota state if the headers carry it, regardless of
       // whether THIS response's status crosses a warning threshold. Future
       // responses need warm samples to project from.
-      for (const w of ["5h", "7d"]) {
-        const util = parseFloat(ctx.headers[`anthropic-ratelimit-unified-${w}-utilization`]);
-        if (Number.isFinite(util)) {
-          ctx.meta._overageQuota = { util, w };
-          break;
-        }
+      const q5hRaw = ctx.headers["anthropic-ratelimit-unified-5h-utilization"];
+      const q5hUtil = q5hRaw ? parseFloat(q5hRaw) : null;
+      if (q5hUtil !== null && Number.isFinite(q5hUtil)) {
+        ctx.meta._overageQuota = { q5h_util: q5hUtil };
       }
 
       // Trigger eligibility latch — only set when this response is the one
@@ -318,12 +311,11 @@ export default {
       // reading, regardless of whether this response is the one that emits.
       if (ctx.event.type === "message_start" && ctx.event.message?.usage) {
         const u = ctx.event.message.usage;
-        const quota = ctx.meta?._overageQuota;
-        if (quota) {
+        const q5hUtil = ctx.meta?._overageQuota?.q5h_util;
+        if (q5hUtil !== undefined && q5hUtil !== null) {
           const sample = {
             t: Date.now(),
-            q5h: quota.util, // utilisation of window `w`: the 7d one when the reply has no 5h header
-            w: quota.w,
+            q5h: q5hUtil,
             input: u.input_tokens || 0,
             cache_creation: u.cache_creation_input_tokens || 0,
             cache_read: u.cache_read_input_tokens || 0,
@@ -352,7 +344,7 @@ export default {
 
         const allowed = checkAndMarkDedup(
           w.trigger.surpassed_threshold,
-          w.raw.window_resets_at,
+          w.snapshot.q5h_resets_at,
         );
         if (!allowed) {
           w.emitted = true;
